@@ -56,7 +56,7 @@ async def config_rename(old_name: str = '', new_name: str = ''):
         return False
     if old_name in mm.script_process:
         if mm.script_process[old_name].state != ScriptState.INACTIVE:
-            mm.script_process[old_name].stop()
+            await mm.script_process[old_name].stop()  # fix: stop() is async, was silently discarded (handoff/15 A2)
         del mm.script_process[old_name]
     if not mm.rename(old_name, new_name):
         raise HTTPException(status_code=400, detail='Rename failed')
@@ -74,7 +74,7 @@ async def config_delete(name: str = ''):
         raise HTTPException(status_code=400, detail='Delete failed')
     if name in mm.script_process:
         if mm.script_process[name].state != ScriptState.INACTIVE:
-            mm.script_process[name].stop()
+            await mm.script_process[name].stop()  # fix: stop() is async, was silently discarded (handoff/15 A2)
         del mm.script_process[name]
     if not mm.delete(name):
         raise HTTPException(status_code=400, detail='Delete failed')
@@ -106,7 +106,7 @@ async def task_group_copy(task_name: str, group_name: str, dest_config_name: str
 async def script_start(script_name: str):
     if script_name not in mm.script_process:
         mm.script_process[script_name] = ScriptProcess(script_name)
-    mm.script_process[script_name].start()
+    await mm.script_process[script_name].start()  # fix: start() is async; REST start was a silent no-op (handoff/15 A1)
     return
 
 @script_app.get('/{script_name}/stop')
@@ -114,7 +114,7 @@ async def script_stop(script_name: str):
     if script_name not in mm.script_process:
         logger.warning(f'[{script_name}] script process does not exist')
         return
-    mm.script_process[script_name].stop()
+    await mm.script_process[script_name].stop()  # fix: stop() is async; REST stop was a silent no-op (handoff/15 A1)
     return
 
 @script_app.get('/{script_name}/{task}/args')
@@ -122,7 +122,7 @@ async def script_task(script_name: str, task: str):
     return mm.config_cache(script_name).model.script_task(task)
 
 @script_app.put('/{script_name}/{task}/{group}/{argument}/value')
-async def script_task(script_name: str, task: str, group: str, argument: str, types: str, value):
+async def script_set_value(script_name: str, task: str, group: str, argument: str, types: str, value):  # C4: 原名 script_task 遮蔽上面的同名函数
     try:
         match types:
             case 'integer':
@@ -143,7 +143,7 @@ async def script_task(script_name: str, task: str, group: str, argument: str, ty
                 value = datetime.strptime(value, '%Y-%m-%d %H:%M:%S')
             case 'time_delta':
                 # strptime 是个好东西，但是不能解析00的天数
-                day = int(value[1])
+                day = int(value[:2])  # C1 (handoff/16): 原 int(value[1]) 丢十位，>=10 天被静默存成个位数
                 date_time = datetime.strptime(value[3:], '%H:%M:%S')
                 value = TimeDelta(days=day, hours=date_time.hour, minutes=date_time.minute, seconds=date_time.second)
             case 'time':

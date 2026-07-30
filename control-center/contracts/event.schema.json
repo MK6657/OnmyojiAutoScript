@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OAS Control Center Event",
+  "type": "object",
+  "required": ["version", "seq", "timestamp", "type", "level", "payload"],
+  "properties": {
+    "version": { "const": 1 },
+    "seq": { "type": "integer", "minimum": 0 },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "type": { "type": "string" },
+    "accountId": { "type": ["string", "null"] },
+    "taskId": { "type": ["string", "null"] },
+    "level": { "enum": ["debug", "info", "warn", "error"] },
+    "payload": { "type": "object" }
+  },
+  "additionalProperties": true
+}
+

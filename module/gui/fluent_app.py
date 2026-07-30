@@ -1,19 +1,34 @@
 # This Python file uses the following encoding: utf-8
 # @author runhey
 # github https://github.com/runhey
+import ctypes
 import sys
 import os
 
 from PySide6.QtGui import QGuiApplication, QIcon
 from PySide6.QtQml import QQmlApplicationEngine, qmlRegisterType
-from PySide6.QtCore import Qt, QObject, QTranslator, QLocale, Slot
+from PySide6.QtCore import Qt, QObject, QTranslator, QLocale, Slot, QLibraryInfo
 from pathlib import Path
 
 from module.gui.utils import get_work_path
 from module.gui.Bridge import bridge
 from module.logger import logger
 
-# import module.gui.qml_rcc
+# FluentUI's native plugin is loaded by Qt's QML engine, so Windows must be
+# told where the Qt DLLs shipped with PySide6 are located first.
+_qt_dll_dir = Path(QLibraryInfo.path(QLibraryInfo.LibraryPath.PrefixPath)).resolve()
+if _qt_dll_dir.exists():
+    os.environ["PATH"] = os.fspath(_qt_dll_dir) + os.pathsep + os.environ.get("PATH", "")
+    _qt_dll_dir_handle = os.add_dll_directory(os.fspath(_qt_dll_dir))
+
+_fluentui_plugin = Path(__file__).resolve().parent / "FluentUI" / "fluentuiplugin.dll"
+if _fluentui_plugin.exists():
+    # The plugin depends on fluentui.dll. Preloading it lets Qt resolve the
+    # dependency reliably on Windows when the QML engine imports FluentUI.
+    _fluentui_plugin_handle = ctypes.CDLL(os.fspath(_fluentui_plugin))
+
+# Register the compiled FluentUI QML resources before loading app.qml.
+import module.gui.qml_rcc
 import module.gui.res_rcc
 
 class FluentApp():
@@ -124,6 +139,3 @@ class DpiScale(QObject):
             case "ceil": QGuiApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.Ceil)  # 始终缩放
             case "round_prefer_floor": QGuiApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.RoundPreferFloor)  # 设备像素比0.75及以上的，进行缩放
             case _: QGuiApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
-
-
-

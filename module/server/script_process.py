@@ -39,7 +39,7 @@ class ScriptProcess(ScriptWSManager):
             logger.warning(f'Script {self.config_name} is initialized')
         if self._process and self._process.is_alive():
             logger.warning(f'Script {self.config_name} is already running and first stop it')
-            self.stop()
+            await self.stop()  # fix: was un-awaited -> second process spawned alongside the running one (handoff/15 A3)
         self._process = multiprocessing.Process(target=func,
                                                 args=(self.config_name, self.state_queue, self.log_pipe_in,),
                                                 name=self.config_name,

@@ -6,6 +6,7 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 
 import argparse
+import asyncio
 from starlette import status
 from starlette.responses import JSONResponse
 from fastapi import FastAPI, Request
@@ -35,8 +36,11 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    # B1 (handoff/16): 仅放行本机来源，堵住 drive-by localhost 攻击面。
+    # 原生客户端(QML/OASX/Flutter)不是浏览器、不受 CORS 约束；标注器页面由本服务同源伺服。
+    allow_origins=["null"],
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$",
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"]
 )
@@ -55,6 +59,8 @@ async def on_startup():
     app.state 的生命周期在定义app的时候就有了
     :return:
     """
+    # C2 (handoff/16): 记录主事件循环，供跨线程的状态/日志广播定向回来。
+    State.main_loop = asyncio.get_running_loop()
     logger.info('OAS web service startup done')
     if app.state.script_instances:
         await mm.restart_processes(app.state.script_instances)

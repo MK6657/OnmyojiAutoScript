@@ -1,0 +1,172 @@
+--- /mnt/user-data/uploads/OSAyys/tasks/RealmRaid/script_task.py	2026-07-26 21:36:54.679062966 +0000
++++ script_task.py	2026-07-26 21:41:53.130041997 +0000
+@@ -15,7 +15,7 @@
+ 
+ 
+ from module.logger import logger
+-from module.exception import TaskEnd
++from module.exception import TaskEnd, GameStuckError
+ from module.atom.image_grid import ImageGrid
+ from module.atom.image import RuleImage
+ from module.atom.click import RuleClick
+@@ -32,7 +32,7 @@
+         如果没有票了，那么就返回False
+         :return:
+         """
+-        self.wait_until_appear(self.I_BACK_RED)
++        self.wait_until_appear(self.I_BACK_RED, wait_time=15)
+         self.screenshot()
+         cu, res, total = self.O_NUMBER.ocr(self.device.image)
+         if cu == 0 and cu + res == total:
+@@ -73,7 +73,7 @@
+         logger.info(f'Click Medal')
+ 
+         # 点击挑战
+-        self.wait_until_appear(self.I_FIRE)
++        self.wait_until_appear(self.I_FIRE, wait_time=15)
+         while 1:
+             self.screenshot()
+             if self.appear_then_click(self.I_FIRE, interval=2):
+@@ -112,7 +112,7 @@
+                 return False
+             self.medal_fire()
+             self.run_general_battle(config.general_battle_config)
+-            self.wait_until_appear(self.I_BACK_RED)
++            self.wait_until_appear(self.I_BACK_RED, wait_time=15)
+ 
+         return True
+ 
+@@ -250,36 +250,55 @@
+     # ----------------------------------------------------------------------------------------------------------------------
+     # 2023.7.21 改版个人突破
+ 
+-    def ensure_lock(self, lock_team_enable: bool):
++    def ensure_lock(self, lock_team_enable: bool, timeout: float = 12):
+         """
+         确保锁定阵容
+-        :param lock_team_enable:
+-        :return:
+-        """
++
++        【二开修复 handoff/20】原实现是两个「无日志 + 无超时」的 while 1：
++        只要锁定 / 未锁定两个图标都识别不出来（游戏版本改版、活动界面顶掉了锁图标、
++        分辨率或缩放不同、0.9 阈值过严），任务就在这里静默死循环——
++        界面还显示「运行中」，日志却停在「Page arrived page_realm_raid」之后再无一行，
++        用户完全看不出发生了什么（这正是 2026-07-27 复现的现象）。
++
++        现在改为：限时轮询 + 明确日志；超时就跳过「锁定阵容」这一步继续跑，
++        绝不再把整个任务吞掉。锁定状态不对顶多是阵容没锁，远好过永久卡死。
++        :param lock_team_enable: True 需要锁定阵容，False 需要解除锁定
++        :param timeout: 最长尝试秒数
++        :return: True 表示达成目标状态；False 表示超时跳过
++        """
++        start = time.time()
++        want = 'lock' if lock_team_enable else 'unlock'
++        logger.info(f'Ensure team {want} (timeout {timeout}s)')
+         if lock_team_enable:
+-            while 1:
++            while time.time() - start < timeout:
+                 self.screenshot()
+                 if self.appear_then_click(self.I_UNLOCK, interval=1):
+                     continue
+                 if self.appear_then_click(self.I_UNLOCK_2, interval=1):
+                     continue
+                 if self.appear(self.I_LOCK_2, threshold=0.9):
+-                    break
++                    logger.info(f'Team locked ({self.I_LOCK_2.name})')
++                    return True
+                 if self.appear(self.I_LOCK, threshold=0.9):
+-                    break
+-            logger.info(f'Click {self.I_UNLOCK.name}')
++                    logger.info(f'Team locked ({self.I_LOCK.name})')
++                    return True
+         else:
+-            while 1:
++            while time.time() - start < timeout:
+                 self.screenshot()
+                 if self.appear_then_click(self.I_LOCK, interval=1):
+                     continue
+                 if self.appear_then_click(self.I_LOCK_2, interval=1):
+                     continue
+                 if self.appear(self.I_UNLOCK_2, threshold=0.9):
+-                    break
++                    logger.info(f'Team unlocked ({self.I_UNLOCK_2.name})')
++                    return True
+                 if self.appear(self.I_UNLOCK, threshold=0.9):
+-                    break
+-            logger.info(f'Click {self.I_LOCK.name}')
++                    logger.info(f'Team unlocked ({self.I_UNLOCK.name})')
++                    return True
++        logger.warning(f'Ensure team {want} timeout after {timeout}s: '
++                       f'识别不到锁定/未锁定图标，跳过这一步继续执行本任务。'
++                       f'（若阵容锁定状态不符合预期，请检查游戏内该图标是否被活动 UI 遮挡）')
++        return False
+ 
+     def is_frog(self, screenshot: bool=True) -> bool:
+         """
+@@ -301,7 +320,7 @@
+         if base < 0 or base > 30:
+             logger.warning(f'It is not a valid base {base}')
+             base = 0
+-        self.wait_until_appear(self.I_BACK_RED)
++        self.wait_until_appear(self.I_BACK_RED, wait_time=15)
+         self.screenshot()
+         cu, res, total = self.O_NUMBER.ocr(self.device.image)
+ 
+@@ -422,7 +441,7 @@
+         if screenshot:
+             self.screenshot()
+         # 由于更改识别顺序，退出战斗之后，需要先等待回到个人突破界面，即识别到红色退出按钮，再进行奖励判断
+-        self.wait_until_appear(self.I_BACK_RED)
++        self.wait_until_appear(self.I_BACK_RED, wait_time=15)
+         text = self.O_TEXT.ocr(self.device.image)
+         # 识别突破卷区域，如果识别到了且其中含有文字，即有聊天框遮挡则进入循环，等待三胜奖励出现并点击，循环退出条件为识别到票（即*/*的形式）
+         if text != "":
+@@ -460,18 +479,28 @@
+         if not self.appear(self.I_FRESH):
+             logger.info(f'No find refresh button and it is in CD')
+             return False
+-        while 1:
++        # 【二开修复 handoff/20】这两个 while 1 原本也没有超时：
++        # 点了「刷新」却等不到确认弹窗（或弹窗关不掉）时会静默卡死，这里统一加 15 秒上限。
++        timeout = 15
++        start = time.time()
++        while time.time() - start < timeout:
+             self.screenshot()
+             if self.appear(self.I_FRESH_ENSURE):
+                 break
+             if self.appear_then_click(self.I_FRESH, interval=1):
+                 continue
+-        while 1:
++        else:
++            logger.warning('Refresh: 点击刷新后 15s 内没等到确认弹窗，按“刷新失败”处理')
++            return False
++        start = time.time()
++        while time.time() - start < timeout:
+             self.screenshot()
+             if not self.appear(self.I_FRESH_ENSURE):
+                 return True
+             if self.appear_then_click(self.I_FRESH_ENSURE, interval=1):
+                 continue
++        logger.warning('Refresh: 确认弹窗 15s 内没有消失，按已刷新继续')
++        return True
+ 
+     def fire(self, order: int):
+         """
+@@ -481,9 +510,14 @@
+         """
+         retry_clean = 0
+         while not self.appear(self.I_RR_PERSON):
++            # 【二开修复 handoff/20】原来这里只打一条 warning 就继续 while，等于永远出不去：
++            # 一旦「个人」标题识别不到，就会一直点屏幕顶部并无限重试，日志刷屏却永不结束。
++            # 现在超过上限就抛 GameStuckError，交给 OAS 自己的异常处理（保存截图 / 重启流程）。
+             if retry_clean > 20:
+-                logger.warning("Stuck too long, try force quit or random click")
+-            
++                logger.critical('Stuck too long: 识别不到「个人」标题(I_RR_PERSON)，'
++                                '放弃本次挑战并交给异常处理')
++                raise GameStuckError('RealmRaid: I_RR_PERSON not found after 20 retries')
++
+             logger.info("Title not found! Checking for popups or rewards...")
+             
+             # 如果看到了“刷新确认”弹窗 (I_FRESH_ENSURE 是右边的确定)

@@ -1,0 +1,182 @@
+--- a/module/server/app.py
++++ b/module/server/app.py
+@@ -6,6 +6,7 @@
+ from contextlib import asynccontextmanager
+ 
+ import argparse
++import asyncio
+ from starlette import status
+ from starlette.responses import JSONResponse
+ from fastapi import FastAPI, Request
+@@ -35,8 +36,11 @@
+ 
+ app.add_middleware(
+     CORSMiddleware,
+-    allow_origins=["*"],
+-    allow_credentials=True,
++    # B1 (handoff/16): 仅放行本机来源，堵住 drive-by localhost 攻击面。
++    # 原生客户端(QML/OASX/Flutter)不是浏览器、不受 CORS 约束；标注器页面由本服务同源伺服。
++    allow_origins=["null"],
++    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$",
++    allow_credentials=False,
+     allow_methods=["*"],
+     allow_headers=["*"]
+ )
+@@ -55,6 +59,8 @@
+     app.state 的生命周期在定义app的时候就有了
+     :return:
+     """
++    # C2 (handoff/16): 记录主事件循环，供跨线程的状态/日志广播定向回来。
++    State.main_loop = asyncio.get_running_loop()
+     logger.info('OAS web service startup done')
+     if app.state.script_instances:
+         await mm.restart_processes(app.state.script_instances)
+--- a/module/server/setting.py
++++ b/module/server/setting.py
+@@ -60,6 +60,7 @@
+ 
+     restart_event: threading.Event = None
+     manager: SyncManager = None
++    main_loop = None  # asyncio 主事件循环，供跨线程广播定向（handoff/16 C2）
+ 
+     @classmethod
+     def init(cls):
+--- a/module/server/script_websocket.py
++++ b/module/server/script_websocket.py
+@@ -1,6 +1,7 @@
+ # This Python file uses the following encoding: utf-8
+ # @author runhey
+ # github https://github.com/runhey
++import asyncio
+ from typing import Iterable
+ 
+ from fastapi import WebSocket, WebSocketDisconnect
+@@ -50,12 +51,33 @@
+         # 广播日志
+         await self._broadcast(self.active_connections, lambda connection: connection.send_text(log))
+ 
++    @staticmethod
++    async def _run_on_main(make_coro) -> None:
++        """把一次实际发送调度到 WebSocket 所属的主事件循环执行。
++
++        上游把状态/日志推送放在独立线程的独立事件循环里(main_manager)，却直接向
++        uvicorn 主循环 accept 的 WebSocket 调用 send —— starlette 的 WebSocket 不是
++        跨循环安全的，会偶发丢消息/断连(handoff/16 C2)。若当前不在主循环，则用
++        run_coroutine_threadsafe 把这次发送定向回主循环；主循环未记录时按原样直接执行。
++        """
++        from module.server.setting import State
++        main_loop = State.main_loop
++        try:
++            current = asyncio.get_running_loop()
++        except RuntimeError:
++            current = None
++        if main_loop is not None and current is not None and main_loop is not current:
++            future = asyncio.run_coroutine_threadsafe(make_coro(), main_loop)
++            await asyncio.wrap_future(future)
++        else:
++            await make_coro()
++
+     async def _send(self, ws: WebSocket, sender, payload) -> bool:
+         if ws.client_state == WebSocketState.DISCONNECTED:
+             await self.disconnect(ws)
+             return False
+         try:
+-            await sender(payload)
++            await self._run_on_main(lambda: sender(payload))
+             return True
+         except (RuntimeError, WebSocketDisconnect):
+             await self.disconnect(ws)
+@@ -71,7 +93,7 @@
+                 dead_connections.append(connection)
+                 continue
+             try:
+-                await sender_factory(connection)
++                await self._run_on_main(lambda conn=connection: sender_factory(conn))
+             except (RuntimeError, WebSocketDisconnect):
+                 dead_connections.append(connection)
+             except Exception:
+--- a/module/server/main_manager.py
++++ b/module/server/main_manager.py
+@@ -17,13 +17,13 @@
+ 
+ class MainManager(ConfigManager):
+     # config_cache: Config = None  # 缓存当前切换的配置
+-    script_process: dict[str: ScriptProcess] = None  # 脚本进程
++    script_process: dict[str, ScriptProcess] = None  # 脚本进程  # C4: 原为 dict[str: ...] 语法笔误
+     push_data_thread: Thread = None  # 数据推送线程
+     signal_kill_server: bool = False
+ 
+     def __init__(self) -> None:
+         super().__init__()
+-        self.script_process: dict[str: ScriptProcess] = {}  # 脚本进程
++        self.script_process: dict[str, ScriptProcess] = {}  # 脚本进程
+         self._all_script_files = self.all_script_files()
+         for script_name in self._all_script_files:
+             self.script_process[script_name] = ScriptProcess(script_name)
+--- a/module/server/script_router.py
++++ b/module/server/script_router.py
+@@ -56,7 +56,7 @@
+         return False
+     if old_name in mm.script_process:
+         if mm.script_process[old_name].state != ScriptState.INACTIVE:
+-            mm.script_process[old_name].stop()
++            await mm.script_process[old_name].stop()  # fix: stop() is async, was silently discarded (handoff/15 A2)
+         del mm.script_process[old_name]
+     if not mm.rename(old_name, new_name):
+         raise HTTPException(status_code=400, detail='Rename failed')
+@@ -74,7 +74,7 @@
+         raise HTTPException(status_code=400, detail='Delete failed')
+     if name in mm.script_process:
+         if mm.script_process[name].state != ScriptState.INACTIVE:
+-            mm.script_process[name].stop()
++            await mm.script_process[name].stop()  # fix: stop() is async, was silently discarded (handoff/15 A2)
+         del mm.script_process[name]
+     if not mm.delete(name):
+         raise HTTPException(status_code=400, detail='Delete failed')
+@@ -106,7 +106,7 @@
+ async def script_start(script_name: str):
+     if script_name not in mm.script_process:
+         mm.script_process[script_name] = ScriptProcess(script_name)
+-    mm.script_process[script_name].start()
++    await mm.script_process[script_name].start()  # fix: start() is async; REST start was a silent no-op (handoff/15 A1)
+     return
+ 
+ @script_app.get('/{script_name}/stop')
+@@ -114,7 +114,7 @@
+     if script_name not in mm.script_process:
+         logger.warning(f'[{script_name}] script process does not exist')
+         return
+-    mm.script_process[script_name].stop()
++    await mm.script_process[script_name].stop()  # fix: stop() is async; REST stop was a silent no-op (handoff/15 A1)
+     return
+ 
+ @script_app.get('/{script_name}/{task}/args')
+@@ -122,7 +122,7 @@
+     return mm.config_cache(script_name).model.script_task(task)
+ 
+ @script_app.put('/{script_name}/{task}/{group}/{argument}/value')
+-async def script_task(script_name: str, task: str, group: str, argument: str, types: str, value):
++async def script_set_value(script_name: str, task: str, group: str, argument: str, types: str, value):  # C4: 原名 script_task 遮蔽上面的同名函数
+     try:
+         match types:
+             case 'integer':
+@@ -143,7 +143,7 @@
+                 value = datetime.strptime(value, '%Y-%m-%d %H:%M:%S')
+             case 'time_delta':
+                 # strptime 是个好东西，但是不能解析00的天数
+-                day = int(value[1])
++                day = int(value[:2])  # C1 (handoff/16): 原 int(value[1]) 丢十位，>=10 天被静默存成个位数
+                 date_time = datetime.strptime(value[3:], '%H:%M:%S')
+                 value = TimeDelta(days=day, hours=date_time.hour, minutes=date_time.minute, seconds=date_time.second)
+             case 'time':
+--- a/module/server/script_process.py
++++ b/module/server/script_process.py
+@@ -39,7 +39,7 @@
+             logger.warning(f'Script {self.config_name} is initialized')
+         if self._process and self._process.is_alive():
+             logger.warning(f'Script {self.config_name} is already running and first stop it')
+-            self.stop()
++            await self.stop()  # fix: was un-awaited -> second process spawned alongside the running one (handoff/15 A3)
+         self._process = multiprocessing.Process(target=func,
+                                                 args=(self.config_name, self.state_queue, self.log_pipe_in,),
+                                                 name=self.config_name,

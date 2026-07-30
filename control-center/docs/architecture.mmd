@@ -1,0 +1,33 @@
+%% OAS 控制中心 · 架构总览
+%% 源文件（唯一事实来源）：control-center/docs/architecture.mmd
+%% 渲染：VS Code Mermaid 预览插件 / https://mermaid.live / GitHub 自动渲染
+%% 更新步骤见 control-center/docs/architecture.md 的「架构图 · 维护与更新」一节
+flowchart TB
+    subgraph CLIENT["使用入口"]
+        BAT["启动.bat（双击）"]
+        BROWSER["浏览器 · UI-claude :4175（默认）/ 旧前端 :5173（-Prod）"]
+        DESKTOP["桌面版 portable（Electron，file:// 载入，回落 127.0.0.1:22367）"]
+    end
+    subgraph CC["control-center（本项目 · 独立目录 · 上游 git pull 不触及）"]
+        START["start.ps1 一键启动：探活 / 复用 / 端口避让"]
+        UI["前端源码 UI-claude<br/>desktop/release/UI-claude/src<br/>App.jsx · api.js · views.jsx · fields.jsx · locale.js"]
+        BRIDGE["Bridge 适配层 :22367<br/>bridge/app: main(19 路由) · core_client · runtime · repository · models · events<br/>SQLite: control-center/data/control_center.db（模板 / 昵称 / 任务顺序）"]
+    end
+    subgraph CORE["OAS Core（上游 runhey/OnmyojiAutoScript · git pull 会覆盖补丁）"]
+        SERVER["server.py → module/server :22267"]
+        PATCH["已打补丁 6 文件：app · setting · script_websocket<br/>script_router · script_process · main_manager<br/>补丁：handoff/patches/applied-03-security-and-correctness.diff"]
+    end
+    subgraph DEV["开发 / 演示 / 回归（无游戏）"]
+        MOCKCORE["mock Core :22268<br/>bridge/tests/mock_core.py（Core 契约的可执行副本）<br/>launcher/start-dev-stack.ps1"]
+        MOCKBRIDGE["mock bridge :22368<br/>UI-claude/tools/mock-bridge.mjs（/health 带 mock:true）"]
+    end
+    BAT --> START
+    START --> BROWSER
+    START --> BRIDGE
+    BROWSER -->|"HTTP + 事件 WS /api/v1"| BRIDGE
+    DESKTOP -->|"HTTP + 事件 WS /api/v1"| BRIDGE
+    UI -. 构建 / 伺服 .-> BROWSER
+    BRIDGE -->|"HTTP + WS /ws/配置名"| SERVER
+    SERVER --- PATCH
+    BRIDGE -. 联调时改指向 .-> MOCKCORE
+    BROWSER -. 离线试用 .-> MOCKBRIDGE

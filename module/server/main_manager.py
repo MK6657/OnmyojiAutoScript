@@ -17,13 +17,13 @@ from module.server.config_manager import ConfigManager
 
 class MainManager(ConfigManager):
     # config_cache: Config = None  # 缓存当前切换的配置
-    script_process: dict[str: ScriptProcess] = None  # 脚本进程
+    script_process: dict[str, ScriptProcess] = None  # 脚本进程  # C4: 原为 dict[str: ...] 语法笔误
     push_data_thread: Thread = None  # 数据推送线程
     signal_kill_server: bool = False
 
     def __init__(self) -> None:
         super().__init__()
-        self.script_process: dict[str: ScriptProcess] = {}  # 脚本进程
+        self.script_process: dict[str, ScriptProcess] = {}  # 脚本进程
         self._all_script_files = self.all_script_files()
         for script_name in self._all_script_files:
             self.script_process[script_name] = ScriptProcess(script_name)

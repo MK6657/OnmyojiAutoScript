@@ -83,47 +83,79 @@ class GeneralBattle(GeneralBuff, GeneralBattleAssets):
         :param config:
         :return:
         """
+        # 【二开修复 handoff/21】本方法原本有 4 个「无超时」的 while 1。
+        # 只要「退出确认」弹窗(I_EXIT_ENSURE)的模板匹配不上（游戏改版 / 分辨率差异），
+        # 就会无限重复点左上角退出键——而弹窗正挡在前面，点了根本没用，
+        # 于是任务静默卡死、日志一直刷 Click GB_EXIT（2026-07-27 个人突破「打九退四」实测复现）。
+        # 现在：每个循环都限时；识别不到确认按钮时，按它的 ROI 中心盲点一次兜底再继续。
+        timeout = 12
+        ok = True
+
         # 如果没有锁定队伍那么在点击准备后才退出的,退四的话就直接退出
         if not config.lock_team_enable and not exit_four:
             # 点击准备按钮
-            self.wait_until_appear(self.I_PREPARE_HIGHLIGHT)
-            while 1:
+            self.wait_until_appear(self.I_PREPARE_HIGHLIGHT, wait_time=15)
+            t0 = time.time()
+            while time.time() - t0 < timeout:
                 self.screenshot()
                 if self.appear_then_click(self.I_PREPARE_HIGHLIGHT, interval=1.5):
                     continue
                 if not (self.appear(self.I_PRESET) or self.appear(self.I_PRESET_WIT_NUMBER)):
                     break
+            else:
+                ok = False
+                logger.warning(f'{self.I_PREPARE_HIGHLIGHT.name} 点击准备超时({timeout}s)，继续尝试退出')
             logger.info(f"Click {self.I_PREPARE_HIGHLIGHT.name}")
 
         # 点击返回
-        while 1:
+        t0 = time.time()
+        ensure_seen = False
+        while time.time() - t0 < timeout:
             self.screenshot()
             if self.appear_then_click(self.I_EXIT, interval=1.5):
                 continue
             if self.appear(self.I_EXIT_ENSURE):
+                ensure_seen = True
                 break
-        logger.info(f"Click {self.I_EXIT.name}")
+        if ensure_seen:
+            logger.info(f"Click {self.I_EXIT.name}")
+        else:
+            # 兜底：弹窗多半已经在屏幕上，只是模板认不出来，按 ROI 中心直接点一次
+            ok = False
+            ex, ey, ew, eh = self.I_EXIT_ENSURE.roi_front
+            logger.warning(f'{self.I_EXIT_ENSURE.name} {timeout}s 内识别不到，'
+                           f'按 ROI 中心({int(ex + ew / 2)},{int(ey + eh / 2)}) 盲点一次兜底')
+            self.device.click(int(ex + ew / 2), int(ey + eh / 2))
+            time.sleep(1.2)
 
         # 点击返回确认
-        while 1:
+        t0 = time.time()
+        while time.time() - t0 < timeout:
             self.screenshot()
             if self.appear_then_click(self.I_EXIT_ENSURE, interval=1.5):
                 continue
             if self.appear(self.I_FALSE):
                 break
+        else:
+            ok = False
+            logger.warning(f'{self.I_FALSE.name} {timeout}s 内没出现，跳过失败结算确认继续')
         logger.info(f"Click {self.I_EXIT_ENSURE.name}")
 
         # 点击失败确认
-        self.wait_until_appear(self.I_FALSE)
-        while 1:
+        self.wait_until_appear(self.I_FALSE, wait_time=10)
+        t0 = time.time()
+        while time.time() - t0 < timeout:
             self.screenshot()
             if self.appear_then_click(self.I_FALSE, interval=1.5):
                 continue
             if not self.appear(self.I_FALSE):
                 break
+        else:
+            ok = False
+            logger.warning(f'{self.I_FALSE.name} {timeout}s 内没能关掉，继续执行')
         logger.info(f"Click {self.I_FALSE.name}")
 
-        return True
+        return ok
 
     def exit_battle(self, skip_first: bool = False) -> bool:
         """
@@ -136,17 +168,27 @@ class GeneralBattle(GeneralBuff, GeneralBattleAssets):
         if not self.appear(self.I_EXIT):
             return False
 
-        # 点击返回
+        # 点击返回（【二开修复 handoff/21】同样加超时，避免弹窗认不出时无限点退出键）
         logger.info(f"Click {self.I_EXIT.name}")
-        while 1:
+        timeout = 12
+        t0 = time.time()
+        ensure_seen = False
+        while time.time() - t0 < timeout:
             self.screenshot()
             if self.appear_then_click(self.I_EXIT, interval=1.5):
                 continue
             if self.appear(self.I_EXIT_ENSURE):
+                ensure_seen = True
                 break
+        if not ensure_seen:
+            ex, ey, ew, eh = self.I_EXIT_ENSURE.roi_front
+            logger.warning(f'{self.I_EXIT_ENSURE.name} {timeout}s 内识别不到，按 ROI 中心盲点一次兜底')
+            self.device.click(int(ex + ew / 2), int(ey + eh / 2))
+            time.sleep(1.2)
 
         # 点击返回确认
-        while 1:
+        t0 = time.time()
+        while time.time() - t0 < timeout:
             self.screenshot()
             if self.appear_then_click(self.I_EXIT_ENSURE, interval=1.5):
                 continue
@@ -154,6 +196,9 @@ class GeneralBattle(GeneralBuff, GeneralBattleAssets):
                 continue
             if not self.appear(self.I_EXIT):
                 break
+        else:
+            logger.warning(f'exit_battle: {timeout}s 内没能确认退出，交由上层逻辑继续处理')
+            return False
 
         return True
 

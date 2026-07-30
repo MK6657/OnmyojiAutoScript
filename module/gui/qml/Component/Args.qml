@@ -556,9 +556,12 @@ Item {
         const values = JSON.parse(valueData)
         const group = MP.parseGroup(args["properties"])
         const groups = MP.parseGroups(args["properties"])
+        // Pydantic 1 emits `definitions`, while Pydantic 2 emits `$defs`.
+        // The project requirements use Pydantic 2, so accept both schema forms.
+        const definitions = args["definitions"] || args["$defs"] || {}
 
         for(let task in group){
-            const argument = MP.parseArgument(args.definitions, group[task])
+            const argument = MP.parseArgument(definitions, group[task])
             const groupLetter = groups[group[task]]
             const argumentVuale = MP.mergeArgument(argument, values[groupLetter])
 //            console.debug(JSON.stringify( argumentVuale ))

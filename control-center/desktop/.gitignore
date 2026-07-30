@@ -1,0 +1,16 @@
+node_modules/
+ui/
+bridge-dist/
+build/
+release/
+data-seed/
+bridge-test-data/
+
+# UI-claude is the active MK6657 secondary-development frontend source.
+# Keep other release outputs ignored, but version this source tree.
+!release/
+release/*
+!release/UI-claude/
+!release/UI-claude/**
+release/UI-claude/node_modules/
+release/UI-claude/dist/

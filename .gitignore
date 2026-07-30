@@ -49,6 +49,14 @@ CLAUDE.md
 .claude/
 openspec/
 
+# MK6657 secondary development: local/generated artifacts
+node_modules/
+.playwright-cli/
+output/
+control-center/data/*.db
+control-center/data/*.db-*
+control-center/bridge/app/_backup_*/
+
 
 # Created by .ignore support plugin (hsz.mobi)
 

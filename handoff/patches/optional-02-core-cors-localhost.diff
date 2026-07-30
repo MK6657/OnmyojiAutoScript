@@ -1,0 +1,17 @@
+--- a/module/server/app.py
++++ b/module/server/app.py
+@@ -35,8 +35,12 @@
+ 
+ app.add_middleware(
+     CORSMiddleware,
+-    allow_origins=["*"],
+-    allow_credentials=True,
++    # optional-02 (handoff/15 B1): restrict browser origins to localhost.
++    # Native clients (QML/OASX/Flutter) are unaffected by CORS; the annotator
++    # page is served same-origin by this app itself.
++    allow_origins=["null"],
++    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$",
++    allow_credentials=False,
+     allow_methods=["*"],
+     allow_headers=["*"]
+ )

@@ -1,0 +1,49 @@
+{
+  "name": "oas-control-center-desktop",
+  "version": "0.1.0",
+  "description": "OAS Control Center desktop shell",
+  "private": true,
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "package:windows": "powershell -ExecutionPolicy Bypass -File build.ps1"
+  },
+  "devDependencies": {
+    "electron": "^37.2.6",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "local.osayyys.controlcenter",
+    "productName": "OAS 控制中心",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.cjs",
+      "preload.cjs",
+      "ui/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "bridge-dist",
+        "to": "bridge",
+        "filter": ["oas-control-bridge.exe"]
+      },
+      {
+        "from": "data-seed",
+        "to": "data-seed",
+        "filter": ["control_center.db"]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": ["x64"]
+        }
+      ],
+      "artifactName": "OAS-Control-Center-${version}-portable.exe"
+    }
+  }
+}

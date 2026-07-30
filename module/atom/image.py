@@ -35,6 +35,13 @@ class RuleImage(RuleImageMallResourceMixin):
         self.roi_back = roi_back
         self.threshold = threshold
         self.file = file
+        # 【二开 handoff/22】多模板支持：file 可写成 "a.png|b.png"，任意一张匹配上即命中。
+        # 解决「同一按钮在白天/夜间/活动皮肤下配色不同导致模板失配」的通病。
+        # 不含 "|" 时行为与原来完全一致。
+        self.files = [f.strip() for f in str(file).split('|') if f.strip()]
+        if self.files:
+            self.file = self.files[0]
+        self._images = None
 
 
 
@@ -69,8 +76,20 @@ class RuleImage(RuleImageMallResourceMixin):
         """
         if self._image is not None:
             return
-        img = cv2.imdecode(fromfile(self.file, dtype=uint8), -1)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        images = []
+        for _f in (self.files or [self.file]):
+            _img = cv2.imdecode(fromfile(_f, dtype=uint8), -1)
+            if _img is None:
+                logger.warning(f'Template unreadable, skipped: {_f}')
+                continue
+            if len(_img.shape) == 3 and _img.shape[2] == 4:
+                _img = cv2.cvtColor(_img, cv2.COLOR_BGRA2BGR)
+            images.append(cv2.cvtColor(_img, cv2.COLOR_BGR2RGB))
+        if not images:
+            logger.error(f'No valid template image for {self.file}')
+            return
+        self._images = images
+        img = images[0]
         self._image = img
 
         height, width, channels = self._image.shape
@@ -151,20 +170,34 @@ class RuleImage(RuleImageMallResourceMixin):
             # raise Exception(f"unknown method {self.method}")
 
         source = self.corp(image)
-        mat = self.image
+        if self.image is None:
+            logger.error(f"Template image is invalid for {self.file}")
+            return False
+        mats = self._images if self._images else [self.image]
 
-        if mat is None or mat.shape[0] == 0 or mat.shape[1] == 0:
-            logger.error(f"Template image is invalid: {mat.shape}")
-            return False  # 模板无效，匹配失败
-
-        res = cv2.matchTemplate(source, mat, cv2.TM_CCOEFF_NORMED)
-        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)  # 最小匹配度，最大匹配度，最小匹配度的坐标，最大匹配度的坐标
+        # 【二开 handoff/22】逐张模板匹配，取分数最高的一张。单模板时行为与原来一致。
+        max_val, max_loc, best = -1.0, None, None
+        for mat in mats:
+            if mat is None or mat.shape[0] == 0 or mat.shape[1] == 0:
+                continue
+            if mat.shape[0] > source.shape[0] or mat.shape[1] > source.shape[1]:
+                continue  # 模板比搜索区还大，跳过，否则 matchTemplate 会抛异常
+            res = cv2.matchTemplate(source, mat, cv2.TM_CCOEFF_NORMED)
+            _min_val, _max_val, _min_loc, _max_loc = cv2.minMaxLoc(res)
+            if _max_val > max_val:
+                max_val, max_loc, best = _max_val, _max_loc, mat
+        if best is None:
+            logger.error(f"No usable template for {self.file}")
+            return False
         if self.debug_mode:
-            logger.attr(self.name, f'matching score {max_val:.5f}')
+            logger.attr(self.name, f'matching score {max_val:.5f} (of {len(mats)} template(s))')
 
         if max_val > threshold:
             self.roi_front[0] = max_loc[0] + self.roi_back[0]
             self.roi_front[1] = max_loc[1] + self.roi_back[1]
+            # 命中的模板尺寸可能与首张不同，同步过去，保证 coord()/front_center() 点在正确位置
+            self.roi_front[2] = best.shape[1]
+            self.roi_front[3] = best.shape[0]
             return True
         else:
             return False

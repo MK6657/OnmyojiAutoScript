@@ -1,0 +1,6 @@
+OAS Control Center 项目交接包
+版本：1.0.0
+交接快照：2026-07-26
+根目录：D:\OSAyys
+程序：control-center\desktop\release\OAS-Control-Center-0.1.0-portable.exe
+状态：已完成本机接口、前端构建、Bridge 打包和交接资料核验

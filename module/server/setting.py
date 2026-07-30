@@ -60,6 +60,7 @@ class State:
 
     restart_event: threading.Event = None
     manager: SyncManager = None
+    main_loop = None  # asyncio 主事件循环，供跨线程广播定向（handoff/16 C2）
 
     @classmethod
     def init(cls):

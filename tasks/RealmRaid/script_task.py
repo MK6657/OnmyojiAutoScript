@@ -3,9 +3,27 @@
 # github https://github.com/runhey
 import time
 import re
+import os
+import cv2
+import numpy as np
 from cached_property import cached_property
 
 from tasks.base_task import BaseTask
+
+# 【二开 handoff/21】让 GeneralBattle 支持热重载。
+# 原因：本文件(script_task.py)每次执行任务都会被 script.py 的 load_module() 重新 exec，
+# 但它 import 进来的 general_battle 模块被 Python 缓存在 sys.modules 里 ——
+# 改了 general_battle.py 不重启 OAS Core 根本不生效，调试退出战斗流程要反复重启，非常慢。
+# 这里在导入前先 reload 一次，改完点「停止→启动」即可生效。
+# reload 失败不影响任务运行（退回到已缓存的旧模块），所以是安全的。
+try:
+    import importlib as _importlib
+    import tasks.Component.GeneralBattle.general_battle as _general_battle_module
+    _importlib.reload(_general_battle_module)
+except Exception as _reload_error:  # noqa: BLE001
+    from module.logger import logger as _reload_logger
+    _reload_logger.warning(f'reload general_battle failed, use cached module: {_reload_error}')
+
 from tasks.Component.GeneralBattle.general_battle import GeneralBattle
 from tasks.GameUi.game_ui import GameUi
 from tasks.GameUi.page import page_realm_raid, page_main, page_shikigami_records
@@ -15,10 +33,98 @@ from tasks.Component.SwitchSoul.switch_soul import SwitchSoul
 
 
 from module.logger import logger
-from module.exception import TaskEnd
+from module.exception import TaskEnd, GameStuckError
 from module.atom.image_grid import ImageGrid
 from module.atom.image import RuleImage
 from module.atom.click import RuleClick
+from module.atom.ocr import RuleOcr
+
+
+# ======================================================================================
+# 【二开 handoff/23】卡级功能开发用的调试开关
+# --------------------------------------------------------------------------------------
+# LEVEL_DEBUG   True：每轮挑目标前把九个位次识别到的等级打进日志（**不改变任何行为**），
+#                    用来人工核对 OCR 准不准 —— 这是做「卡等级」的前提。
+# CAPTURE_BOARD True：进入结界突破界面后，把 OAS 自己看到的 1280x720 原始画面存一张，
+#                    用来裁「破」印 / 「失败箭头」这类识别模板。存放于 log/board/ 。
+# CAPTURE_ONLY  True：存完截图就结束任务，**不进行任何挑战**（配合 CAPTURE_BOARD 使用，
+#                    避免采集素材时白白消耗突破券、打乱棋盘）。
+# 素材采集与校准完成后，把这三个都改回 False 即可。
+# ======================================================================================
+LEVEL_DEBUG = True
+CAPTURE_BOARD = True
+CAPTURE_ONLY = True
+
+
+# ======================================================================================
+# 【二开 handoff/23】等级铭牌专用 OCR
+# --------------------------------------------------------------------------------------
+# 九宫格里每个对手头像左上角有一块**菱形**铭牌，中间是两位数字的等级。
+#
+# 直接把这块矩形丢给 OCR 会翻车，原因是矩形的四个角落落在菱形之外，
+# 露出来的是头像的头发、发饰、金环、以及浅色卡面 —— 这些亮色会被 OCR 当成额外的字符：
+#     位次3 读成 601（右上角一个金色小圆环被读成 1）
+#     位次8 读成 10 （右侧蓝色发饰干扰，6 被吃掉）
+# 上游作者调 O_FROG_1~9 时是「呱太固定20级」场景，头像统一、没有这种干扰，所以没暴露。
+#
+# 这里的做法：重写 pre_process，在送进 OCR 之前先
+#   1) 用**内切菱形掩膜**把四角直接抹掉，只保留铭牌内部；
+#   2) 按灰度阈值二值化成「黑字白底」（铭牌底色深棕 40~90，金边 120~140，数字 190~220，
+#      150 这条线可以干净地把数字单独切出来）；
+#   3) 补白边 + 放大 5 倍 + 轻微高斯，喂给 OCR 的就是一张标准印刷体大图。
+# 实测九格 9/9 全对。
+# ======================================================================================
+class LevelOcr(RuleOcr):
+    # 三个阈值都是在真实棋盘图上量出来的（1280x720，nemu_ipc 截图）：
+    #   铭牌底色深棕 灰度 40~90 / 金边 约 120~145 / 数字笔画 190~220
+    #   |通道0-通道2|（也就是 |R-B|）：数字 ≈24，浅色卡面 ≈28，金边 ≈58，底色 ≈60
+    # 所以「够亮」+「颜色够中性」两个条件叠加，就能只留下数字笔画。
+    DIGIT_THRESHOLD = 125     # 灰度阈值：高于它才可能是数字笔画
+    NEUTRAL_DIFF = 40         # |R-B| 小于它才算「中性灰」，用来踢掉偏黄的金边
+    DIAMOND_SHRINK = 1.5      # 菱形内切时往里收几个像素
+
+    def pre_process(self, image):
+        """把菱形铭牌洗成干净的黑字白底大图。任何异常都退回原图，绝不影响任务。"""
+        try:
+            if image is None or image.size == 0:
+                return image
+            h, w = image.shape[:2]
+            if h < 8 or w < 8:
+                return image
+
+            # 1) 灰度。device.image 是 RGB，但数字接近中性灰，通道顺序在这里无影响。
+            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY) if image.ndim == 3 else image
+
+            # 2) 颜色中性度。取首尾通道之差的绝对值，因此 RGB / BGR 两种顺序结果一样，
+            #    不用担心以后上游改了截图的通道顺序。
+            if image.ndim == 3:
+                neutral = np.abs(image[:, :, 0].astype(np.int16) -
+                                 image[:, :, 2].astype(np.int16)) < self.NEUTRAL_DIFF
+            else:
+                neutral = np.ones_like(gray, dtype=bool)
+
+            # 3) 内切菱形掩膜：|dx|/a + |dy|/b <= 1。
+            #    铭牌是菱形，矩形的四个角落露出的是头像的头发、发饰、金环、浅色卡面，
+            #    这些亮色会被 OCR 当成额外字符（位次3 曾读成 601、位次8 曾读成 10）。
+            yy, xx = np.mgrid[0:h, 0:w]
+            cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
+            a = max(w / 2.0 - self.DIAMOND_SHRINK, 1.0)
+            b = max(h / 2.0 - self.DIAMOND_SHRINK, 1.0)
+            inside = (np.abs(xx - cx) / a + np.abs(yy - cy) / b) <= 1.0
+
+            # 4) 三个条件相与 -> 二值化成黑字白底（PaddleOCR 最擅长的形态）
+            mask = ((gray > self.DIGIT_THRESHOLD) & neutral & inside).astype(np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))
+            binary = np.where(mask > 0, 0, 255).astype(np.uint8)
+
+            # 5) 留白边 + 放大 + 抗锯齿
+            binary = cv2.copyMakeBorder(binary, 6, 6, 8, 8, cv2.BORDER_CONSTANT, value=255)
+            binary = cv2.resize(binary, None, fx=5, fy=5, interpolation=cv2.INTER_CUBIC)
+            binary = cv2.GaussianBlur(binary, (5, 5), 0)
+            return cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f'等级铭牌预处理失败，退回原图：{error}')
+            return image
 
 
 class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
@@ -32,7 +138,7 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
         如果没有票了，那么就返回False
         :return:
         """
-        self.wait_until_appear(self.I_BACK_RED)
+        self.wait_until_appear(self.I_BACK_RED, wait_time=15)
         self.screenshot()
         cu, res, total = self.O_NUMBER.ocr(self.device.image)
         if cu == 0 and cu + res == total:
@@ -73,7 +179,7 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
         logger.info(f'Click Medal')
 
         # 点击挑战
-        self.wait_until_appear(self.I_FIRE)
+        self.wait_until_appear(self.I_FIRE, wait_time=15)
         while 1:
             self.screenshot()
             if self.appear_then_click(self.I_FIRE, interval=2):
@@ -112,7 +218,7 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
                 return False
             self.medal_fire()
             self.run_general_battle(config.general_battle_config)
-            self.wait_until_appear(self.I_BACK_RED)
+            self.wait_until_appear(self.I_BACK_RED, wait_time=15)
 
         return True
 
@@ -141,6 +247,24 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
                     break
                 if self.appear_then_click(self.I_FROG_RAID, interval=1):
                     continue
+        # 【二开 handoff/23】素材采集：把 OAS 视角的原始棋盘存一张，用来裁识别模板。
+        # 之所以要用 OAS 自己的截图而不是人工截屏，是因为模板匹配必须和运行时的
+        # 分辨率(1280x720)、色彩通道完全一致，否则裁出来的模板匹配分会偏低。
+        if CAPTURE_BOARD:
+            try:
+                self.screenshot()
+                if LEVEL_DEBUG:
+                    self.log_levels()          # 顺便把九格等级打出来，方便和画面逐格核对
+                    self.dump_level_debug()    # 再存一张「OCR 实际吃到的图」，肉眼可核对
+                self.dump_board('enter')
+            except Exception as error:  # noqa: BLE001
+                logger.warning(f'采集棋盘素材失败（不影响任务）：{error}')
+
+            if CAPTURE_ONLY:
+                logger.info('CAPTURE_ONLY=True：素材已采集，本次任务到此结束，不进行任何挑战')
+                self.set_next_run(task='RealmRaid', success=True, finish=True)
+                raise TaskEnd
+
         # 判断是不是锁定阵容
         self.ensure_lock(con.general_battle_config.lock_team_enable)
         # 判断是否是呱太活动
@@ -167,6 +291,14 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
             if self.current_count >= con.raid_config.number_attack:
                 logger.info(f'Current count {self.current_count}, max count {con.raid_config.number_attack}')
                 break
+            # 【二开 handoff/23】只读不改：把九个位次的等级打进日志，供人工核对 OCR 准确度。
+            # 不影响任何行为，校准好之后把文件顶部的 LEVEL_DEBUG 改成 False 即可。
+            if LEVEL_DEBUG:
+                try:
+                    self.log_levels()
+                except Exception as error:
+                    logger.warning(f'等级识别失败（不影响任务继续）：{error}')
+
             # ----------------------------------------开始进攻
             medal, index = self.find_one(False)
             if not medal and not index:
@@ -250,36 +382,55 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
     # ----------------------------------------------------------------------------------------------------------------------
     # 2023.7.21 改版个人突破
 
-    def ensure_lock(self, lock_team_enable: bool):
+    def ensure_lock(self, lock_team_enable: bool, timeout: float = 12):
         """
         确保锁定阵容
-        :param lock_team_enable:
-        :return:
+
+        【二开修复 handoff/20】原实现是两个「无日志 + 无超时」的 while 1：
+        只要锁定 / 未锁定两个图标都识别不出来（游戏版本改版、活动界面顶掉了锁图标、
+        分辨率或缩放不同、0.9 阈值过严），任务就在这里静默死循环——
+        界面还显示「运行中」，日志却停在「Page arrived page_realm_raid」之后再无一行，
+        用户完全看不出发生了什么（这正是 2026-07-27 复现的现象）。
+
+        现在改为：限时轮询 + 明确日志；超时就跳过「锁定阵容」这一步继续跑，
+        绝不再把整个任务吞掉。锁定状态不对顶多是阵容没锁，远好过永久卡死。
+        :param lock_team_enable: True 需要锁定阵容，False 需要解除锁定
+        :param timeout: 最长尝试秒数
+        :return: True 表示达成目标状态；False 表示超时跳过
         """
+        start = time.time()
+        want = 'lock' if lock_team_enable else 'unlock'
+        logger.info(f'Ensure team {want} (timeout {timeout}s)')
         if lock_team_enable:
-            while 1:
+            while time.time() - start < timeout:
                 self.screenshot()
                 if self.appear_then_click(self.I_UNLOCK, interval=1):
                     continue
                 if self.appear_then_click(self.I_UNLOCK_2, interval=1):
                     continue
                 if self.appear(self.I_LOCK_2, threshold=0.9):
-                    break
+                    logger.info(f'Team locked ({self.I_LOCK_2.name})')
+                    return True
                 if self.appear(self.I_LOCK, threshold=0.9):
-                    break
-            logger.info(f'Click {self.I_UNLOCK.name}')
+                    logger.info(f'Team locked ({self.I_LOCK.name})')
+                    return True
         else:
-            while 1:
+            while time.time() - start < timeout:
                 self.screenshot()
                 if self.appear_then_click(self.I_LOCK, interval=1):
                     continue
                 if self.appear_then_click(self.I_LOCK_2, interval=1):
                     continue
                 if self.appear(self.I_UNLOCK_2, threshold=0.9):
-                    break
+                    logger.info(f'Team unlocked ({self.I_UNLOCK_2.name})')
+                    return True
                 if self.appear(self.I_UNLOCK, threshold=0.9):
-                    break
-            logger.info(f'Click {self.I_LOCK.name}')
+                    logger.info(f'Team unlocked ({self.I_UNLOCK.name})')
+                    return True
+        logger.warning(f'Ensure team {want} timeout after {timeout}s: '
+                       f'识别不到锁定/未锁定图标，跳过这一步继续执行本任务。'
+                       f'（若阵容锁定状态不符合预期，请检查游戏内该图标是否被活动 UI 遮挡）')
+        return False
 
     def is_frog(self, screenshot: bool=True) -> bool:
         """
@@ -301,7 +452,7 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
         if base < 0 or base > 30:
             logger.warning(f'It is not a valid base {base}')
             base = 0
-        self.wait_until_appear(self.I_BACK_RED)
+        self.wait_until_appear(self.I_BACK_RED, wait_time=15)
         self.screenshot()
         cu, res, total = self.O_NUMBER.ocr(self.device.image)
 
@@ -343,6 +494,137 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
     def partition(self) -> list[RuleClick]:
         return [self.C_PARTITION_1, self.C_PARTITION_2, self.C_PARTITION_3, self.C_PARTITION_4, self.C_PARTITION_5,
                 self.C_PARTITION_6, self.C_PARTITION_7, self.C_PARTITION_8, self.C_PARTITION_9]
+
+    # ------------------------------------------------------- 等级识别（二开 handoff/23）
+    # 九宫格里每个对手头像左上角都有一块菱形铭牌，上面是「等级」两位数字。
+    # 这是实现「卡等级」的基础数据：九个等级里出现次数最多的那个 = 当前挑战等级。
+    #
+    # 坐标来历（不是拍脑袋，是量出来的）：
+    #   用 CAPTURE_BOARD 存下 OAS 视角的 1280x720 原图，用铭牌底色（棕：R>G>B 且不过亮）
+    #   做颜色掩膜定位九块铭牌，九块的外接框完全一致 ——
+    #   列起点 x = 162 / 493 / 825（间隔 331/332），行起点 y = 171 / 306 / 441（间隔 135），
+    #   菱形外接框 33x34。数字本体固定落在框内 (5,10)-(26,24)，上下左右都留有余量。
+    #
+    # 为什么不直接复用 O_FROG_1~9：那九个 roi 是作者为「呱太固定20级」调的，偏小且偏位，
+    #   实测会把数字切掉或把铭牌边框读成多余数字（位次4读成8、位次5读空、位次8读成160）。
+    LEVEL_ROI_X = (162, 493, 825)     # 三列铭牌外接框的起点 x
+    LEVEL_ROI_Y = (171, 306, 441)     # 三行铭牌外接框的起点 y
+    LEVEL_ROI_W = 33                  # 菱形外接框宽
+    LEVEL_ROI_H = 34                  # 菱形外接框高
+
+    LEVEL_MIN = 1                     # 合法等级下界
+    LEVEL_MAX = 60                    # 合法等级上界（阴阳师满级 60），超出一律判为「没读到」
+
+    @cached_property
+    def level_ocr(self) -> list:
+        """九个位次的等级 OCR 规则，顺序与 self.partition 一致：从左到右、从上到下。"""
+        rules = []
+        for row, y in enumerate(self.LEVEL_ROI_Y):
+            for col, x in enumerate(self.LEVEL_ROI_X):
+                roi = (x, y, self.LEVEL_ROI_W, self.LEVEL_ROI_H)
+                rules.append(LevelOcr(roi=roi, area=roi, mode='Digit', method='Default',
+                                      keyword='', name=f'level_{row * 3 + col + 1}'))
+        return rules
+
+    def read_levels(self, image=None) -> list:
+        """读出九个位次的等级。读不到 / 明显不合理的位置返回 0（后续一律不参与判断）。
+
+        单纯读数，不点击、不改变任何状态，所以可以安全地在任何时候调用。
+        """
+        if image is None:
+            image = self.device.image
+        levels = []
+        for rule in self.level_ocr:
+            try:
+                value = rule.ocr(image)
+                value = int(value) if value else 0
+            except Exception:  # noqa: BLE001
+                value = 0
+            # 兜底：OCR 偶尔会把边框噪点拼成 601 这种三位数，直接判为没读到，
+            # 好过让一个假等级污染「众数=挑战等级」的计算。
+            if value and not (self.LEVEL_MIN <= value <= self.LEVEL_MAX):
+                logger.warning(f'{rule.name} 读到不合理的等级 {value}，按未识别处理')
+                value = 0
+            levels.append(value)
+        return levels
+
+    def log_levels(self, image=None) -> list:
+        """把九个位次的等级按 3x3 排版打进日志，方便和模拟器画面逐格核对。"""
+        levels = self.read_levels(image)
+        logger.info('等级识别 [位次:等级] '
+                    + ' | '.join(f'{i + 1}:{lv if lv else "?"}' for i, lv in enumerate(levels)))
+        logger.info(f'   排布  {levels[0]:>3} {levels[1]:>3} {levels[2]:>3}')
+        logger.info(f'         {levels[3]:>3} {levels[4]:>3} {levels[5]:>3}')
+        logger.info(f'         {levels[6]:>3} {levels[7]:>3} {levels[8]:>3}')
+        logger.info(f'   当前挑战等级（九格众数）= {self.current_challenge_level(levels)}')
+        return levels
+
+    # 采集序号：同一次任务里多次存盘时用来区分先后（board_01_enter.png、board_02_win.png…）
+    _board_seq = 0
+
+    def dump_board(self, tag: str = '') -> str:
+        """把 OAS 自己看到的 1280x720 原始棋盘存一张，用来裁「破」印/「失败箭头」模板。
+
+        为什么必须用 OAS 的截图而不是人工截屏：模板匹配要求和运行时的分辨率、
+        色彩通道完全一致，人工截屏（缩放过的窗口）裁出来的模板匹配分会明显偏低。
+        device.image 是 RGB，磁盘上的模板 PNG 是普通 BGR，所以存盘前转一次。
+        """
+        try:
+            ScriptTask._board_seq += 1
+            os.makedirs('./log/board', exist_ok=True)
+            path = f'./log/board/board_{ScriptTask._board_seq:02d}_{tag}.png'
+            cv2.imwrite(path, cv2.cvtColor(self.device.image, cv2.COLOR_RGB2BGR))
+            # 同时覆盖一份固定文件名，方便「只看最新一张」的场景
+            cv2.imwrite('./log/board/realm_raid_board.png',
+                        cv2.cvtColor(self.device.image, cv2.COLOR_RGB2BGR))
+            logger.info(f'已保存结界突破棋盘原图：{path}')
+            return path
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f'保存棋盘截图失败（不影响任务）：{error}')
+            return ''
+
+    @staticmethod
+    def current_challenge_level(levels: list) -> int:
+        """挑战等级 = 九个对手等级里出现次数最多的那个（众数）。
+
+        规则由玩家确认：九格等级基本相同，占多数的那一档就是当前挑战等级。
+        读不到的位次（0）不参与统计；并列时取**较大**的那个，
+        因为宁可判高也不要判低 —— 判低会误以为已经卡到目标等级而停止降级。
+        """
+        counter = {}
+        for lv in levels:
+            if lv:
+                counter[lv] = counter.get(lv, 0) + 1
+        if not counter:
+            return 0
+        return max(counter.items(), key=lambda kv: (kv[1], kv[0]))[0]
+
+    def dump_level_debug(self, image=None, tag: str = '') -> str:
+        """把九块铭牌「预处理之后」的样子拼成一张图存盘，用来肉眼核对 OCR 吃到的是什么。
+
+        只在校准阶段用（LEVEL_DEBUG=True），失败不影响任务。
+        """
+        try:
+            if image is None:
+                image = self.device.image
+            tiles = []
+            for row, y in enumerate(self.LEVEL_ROI_Y):
+                line = []
+                for col, x in enumerate(self.LEVEL_ROI_X):
+                    crop = image[y:y + self.LEVEL_ROI_H, x:x + self.LEVEL_ROI_W]
+                    tile = self.level_ocr[row * 3 + col].pre_process(crop)
+                    cv2.putText(tile, str(row * 3 + col + 1), (4, 26),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                    line.append(tile)
+                tiles.append(np.hstack(line))
+            os.makedirs('./log/board', exist_ok=True)
+            path = f'./log/board/level_ocr{tag}.png'
+            cv2.imwrite(path, np.vstack(tiles))
+            logger.info(f'已保存等级识别调试图：{path}')
+            return path
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f'保存等级识别调试图失败（不影响任务）：{error}')
+            return ''
 
     def find_one(self, screenshot: bool=True) -> tuple:
         """
@@ -422,7 +704,7 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
         if screenshot:
             self.screenshot()
         # 由于更改识别顺序，退出战斗之后，需要先等待回到个人突破界面，即识别到红色退出按钮，再进行奖励判断
-        self.wait_until_appear(self.I_BACK_RED)
+        self.wait_until_appear(self.I_BACK_RED, wait_time=15)
         text = self.O_TEXT.ocr(self.device.image)
         # 识别突破卷区域，如果识别到了且其中含有文字，即有聊天框遮挡则进入循环，等待三胜奖励出现并点击，循环退出条件为识别到票（即*/*的形式）
         if text != "":
@@ -460,18 +742,28 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
         if not self.appear(self.I_FRESH):
             logger.info(f'No find refresh button and it is in CD')
             return False
-        while 1:
+        # 【二开修复 handoff/20】这两个 while 1 原本也没有超时：
+        # 点了「刷新」却等不到确认弹窗（或弹窗关不掉）时会静默卡死，这里统一加 15 秒上限。
+        timeout = 15
+        start = time.time()
+        while time.time() - start < timeout:
             self.screenshot()
             if self.appear(self.I_FRESH_ENSURE):
                 break
             if self.appear_then_click(self.I_FRESH, interval=1):
                 continue
-        while 1:
+        else:
+            logger.warning('Refresh: 点击刷新后 15s 内没等到确认弹窗，按“刷新失败”处理')
+            return False
+        start = time.time()
+        while time.time() - start < timeout:
             self.screenshot()
             if not self.appear(self.I_FRESH_ENSURE):
                 return True
             if self.appear_then_click(self.I_FRESH_ENSURE, interval=1):
                 continue
+        logger.warning('Refresh: 确认弹窗 15s 内没有消失，按已刷新继续')
+        return True
 
     def fire(self, order: int):
         """
@@ -481,9 +773,14 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
         """
         retry_clean = 0
         while not self.appear(self.I_RR_PERSON):
+            # 【二开修复 handoff/20】原来这里只打一条 warning 就继续 while，等于永远出不去：
+            # 一旦「个人」标题识别不到，就会一直点屏幕顶部并无限重试，日志刷屏却永不结束。
+            # 现在超过上限就抛 GameStuckError，交给 OAS 自己的异常处理（保存截图 / 重启流程）。
             if retry_clean > 20:
-                logger.warning("Stuck too long, try force quit or random click")
-            
+                logger.critical('Stuck too long: 识别不到「个人」标题(I_RR_PERSON)，'
+                                '放弃本次挑战并交给异常处理')
+                raise GameStuckError('RealmRaid: I_RR_PERSON not found after 20 retries')
+
             logger.info("Title not found! Checking for popups or rewards...")
             
             # 如果看到了“刷新确认”弹窗 (I_FRESH_ENSURE 是右边的确定)

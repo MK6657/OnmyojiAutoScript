@@ -46,8 +46,12 @@ class GameUiAssets:
 	I_CHECK_MAIN = RuleImage(roi_front=(807,108,76,45), roi_back=(49,98,1033,61), threshold=0.8, method="Template matching", file="./tasks/GameUi/page/page_check_main.png")
 	# 庭院卷轴关闭标识 
 	I_MAIN_SCROLL_CLOSE = RuleImage(roi_front=(1181,634,28,39), roi_back=(1162,595,77,112), threshold=0.8, method="Template matching", file="./tasks/GameUi/page/page_main_scroll_close.png")
-	# description 
-	I_MAIN_GOTO_EXPLORATION = RuleImage(roi_front=(493,116,45,75), roi_back=(243,100,933,211), threshold=0.8, method="Template matching", file="./tasks/GameUi/page/page_main_goto_exploration.png")
+	# 【二开 handoff/22】庭院会随时间/活动换皮，「探索」灯笼配色变化很大：
+	#   白天模板在夜间皮肤下最高只有 0.561，而阈值是 0.8 -> 永远进不去探索，整条玩法链路断掉。
+	# 解法不是降阈值(离噪声 0.363 太近)，而是用【多模板】：白天一张、夜间一张，取最高分。
+	# 实测：夜间 1.000 命中、白天 ≈1.0、画面中没有该按钮时 0.363 不误报，阈值安全地保持 0.8。
+	# 多模板由 module/atom/image.py 支持，file 用 "|" 分隔；以后新皮肤只需再加一张图。
+	I_MAIN_GOTO_EXPLORATION = RuleImage(roi_front=(493,116,45,75), roi_back=(243,100,933,211), threshold=0.8, method="Template matching", file="./tasks/GameUi/page/page_main_goto_exploration.png|./tasks/GameUi/page/page_main_goto_exploration_night.png")
 	# description 
 	I_CHECK_EXPLORATION = RuleImage(roi_front=(681,12,27,36), roi_back=(661,0,70,61), threshold=0.65, method="Template matching", file="./tasks/GameUi/page/page_check_exploration.png")
 	# 探索前往觉醒 

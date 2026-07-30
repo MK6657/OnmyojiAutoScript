@@ -87,7 +87,6 @@ FluWindow {
             nav_view.setCurrentIndex(0)
             items.addFluPaneItems()
 
-            notity.open()
         }
     }
     Component.onCompleted:{
