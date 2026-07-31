@@ -102,9 +102,27 @@ function Test-HttpOk([string]$Url) {
   } catch { return $false }
 }
 
+function Test-PortBindable([int]$Port) {
+  # Get-NetTCPConnection 看不到 Windows excluded port range。实际短暂绑定一次，
+  # 才能同时识别“被进程占用”和“被系统保留（Vite 会报 EACCES）”两种情况。
+  $listener = $null
+  try {
+    $address = [System.Net.IPAddress]::Parse('127.0.0.1')
+    $listener = [System.Net.Sockets.TcpListener]::new($address, $Port)
+    $listener.Start()
+    return $true
+  } catch {
+    return $false
+  } finally {
+    if ($listener) {
+      try { $listener.Stop() } catch { }
+    }
+  }
+}
+
 function Find-FreePort([int]$From, [int]$To) {
   for ($p = $From; $p -le $To; $p++) {
-    if (-not (Get-PortOwner $p)) { return $p }
+    if (Test-PortBindable $p) { return $p }
   }
   throw ("{0}-{1} 之间没有空闲端口" -f $From, $To)
 }
@@ -276,10 +294,16 @@ if (Test-HttpOk $frontUrl) {
   Write-Host ("[3/3] 界面   {0} 已有页面在跑，复用（若那不是控制中心页面，请关掉它后重跑本脚本）" -f $frontUrl) -ForegroundColor Green
 } else {
   $owner = Get-PortOwner $frontPort
-  if ($owner) {
-    $frontPort = Find-FreePort ($frontPort + 1) ($frontPort + 15)
+  $portUnavailable = -not (Test-PortBindable $frontPort)
+  if ($owner -or $portUnavailable) {
+    $originalFrontPort = $frontPort
+    $frontPort = Find-FreePort ($frontPort + 1) ($frontPort + 300)
     $frontUrl  = ("http://127.0.0.1:{0}/" -f $frontPort)
-    Write-Host ("[3/3] 界面   原端口被 {0} 占用，自动改用 {1}" -f $owner.Name, $frontPort) -ForegroundColor DarkYellow
+    if ($owner) {
+      Write-Host ("[3/3] 界面   原端口 {0} 被 {1} 占用，自动改用 {2}" -f $originalFrontPort, $owner.Name, $frontPort) -ForegroundColor DarkYellow
+    } else {
+      Write-Host ("[3/3] 界面   原端口 {0} 被 Windows 保留/拒绝绑定，自动改用 {1}" -f $originalFrontPort, $frontPort) -ForegroundColor DarkYellow
+    }
   }
   if ($Prod) {
     $frontScript = Join-Path $cc 'launcher\start-frontend.ps1'

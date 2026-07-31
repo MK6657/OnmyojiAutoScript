@@ -196,8 +196,8 @@ export default function App() {
     refreshWindows(true).catch(() => {})
   }, [refreshWindows])
 
-  // 选中窗口 → 写 device.handle（+ 尽力识别 emulatorinfo_type，只写 Core 真实枚举里的合法值）→ 保存 → 刷新设备摘要。
-  // 纯前端 + 现有 /windows 与配置保存接口，不改上游 Core（handoff/18）。
+  // 选中窗口 → 同时写 handle 和 Bridge 已核验的 ADB serial。
+  // 多设备时没有确定映射就拒绝绑定，不能留下“窗口已绑定、Core 仍在 auto 猜设备”的半绑定状态。
   const bindWindow = useCallback(async (win) => {
     if (!selectedId || !win) return
     const accountId = selectedId
@@ -206,8 +206,14 @@ export default function App() {
       const cfg = await api.taskConfig(accountId, 'Script')
       const device = cfg?.groups?.device || []
       const handleField = device.find((f) => f.name === 'handle')
+      const serialField = device.find((f) => f.name === 'serial')
       const typeField = device.find((f) => f.name === 'emulatorinfo_type')
       const fields = [{ group: 'device', name: 'handle', value: String(win.handle), type: handleField?.type || 'string' }]
+      const mappedSerial = String(win.serial || '').trim()
+      if (!mappedSerial) {
+        throw new Error('无法确认该窗口对应的 ADB 设备，未保存。请刷新窗口后重试，或在运行设置里手动选择设备序列号。')
+      }
+      fields.push({ group: 'device', name: 'serial', value: mappedSerial, type: serialField?.type || 'string' })
       const inferred = typeField ? inferEmulatorType(win, typeField.options || []) : null
       if (inferred && String(typeField.value) !== inferred) {
         fields.push({ group: 'device', name: 'emulatorinfo_type', value: inferred, type: typeField.type || 'enum' })
@@ -217,7 +223,7 @@ export default function App() {
         const fresh = await api.taskConfig(accountId, 'Script').catch(() => null)
         if (fresh) setDeviceConfig(fresh)
       }
-      notify(`已绑定「${win.title || win.handle}」（句柄 ${win.handle}${inferred ? ` · ${inferred}` : ''}），已保存到 ${accountId}`, 'success')
+      notify(`已绑定「${win.title || win.handle}」（句柄 ${win.handle} · ${mappedSerial}${inferred ? ` · ${inferred}` : ''}），已保存到 ${accountId}`, 'success')
     } catch (error) {
       notify(`绑定失败：${error.message}`, 'error')
     }

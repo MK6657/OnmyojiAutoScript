@@ -4,6 +4,9 @@
 import time
 import re
 import os
+import hashlib
+from collections import Counter
+from datetime import datetime
 import cv2
 import numpy as np
 from cached_property import cached_property
@@ -29,6 +32,19 @@ from tasks.GameUi.game_ui import GameUi
 from tasks.GameUi.page import page_realm_raid, page_main, page_shikigami_records
 from tasks.RealmRaid.assets import RealmRaidAssets
 from tasks.RealmRaid.config import RealmRaid, RaidMode, AttackNumber, WhenAttackFail
+from tasks.RealmRaid.level_mode import (
+    BoardSnapshot,
+    CheckpointStore,
+    LevelAction,
+    LevelMode,
+    PendingAction,
+    RealmRaidCheckpoint,
+    decide_next_action,
+    generation_changed,
+    reconcile_checkpoint,
+    resolve_broken_levels,
+    schedule_after_cooldown,
+)
 from tasks.Component.SwitchSoul.switch_soul import SwitchSoul
 
 
@@ -260,7 +276,7 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
             except Exception as error:  # noqa: BLE001
                 logger.warning(f'采集棋盘素材失败（不影响任务）：{error}')
 
-            if CAPTURE_ONLY:
+            if CAPTURE_ONLY and not con.level_mode_config.enable:
                 logger.info('CAPTURE_ONLY=True：素材已采集，本次任务到此结束，不进行任何挑战')
                 self.set_next_run(task='RealmRaid', success=True, finish=True)
                 raise TaskEnd
@@ -271,6 +287,10 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
         frog = self.is_frog(True)
         if frog:
             logger.info(f'Frog raid')
+
+        if con.level_mode_config.enable and not frog:
+            logger.info(f'Target level mode enabled: target={con.level_mode_config.target_level}')
+            self.run_level_mode(con)
 
 
         # 开始循环
@@ -371,6 +391,508 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
         self.ui_goto(page_main)
         self.set_next_run(task='RealmRaid', success=success, finish=True)
         raise TaskEnd
+
+    # ------------------------------------------------------- 目标等级模式（二开 Codex-05）
+
+    @cached_property
+    def level_failure_sign(self) -> RuleImage:
+        return RuleImage(
+            roi_front=(0, 0, 42, 24),
+            roi_back=tuple(self.false_roi[0]),
+            threshold=0.78,
+            method='Template matching',
+            file='./tasks/RyouToppa/dev/loser_sign_1.png|./tasks/RyouToppa/dev/loser_sign_2.png',
+        )
+
+    @cached_property
+    def level_broken_sign(self) -> RuleImage:
+        return RuleImage(
+            roi_front=(0, 0, 25, 37),
+            roi_back=tuple(self.partition[0].roi_back),
+            threshold=0.80,
+            method='Template matching',
+            file='./tasks/RyouToppa/dev/finished_1.png|./tasks/RyouToppa/dev/finished_2.png',
+        )
+
+    @cached_property
+    def attack_record_ocr(self) -> RuleOcr:
+        # 数字位于“攻破记录”下方。0 的 OCR 结果与空结果相同，因此 0 只在没有破印时采用。
+        roi = (205, 595, 40, 38)
+        return RuleOcr(roi=roi, area=roi, mode='Digit', method='Default',
+                       keyword='', name='realm_raid_attack_record')
+
+    def detect_level_board_marks(self, image=None) -> tuple[frozenset[int], frozenset[int]]:
+        if image is None:
+            image = self.device.image
+
+        broken = set()
+        for index, click in enumerate(self.partition, start=1):
+            self.level_broken_sign.roi_back = tuple(click.roi_back)
+            if self.level_broken_sign.match(image):
+                broken.add(index)
+
+        failure_marked = set()
+        for index, roi in enumerate(self.false_roi, start=1):
+            self.level_failure_sign.roi_back = tuple(roi)
+            if self.level_failure_sign.match(image):
+                failure_marked.add(index)
+
+        # “破”印本身包含红色，且目标已经不可挑战；不把它同时当作失败箭头。
+        failure_marked.difference_update(broken)
+        return frozenset(broken), frozenset(failure_marked)
+
+    @staticmethod
+    def _layout_hash(image, partitions) -> str:
+        """对九格左上名称区做弱感知哈希，避开右上失败箭头和右侧“破”印。"""
+        fingerprints = []
+        for click in partitions:
+            x, y, w, h = click.roi_back
+            crop = image[y + 4:y + min(h, 52), x + 4:x + min(w, 145)]
+            if crop.size == 0:
+                continue
+            gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY) if crop.ndim == 3 else crop
+            small = cv2.resize(gray, (16, 8), interpolation=cv2.INTER_AREA)
+            fingerprints.append(np.packbits(small >= np.median(small)).tobytes())
+        if not fingerprints:
+            return ''
+        return hashlib.sha1(b''.join(fingerprints)).hexdigest()[:20]
+
+    def read_refresh_cd_seconds(self, image=None) -> int | None:
+        if image is None:
+            image = self.device.image
+        try:
+            text = str(self.O_FRESH_TIME.ocr_single(image) or '')
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f'Refresh CD OCR failed: {error}')
+            return None
+
+        parts = [int(value) for value in re.findall(r'\d+', text)]
+        if len(parts) >= 3:
+            return parts[-3] * 3600 + parts[-2] * 60 + parts[-1]
+        if len(parts) == 2:
+            return parts[0] * 60 + parts[1]
+        if len(parts) == 1:
+            digits = re.sub(r'\D', '', text)
+            if 3 <= len(digits) <= 4:
+                return int(digits[:-2]) * 60 + int(digits[-2:])
+        return None
+
+    def build_level_board_snapshot(
+        self,
+        screenshot: bool = True,
+        expected_level: int = 0,
+        expected_board_signature: str = '',
+    ) -> BoardSnapshot:
+        if screenshot:
+            self.screenshot()
+        image = self.device.image
+        raw_levels = tuple(self.read_levels(image))
+        broken, failure_marked = self.detect_level_board_marks(image)
+        layout_signature = self._layout_hash(image, self.partition)
+
+        trusted_expected_level = 0
+        if expected_board_signature and expected_board_signature == layout_signature:
+            trusted_expected_level = expected_level
+        levels, imputed, imputation_source = resolve_broken_levels(
+            raw_levels,
+            broken,
+            expected_level=trusted_expected_level,
+        )
+        challenge_level = self.current_challenge_level(levels)
+        votes = Counter(level for level in levels if level).get(challenge_level, 0)
+
+        try:
+            tickets_current, _tickets_rest, tickets_total = self.O_NUMBER.ocr(image)
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f'Ticket OCR failed: {error}')
+            tickets_current, tickets_total = -1, 30
+        if tickets_total <= 0:
+            tickets_current, tickets_total = -1, 30
+
+        try:
+            record_value = int(self.attack_record_ocr.ocr(image))
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f'Attack record OCR failed: {error}')
+            record_value = -1
+        if record_value == 0:
+            attack_record = 0 if not broken else None
+        elif 1 <= record_value <= 9:
+            attack_record = record_value
+        else:
+            attack_record = None
+
+        refresh_available = self.appear(self.I_FRESH)
+        refresh_cd_seconds = None if refresh_available else self.read_refresh_cd_seconds(image)
+        snapshot = BoardSnapshot(
+            levels=levels,
+            challenge_level=challenge_level,
+            challenge_level_votes=votes,
+            broken=broken,
+            failure_marked=failure_marked,
+            attack_record=attack_record,
+            tickets_current=tickets_current,
+            tickets_total=tickets_total,
+            refresh_available=refresh_available,
+            refresh_cd_seconds=refresh_cd_seconds,
+            layout_signature=layout_signature,
+            captured_at=datetime.now(),
+            imputed=imputed,
+        )
+        if snapshot.imputed:
+            logger.warning(
+                'Level OCR imputed only for broken cards: '
+                f'raw={list(raw_levels)}, resolved={list(snapshot.levels)}, '
+                f'imputed={sorted(snapshot.imputed)}, source={imputation_source}'
+            )
+        logger.info(
+            'Level board: '
+            f'levels={list(snapshot.levels)}, current={snapshot.challenge_level}({snapshot.challenge_level_votes}), '
+            f'broken={sorted(snapshot.broken)}, imputed={sorted(snapshot.imputed)}, '
+            f'failed={sorted(snapshot.failure_marked)}, '
+            f'record={snapshot.attack_record}, tickets={snapshot.tickets_current}/{snapshot.tickets_total}, '
+            f'refresh={snapshot.refresh_available}, cd={snapshot.refresh_cd_seconds}'
+        )
+        return snapshot
+
+    def wait_level_board(self, timeout: float = 25) -> bool:
+        start = time.time()
+        while time.time() - start < timeout:
+            self.screenshot()
+            if self.appear_then_click(self.I_SOUL_RAID, interval=1):
+                logger.info('Dismiss RealmRaid 3/6/9 reward')
+                continue
+            if self.appear(self.I_BACK_RED, threshold=0.7):
+                return True
+            time.sleep(0.5)
+        logger.warning(f'Wait RealmRaid board timeout after {timeout}s')
+        return False
+
+    def observe_level_board(
+        self,
+        retries: int = 3,
+        expected_level: int = 0,
+        expected_board_signature: str = '',
+    ) -> BoardSnapshot | None:
+        if not self.wait_level_board(timeout=20):
+            return None
+        last = None
+        for attempt in range(1, retries + 1):
+            last = self.build_level_board_snapshot(
+                screenshot=True,
+                expected_level=expected_level,
+                expected_board_signature=expected_board_signature,
+            )
+            if last.is_safe():
+                return last
+            logger.warning(f'Unsafe RealmRaid board evidence, retry {attempt}/{retries}')
+            time.sleep(0.8)
+        if last is not None:
+            self.dump_board('unsafe')
+        return last
+
+    def choose_level_target(self, snapshot: BoardSnapshot) -> int | None:
+        attackable = sorted(snapshot.attackable)
+        if not attackable:
+            return None
+
+        image = self.device.image.copy()
+        for index in snapshot.broken:
+            x, y, w, h = self.partition[index - 1].roi_back
+            image[y:y + h, x:x + w, ...] = 0
+
+        target = self.order_medal.find_anyone(image)
+        if target:
+            center = target.front_center()
+            for index in attackable:
+                x, y, w, h = self.partition[index - 1].roi_front
+                if x < center[0] < x + w and y < center[1] < y + h:
+                    return index
+        logger.warning(f'Medal order did not select a target; fallback to position {attackable[0]}')
+        return attackable[0]
+
+    def recover_pending_level_action(
+        self,
+        checkpoint: RealmRaidCheckpoint,
+        snapshot: BoardSnapshot,
+        store: CheckpointStore,
+    ) -> None:
+        try:
+            pending = PendingAction(checkpoint.pending_action)
+        except ValueError:
+            pending = PendingAction.NONE
+        if pending == PendingAction.NONE:
+            return
+
+        target = checkpoint.last_target
+        if pending == PendingAction.REFRESH:
+            checkpoint.pending_refresh = True
+            store.save(checkpoint)
+            return
+
+        committed = False
+        if pending == PendingAction.ATTACK:
+            if snapshot.success_count > checkpoint.pending_success_before or target in snapshot.broken:
+                checkpoint.success_count = snapshot.success_count
+                committed = True
+            elif (target and not checkpoint.pending_failure_marked_before
+                  and target in snapshot.failure_marked):
+                checkpoint.failure_count += 1
+                checkpoint.pending_refresh = checkpoint.level_mode == LevelMode.RAISE
+                committed = True
+        elif pending == PendingAction.SURRENDER:
+            if (target and not checkpoint.pending_failure_marked_before
+                    and target in snapshot.failure_marked):
+                checkpoint.failure_count += 1
+                committed = True
+
+        if committed:
+            logger.warning(f'Recovered committed pending action: {pending.value}, target={target}')
+        else:
+            logger.warning(f'Pending action has no conclusive evidence; it will be retried: '
+                           f'{pending.value}, target={target}')
+        checkpoint.finish_action()
+        store.save(checkpoint)
+
+    def execute_level_surrender(
+        self,
+        snapshot: BoardSnapshot,
+        checkpoint: RealmRaidCheckpoint,
+        store: CheckpointStore,
+        battle_config,
+    ) -> bool:
+        target = self.choose_level_target(snapshot)
+        if target is None:
+            logger.warning('No attackable target for surrender')
+            return False
+
+        checkpoint.begin_action(PendingAction.SURRENDER, snapshot, target)
+        store.save(checkpoint)
+        logger.info(f'Level mode surrender: target={target}, failure={checkpoint.failure_count + 1}')
+        self.fire(target)
+        action_ok = self.run_general_battle_back(battle_config, exit_four=True)
+        if not self.wait_level_board(timeout=25):
+            return False
+        after = self.observe_level_board(
+            expected_level=checkpoint.observed_level,
+            expected_board_signature=checkpoint.board_signature,
+        )
+        if after is None or not after.is_safe():
+            return False
+        if after.tickets_current != snapshot.tickets_current:
+            logger.warning('Surrender unexpectedly changed ticket count; stop without committing checkpoint')
+            self.dump_board('surrender_ticket_changed')
+            return False
+        if not action_ok and not (
+            target not in snapshot.failure_marked and target in after.failure_marked
+        ):
+            logger.warning('Surrender result is ambiguous; keep pending action for recovery')
+            return False
+
+        checkpoint.failure_count += 1
+        checkpoint.success_count = after.success_count
+        checkpoint.board_signature = after.board_signature
+        checkpoint.finish_action()
+        store.save(checkpoint)
+        return True
+
+    def execute_level_attack(
+        self,
+        snapshot: BoardSnapshot,
+        checkpoint: RealmRaidCheckpoint,
+        store: CheckpointStore,
+        battle_config,
+    ) -> bool:
+        target = self.choose_level_target(snapshot)
+        if target is None:
+            logger.warning('No attackable target for attack')
+            return False
+
+        checkpoint.begin_action(PendingAction.ATTACK, snapshot, target)
+        store.save(checkpoint)
+        logger.info(f'Level mode attack: target={target}, success={snapshot.success_count}/9')
+        self.fire(target)
+        won = self.run_general_battle(battle_config)
+        if not self.wait_level_board(timeout=35):
+            return False
+        after = self.observe_level_board(
+            expected_level=checkpoint.observed_level,
+            expected_board_signature=checkpoint.board_signature,
+        )
+        if after is None or not after.is_safe():
+            return False
+
+        changed = generation_changed(snapshot, after)
+        if won:
+            confirmed = (
+                changed
+                or after.success_count > snapshot.success_count
+                or target in after.broken
+                or after.tickets_current < snapshot.tickets_current
+            )
+            if not confirmed:
+                logger.warning('Battle reported win but board/ticket evidence did not change')
+                self.dump_board('win_unconfirmed')
+                return False
+            logger.info(f'Level mode battle won: target={target}')
+        else:
+            checkpoint.failure_count += 1
+            if checkpoint.level_mode == LevelMode.RAISE:
+                checkpoint.pending_refresh = True
+            logger.info(f'Level mode battle lost: target={target}, failures={checkpoint.failure_count}')
+
+        checkpoint.success_count = after.success_count
+        checkpoint.finish_action()
+        if changed:
+            logger.info('RealmRaid board generation changed after battle')
+            store.clear()
+        else:
+            checkpoint.board_signature = after.board_signature
+            store.save(checkpoint)
+        return True
+
+    def wait_level_generation_change(
+        self,
+        before: BoardSnapshot,
+        timeout: float = 25,
+    ) -> BoardSnapshot | None:
+        start = time.time()
+        while time.time() - start < timeout:
+            if not self.wait_level_board(timeout=5):
+                continue
+            after = self.build_level_board_snapshot(screenshot=True)
+            if after.is_safe() and generation_changed(before, after):
+                return after
+            time.sleep(1)
+        return None
+
+    def execute_level_refresh(
+        self,
+        snapshot: BoardSnapshot,
+        checkpoint: RealmRaidCheckpoint,
+        store: CheckpointStore,
+    ) -> bool:
+        checkpoint.begin_action(PendingAction.REFRESH, snapshot)
+        checkpoint.pending_refresh = True
+        store.save(checkpoint)
+        if not self.check_refresh(screenshot=False):
+            logger.info('Manual refresh is unavailable')
+            return False
+
+        after = self.wait_level_generation_change(snapshot, timeout=25)
+        if after is None:
+            logger.warning('Manual refresh clicked but a new board was not confirmed')
+            self.dump_board('refresh_unconfirmed')
+            return False
+        logger.info(f'Manual refresh confirmed: level {snapshot.challenge_level} -> {after.challenge_level}')
+        store.clear()
+        return True
+
+    def finish_level_mode(self, success: bool, target: datetime | None = None) -> None:
+        try:
+            self.ui_click(self.I_BACK_RED, self.I_CHECK_EXPLORATION)
+            self.ui_get_current_page()
+            self.ui_goto(page_main)
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f'Leave RealmRaid page failed; scheduler will recover next run: {error}')
+        self.set_next_run(task='RealmRaid', success=success, finish=True,
+                          server=target is None, target=target)
+        raise TaskEnd
+
+    def run_level_mode(self, config: RealmRaid) -> None:
+        account = getattr(self.config, 'config_name', 'default')
+        target_level = config.level_mode_config.target_level
+        store = CheckpointStore(account)
+        checkpoint = store.load()
+        transaction_count = 0
+        max_transactions = max(40, config.raid_config.number_attack + 20)
+
+        while transaction_count < max_transactions:
+            snapshot = self.observe_level_board(
+                expected_level=checkpoint.observed_level if checkpoint else 0,
+                expected_board_signature=checkpoint.board_signature if checkpoint else '',
+            )
+            if snapshot is None or not snapshot.is_safe():
+                logger.warning('Target level mode stopped: board evidence is unsafe')
+                self.finish_level_mode(success=False)
+
+            checkpoint = reconcile_checkpoint(
+                account=account,
+                snapshot=snapshot,
+                target_level=target_level,
+                checkpoint=checkpoint,
+            )
+            self.recover_pending_level_action(checkpoint, snapshot, store)
+            store.save(checkpoint)
+            decision = decide_next_action(snapshot, checkpoint)
+            logger.info(
+                f'Level decision: mode={decision.mode}, action={decision.action}, '
+                f'failure={decision.failure_count}, success={decision.success_count}, reason={decision.reason}'
+            )
+
+            if decision.action == LevelAction.SURRENDER:
+                if not self.execute_level_surrender(
+                    snapshot, checkpoint, store, config.general_battle_config
+                ):
+                    self.finish_level_mode(success=False)
+                transaction_count += 1
+                continue
+
+            if decision.action == LevelAction.ATTACK:
+                if self.current_count >= config.raid_config.number_attack:
+                    logger.warning(f'Level mode reached attack safety cap: {self.current_count}')
+                    self.finish_level_mode(success=False)
+                if not self.execute_level_attack(
+                    snapshot, checkpoint, store, config.general_battle_config
+                ):
+                    self.finish_level_mode(success=False)
+                transaction_count += 1
+                checkpoint = store.load()
+                continue
+
+            if decision.action == LevelAction.REFRESH:
+                if self.execute_level_refresh(snapshot, checkpoint, store):
+                    transaction_count += 1
+                    checkpoint = None
+                    continue
+                refreshed = self.build_level_board_snapshot(screenshot=True)
+                if refreshed.refresh_available:
+                    self.finish_level_mode(success=False)
+                snapshot = refreshed
+                decision = decide_next_action(snapshot, checkpoint)
+
+            if decision.action == LevelAction.WAIT_AUTO_REFRESH:
+                after = self.wait_level_generation_change(snapshot, timeout=25)
+                if after is None:
+                    logger.warning('Ninth win did not produce a confirmed automatic refresh')
+                    self.dump_board('auto_refresh_timeout')
+                    self.finish_level_mode(success=False)
+                store.clear()
+                checkpoint = None
+                continue
+
+            if decision.action == LevelAction.WAIT_COOLDOWN:
+                cd_seconds = snapshot.refresh_cd_seconds
+                if cd_seconds is None or cd_seconds <= 0:
+                    cd_seconds = 300
+                    logger.warning('Refresh CD OCR unavailable; fallback to the known 5-minute cooldown')
+                due = schedule_after_cooldown(cd_seconds)
+                checkpoint.pending_refresh = True
+                checkpoint.refresh_not_before = due.isoformat(timespec='seconds')
+                checkpoint.finish_action()
+                store.save(checkpoint)
+                logger.info(f'RealmRaid refresh cooling down; next run at {due.isoformat(timespec="seconds")}')
+                self.finish_level_mode(success=False, target=due)
+
+            if decision.action == LevelAction.STOP:
+                logger.info('Target level mode finished: no RealmRaid tickets')
+                self.finish_level_mode(success=True)
+
+            logger.warning(f'Target level mode stopped on unsafe action: {decision.action}')
+            self.dump_board('level_mode_unsafe')
+            self.finish_level_mode(success=False)
+
+        logger.warning(f'Target level mode reached transaction safety cap: {max_transactions}')
+        self.finish_level_mode(success=False)
 
 
 
@@ -861,4 +1383,3 @@ if __name__ == "__main__":
     t = ScriptTask(config, device)
 
     t.run()
-

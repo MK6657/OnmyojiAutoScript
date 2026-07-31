@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import json
 import os
+import re
+import shutil
+import subprocess
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -88,6 +92,90 @@ def state_view(runtime: Any) -> tuple[str, str, bool]:
     return runtime.state, runtime.state_label, runtime.connected
 
 
+def infer_window_serial(process: str, command_line: str, connected_serials: set[str]) -> str | None:
+    """只在映射有确定证据时返回 ADB serial，避免把账号绑定到另一台模拟器。"""
+    process_lower = str(process or "").lower()
+    command_line = str(command_line or "")
+
+    if ("mumu" in process_lower or "nemu" in process_lower) and command_line:
+        match = re.search(r"(?:^|\s)-v\s+(\d+)(?:\s|$)", command_line)
+        instance_index = int(match.group(1)) if match else 0
+        # MuMu 12 的 OAS/NemuIpc 实例表使用 16384 + 32*N，不使用 adb devices
+        # 里可能同时出现的 emulator-5554/5556 别名。
+        expected = f"127.0.0.1:{16384 + instance_index * 32}"
+        return expected if expected in connected_serials else None
+
+    emulator_process = re.search(
+        r"mumu|nemu|dnplayer|ldplayer|nox|hd-player|bluestacks|memu",
+        process_lower,
+    )
+    if emulator_process and len(connected_serials) == 1:
+        return next(iter(connected_serials))
+    return None
+
+
+def _process_command_lines(process_ids: set[int]) -> dict[int, str]:
+    if os.name != "nt" or not process_ids:
+        return {}
+    ids = ",".join(str(value) for value in sorted(process_ids))
+    command = (
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+        f"$ids=@({ids}); Get-CimInstance Win32_Process | "
+        "Where-Object { $ids -contains [int]$_.ProcessId } | "
+        "ForEach-Object { \"{0}`t{1}\" -f $_.ProcessId,$_.CommandLine }"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    lines: dict[int, str] = {}
+    for line in result.stdout.splitlines():
+        pid, separator, value = line.partition("\t")
+        if separator and pid.strip().isdigit():
+            lines[int(pid.strip())] = value.strip()
+    return lines
+
+
+def _connected_adb_serials() -> set[str]:
+    project_root = ROOT.parent
+    candidates = [
+        os.getenv("ADB_PATH"),
+        shutil.which("adb"),
+        str(project_root / ".venv" / "Lib" / "site-packages" / "adbutils" / "binaries" / "adb.exe"),
+    ]
+    adb = next((candidate for candidate in candidates if candidate and Path(candidate).exists()), None)
+    if not adb:
+        return set()
+    try:
+        result = subprocess.run(
+            [adb, "devices"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    serials = set()
+    for line in result.stdout.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) >= 2 and fields[1] == "device":
+            serials.add(fields[0])
+    return serials
+
+
 def visible_windows() -> list[dict[str, Any]]:
     """列出 Windows 上的可见顶层窗口，供设备绑定选择。非 Windows 返回空列表。"""
     if os.name != "nt":
@@ -133,6 +221,20 @@ def visible_windows() -> list[dict[str, Any]]:
         return True
 
     user32.EnumWindows(callback, 0)
+    emulator_windows = [
+        item for item in windows
+        if re.search(r"mumu|nemu|dnplayer|ldplayer|nox|hd-player|bluestacks|memu",
+                     item["process"], re.IGNORECASE)
+    ]
+    command_lines = _process_command_lines({item["pid"] for item in emulator_windows})
+    connected_serials = _connected_adb_serials()
+    for item in emulator_windows:
+        serial = infer_window_serial(
+            item["process"], command_lines.get(item["pid"], ""), connected_serials
+        )
+        if serial:
+            item["serial"] = serial
+            item["serial_source"] = "verified_adb_mapping"
     return sorted(windows, key=lambda item: (item["title"].casefold(), item["handle"]))
 
 

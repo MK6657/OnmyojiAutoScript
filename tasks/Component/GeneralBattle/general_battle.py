@@ -77,6 +77,58 @@ class GeneralBattle(GeneralBuff, GeneralBattleAssets):
             sleep(random.uniform(0.4, 0.8))
         return False
 
+    def _request_battle_exit(self, timeout: float = 12, confirm_timeout: float = 3) -> bool:
+        """Click the battle exit once, then confirm without repeatedly hitting exit.
+
+        The exit button remains detectable behind the confirmation dialog. Repeatedly
+        using appear_then_click on it therefore trips Device's TooManyClick guard even
+        though the dialog is already open.
+        """
+        start = time.time()
+        exit_clicked = False
+        ensure_seen = False
+        while time.time() - start < timeout:
+            self.screenshot()
+            if self.appear(self.I_EXIT_ENSURE):
+                ensure_seen = True
+                break
+            if self.appear_then_click(self.I_EXIT, interval=1.5):
+                exit_clicked = True
+                logger.info(f"Click {self.I_EXIT.name} once; wait for confirmation")
+                break
+            time.sleep(0.2)
+
+        if not exit_clicked and not ensure_seen:
+            logger.warning(f'{self.I_EXIT.name} did not appear within {timeout}s')
+            return False
+
+        if not ensure_seen:
+            start = time.time()
+            while time.time() - start < confirm_timeout:
+                self.screenshot()
+                if self.appear(self.I_EXIT_ENSURE):
+                    ensure_seen = True
+                    break
+                if self.appear(self.I_FALSE):
+                    return True
+                time.sleep(0.2)
+
+        if ensure_seen:
+            if not self.appear_then_click(self.I_EXIT_ENSURE, interval=1.5):
+                logger.warning(f'{self.I_EXIT_ENSURE.name} disappeared before click')
+                return False
+            logger.info(f"Click {self.I_EXIT_ENSURE.name} once")
+        else:
+            ex, ey, ew, eh = self.I_EXIT_ENSURE.roi_front
+            x, y = int(ex + ew / 2), int(ey + eh / 2)
+            logger.warning(
+                f'{self.I_EXIT_ENSURE.name} not detected within {confirm_timeout}s; '
+                f'click ROI center ({x},{y}) once'
+            )
+            self.device.click(x, y, control_name=f'{self.I_EXIT_ENSURE.name}_FALLBACK')
+        time.sleep(1.2)
+        return True
+
     def run_general_battle_back(self, config: GeneralBattleConfig = None, exit_four: bool = False) -> bool:
         """
         进入挑战然后直接返回
@@ -107,55 +159,39 @@ class GeneralBattle(GeneralBuff, GeneralBattleAssets):
                 logger.warning(f'{self.I_PREPARE_HIGHLIGHT.name} 点击准备超时({timeout}s)，继续尝试退出')
             logger.info(f"Click {self.I_PREPARE_HIGHLIGHT.name}")
 
-        # 点击返回
-        t0 = time.time()
-        ensure_seen = False
-        while time.time() - t0 < timeout:
-            self.screenshot()
-            if self.appear_then_click(self.I_EXIT, interval=1.5):
-                continue
-            if self.appear(self.I_EXIT_ENSURE):
-                ensure_seen = True
-                break
-        if ensure_seen:
-            logger.info(f"Click {self.I_EXIT.name}")
-        else:
-            # 兜底：弹窗多半已经在屏幕上，只是模板认不出来，按 ROI 中心直接点一次
-            ok = False
-            ex, ey, ew, eh = self.I_EXIT_ENSURE.roi_front
-            logger.warning(f'{self.I_EXIT_ENSURE.name} {timeout}s 内识别不到，'
-                           f'按 ROI 中心({int(ex + ew / 2)},{int(ey + eh / 2)}) 盲点一次兜底')
-            self.device.click(int(ex + ew / 2), int(ey + eh / 2))
-            time.sleep(1.2)
+        if not self._request_battle_exit(timeout=timeout):
+            return False
 
-        # 点击返回确认
+        # Wait for the failure result. The fallback may have clicked slightly early,
+        # so one template-confirmed retry is allowed, but never a click loop.
         t0 = time.time()
+        ensure_retried = False
         while time.time() - t0 < timeout:
             self.screenshot()
-            if self.appear_then_click(self.I_EXIT_ENSURE, interval=1.5):
-                continue
             if self.appear(self.I_FALSE):
                 break
+            if not ensure_retried and self.appear_then_click(self.I_EXIT_ENSURE, interval=1.5):
+                ensure_retried = True
+                logger.info(f"Retry {self.I_EXIT_ENSURE.name} once")
+                continue
+            time.sleep(0.2)
         else:
-            ok = False
-            logger.warning(f'{self.I_FALSE.name} {timeout}s 内没出现，跳过失败结算确认继续')
-        logger.info(f"Click {self.I_EXIT_ENSURE.name}")
+            logger.warning(f'{self.I_FALSE.name} did not appear within {timeout}s')
+            return False
 
-        # 点击失败确认
-        self.wait_until_appear(self.I_FALSE, wait_time=10)
+        if not self.appear_then_click(self.I_FALSE, interval=1.5):
+            logger.warning(f'{self.I_FALSE.name} disappeared before click')
+            return False
+        logger.info(f"Click {self.I_FALSE.name} once")
+
         t0 = time.time()
         while time.time() - t0 < timeout:
             self.screenshot()
-            if self.appear_then_click(self.I_FALSE, interval=1.5):
-                continue
             if not self.appear(self.I_FALSE):
-                break
-        else:
-            ok = False
-            logger.warning(f'{self.I_FALSE.name} {timeout}s 内没能关掉，继续执行')
-        logger.info(f"Click {self.I_FALSE.name}")
-
-        return ok
+                return ok
+            time.sleep(0.2)
+        logger.warning(f'{self.I_FALSE.name} did not close within {timeout}s')
+        return False
 
     def exit_battle(self, skip_first: bool = False) -> bool:
         """
@@ -165,37 +201,30 @@ class GeneralBattle(GeneralBuff, GeneralBattleAssets):
         if skip_first:
             self.screenshot()
 
-        if not self.appear(self.I_EXIT):
+        if not self.appear(self.I_EXIT) and not self.appear(self.I_EXIT_ENSURE):
             return False
 
-        # 点击返回（【二开修复 handoff/21】同样加超时，避免弹窗认不出时无限点退出键）
-        logger.info(f"Click {self.I_EXIT.name}")
+        # 【二开修复】退出键只点一次，避免弹窗出现后仍持续点退出键触发 TooManyClick。
         timeout = 12
-        t0 = time.time()
-        ensure_seen = False
-        while time.time() - t0 < timeout:
-            self.screenshot()
-            if self.appear_then_click(self.I_EXIT, interval=1.5):
-                continue
-            if self.appear(self.I_EXIT_ENSURE):
-                ensure_seen = True
-                break
-        if not ensure_seen:
-            ex, ey, ew, eh = self.I_EXIT_ENSURE.roi_front
-            logger.warning(f'{self.I_EXIT_ENSURE.name} {timeout}s 内识别不到，按 ROI 中心盲点一次兜底')
-            self.device.click(int(ex + ew / 2), int(ey + eh / 2))
-            time.sleep(1.2)
+        if not self._request_battle_exit(timeout=timeout):
+            return False
 
-        # 点击返回确认
+        # 结算页和战斗页都只允许单次点击；其余时间等待状态变化。
         t0 = time.time()
+        ensure_retried = False
+        false_clicked = False
         while time.time() - t0 < timeout:
             self.screenshot()
-            if self.appear_then_click(self.I_EXIT_ENSURE, interval=1.5):
+            if not ensure_retried and self.appear_then_click(self.I_EXIT_ENSURE, interval=1.5):
+                ensure_retried = True
                 continue
-            if self.appear_then_click(self.I_FALSE, interval=1.5):
+            if not false_clicked and self.appear_then_click(self.I_FALSE, interval=1.5):
+                false_clicked = True
                 continue
-            if not self.appear(self.I_EXIT):
+            if not self.appear(self.I_EXIT) and not self.appear(self.I_EXIT_ENSURE) \
+                    and not self.appear(self.I_FALSE):
                 break
+            time.sleep(0.2)
         else:
             logger.warning(f'exit_battle: {timeout}s 内没能确认退出，交由上层逻辑继续处理')
             return False

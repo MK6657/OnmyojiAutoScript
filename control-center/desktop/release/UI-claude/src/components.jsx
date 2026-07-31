@@ -172,7 +172,7 @@ export function WindowBindDialog({ open, windows, loading, onRefresh, onPick, on
                     <span className="wb-title">{win.title || '(无标题窗口)'}</span>
                     <span className="wb-meta">
                       {sign ? <em className="wb-tag">{sign.label}</em> : null}
-                      <span>{win.process || '未知进程'} · 句柄 {win.handle}</span>
+                      <span>{win.process || '未知进程'} · 句柄 {win.handle}{win.serial ? ` · ${win.serial}` : ' · ADB 未确认'}</span>
                     </span>
                   </button>
                 </li>

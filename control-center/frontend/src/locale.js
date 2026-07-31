@@ -87,6 +87,7 @@ const groupLabels = {
   orochi_config: '御魂设置',
   invite_config: '邀请设置',
   general_battle_config: '通用战斗设置',
+  level_mode_config: '目标等级模式',
   switch_soul: '御魂切换',
   meta_demon_config: '超鬼王设置',
   md_default_strategy: '默认阵容策略',
@@ -379,6 +380,7 @@ const fieldLabels = {
   daily_attack_count: '每日攻击次数',
   number_attack: '攻击数量',
   number_base: '基础数量',
+  target_level: '目标等级',
   min_bounty: '最低悬赏等级',
   boss_number: '鬼王数量',
   use_collect: '使用收藏目标',
@@ -576,6 +578,8 @@ const fieldLabels = {
 
 const descriptions = {
   enable_help: '将这个任务加入调度器',
+  target_level_mode_enable_help: '启用按账号配置的目标等级模式；默认关闭，呱太特殊模式仍沿用上游流程',
+  target_level_help: '当前等级高于目标时降级，等于目标时保级，低于目标时升级',
   next_run_help: '会根据间隔时间自动计算下一次运行时间',
   priority_help: '数字越低优先级越高，同优先级按加入顺序执行',
   success_interval_help: '任务成功后，按此间隔再次执行',

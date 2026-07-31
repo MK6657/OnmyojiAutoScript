@@ -329,6 +329,33 @@ async def test_log_level_parsing():
     expect(parse_log_timestamp("没有时间戳") is None, "不该凭空造时间戳")
 
 
+@check("多模拟器窗口只采用经过在线 ADB 列表验证的 serial")
+async def test_window_serial_mapping():
+    connected = {"127.0.0.1:16384", "127.0.0.1:16416", "emulator-5554", "emulator-5556"}
+    expect(
+        bridge_main.infer_window_serial(
+            "MuMuNxDevice.exe", "MuMuNxDevice.exe", connected
+        ) == "127.0.0.1:16384",
+        "MuMu 实例 0 映射错误",
+    )
+    expect(
+        bridge_main.infer_window_serial(
+            "MuMuNxDevice.exe", "MuMuNxDevice.exe -v 1", connected
+        ) == "127.0.0.1:16416",
+        "MuMu 实例 1 映射错误",
+    )
+    expect(
+        bridge_main.infer_window_serial(
+            "MuMuNxDevice.exe", "MuMuNxDevice.exe -v 2", connected
+        ) is None,
+        "离线实例不应被猜成其他设备",
+    )
+    expect(
+        bridge_main.infer_window_serial("dnplayer.exe", "", connected) is None,
+        "多设备时未知映射必须拒绝",
+    )
+
+
 @check("模板与任务顺序能在 Bridge 侧持久化")
 async def test_ui_metadata_roundtrip():
     reset()

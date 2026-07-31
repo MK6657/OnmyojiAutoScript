@@ -22,6 +22,22 @@ class WhenAttackFail(str, Enum):
     CONTINUE: str = 'Continue'
     REFRESH: str = 'Refresh'
 
+
+class LevelModeConfig(BaseModel):
+    enable: bool = Field(
+        title='Target Level Mode Enable',
+        default=False,
+        description='target_level_mode_enable_help',
+    )
+    target_level: int = Field(
+        title='Target Level',
+        default=59,
+        ge=1,
+        le=60,
+        description='target_level_help',
+    )
+
+
 class RaidConfig(BaseModel):
     # raid_mode: RaidMode = Field(title='Raid Mode', default=RaidMode.NORMAL,
     #                             description='raid_mode_help')
@@ -37,10 +53,10 @@ class RaidConfig(BaseModel):
 
 class RealmRaid(ConfigBase):
     scheduler: Scheduler = Field(default_factory=Scheduler)
+    level_mode_config: LevelModeConfig = Field(default_factory=LevelModeConfig)
     raid_config: RaidConfig = Field(default_factory=RaidConfig)
     general_battle_config: GeneralBattleConfig = Field(default_factory=GeneralBattleConfig)
     switch_soul_config: SwitchSoulConfig = Field(default_factory=SwitchSoulConfig)
-
 
 
 
