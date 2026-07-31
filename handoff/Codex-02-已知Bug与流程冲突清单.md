@@ -32,6 +32,8 @@
 
 ### P0-04 Mock 联调会写入并清理真实控制中心元数据
 
+> 2026-07-31 已修复：联调栈默认改用 22368，Bridge 使用 `output/dev-stack/bridge-data` 独立数据库并标记 `OAS_INTEGRATION_TEST=1`；接口与界面集成测试均在写操作前校验测试模式、mock Core URL 和数据目录。以下保留原根因，供上游对照。
+
 `control-center/launcher/start-dev-stack.ps1:31-59` 只替换 Core URL，没有设置独立 `OAS_CONTROL_CENTER_DATA_DIR`。Bridge 默认仍使用 `control-center/data/control_center.db`，见 `bridge/app/main.py:34-36`。访问 `/accounts` 时，`repository.py:79-99` 会把不存在于 mock Core 的账号视为 stale，并删除其元数据和任务顺序。
 
 例子：真实数据库有 A、B 两个账号，mock Core 只返回 demo。打开 mock 联调 UI 后，A、B 的控制中心昵称、标签、排序和 task_order 会被删除。Core 的真实 JSON 不会被删，但控制中心数据已经被污染。

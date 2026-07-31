@@ -49,7 +49,7 @@ from tasks.Component.SwitchSoul.switch_soul import SwitchSoul
 
 
 from module.logger import logger
-from module.exception import TaskEnd, GameStuckError
+from module.exception import GameStuckError, GameTooManyClickError, TaskEnd
 from module.atom.image_grid import ImageGrid
 from module.atom.image import RuleImage
 from module.atom.click import RuleClick
@@ -67,9 +67,9 @@ from module.atom.ocr import RuleOcr
 #                    避免采集素材时白白消耗突破券、打乱棋盘）。
 # 素材采集与校准完成后，把这三个都改回 False 即可。
 # ======================================================================================
-LEVEL_DEBUG = True
-CAPTURE_BOARD = True
-CAPTURE_ONLY = True
+LEVEL_DEBUG = False
+CAPTURE_BOARD = False
+CAPTURE_ONLY = False
 
 
 # ======================================================================================
@@ -289,8 +289,25 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
             logger.info(f'Frog raid')
 
         if con.level_mode_config.enable and not frog:
-            logger.info(f'Target level mode enabled: target={con.level_mode_config.target_level}')
-            self.run_level_mode(con)
+            logger.info(
+                f'Target level mode enabled: target={con.level_mode_config.target_level}, '
+                f'single_step={con.level_mode_config.single_step}'
+            )
+            try:
+                self.run_level_mode(con)
+            except (GameStuckError, GameTooManyClickError) as error:
+                # The target-level flow is still under supervised validation. Preserve its
+                # pending checkpoint and stop this task without invoking the global app restart.
+                logger.error(
+                    'Target level mode action aborted without restarting the game: '
+                    f'{type(error).__name__}: {error}'
+                )
+                try:
+                    self.dump_board('level_mode_action_error')
+                except Exception as dump_error:  # noqa: BLE001
+                    logger.warning(f'Level mode error screenshot failed: {dump_error}')
+                self.set_next_run(task='RealmRaid', success=False, finish=True)
+                raise TaskEnd
 
 
         # 开始循环
@@ -443,7 +460,7 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
 
     @staticmethod
     def _layout_hash(image, partitions) -> str:
-        """对九格左上名称区做弱感知哈希，避开右上失败箭头和右侧“破”印。"""
+        """Hash binarized opponent names, ignoring card lighting and status effects."""
         fingerprints = []
         for click in partitions:
             x, y, w, h = click.roi_back
@@ -451,8 +468,17 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
             if crop.size == 0:
                 continue
             gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY) if crop.ndim == 3 else crop
-            small = cv2.resize(gray, (16, 8), interpolation=cv2.INTER_AREA)
-            fingerprints.append(np.packbits(small >= np.median(small)).tobytes())
+            blur = cv2.GaussianBlur(gray, (3, 3), 0)
+            _threshold, ink = cv2.threshold(
+                blur,
+                0,
+                255,
+                cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+            )
+            # Downsampling removes anti-aliased edge differences caused by dimmed
+            # broken cards while retaining the overall nine-name layout.
+            small = cv2.resize(ink, (16, 8), interpolation=cv2.INTER_AREA)
+            fingerprints.append(np.packbits(small >= 64).tobytes())
         if not fingerprints:
             return ''
         return hashlib.sha1(b''.join(fingerprints)).hexdigest()[:20]
@@ -798,6 +824,29 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
                           server=target is None, target=target)
         raise TaskEnd
 
+    def finish_level_single_step(
+        self,
+        config: RealmRaid,
+        action: LevelAction,
+        transaction_count: int,
+        store: CheckpointStore,
+    ) -> None:
+        if not config.level_mode_config.single_step or transaction_count < 1:
+            return
+        checkpoint = store.load()
+        if checkpoint is None:
+            state = 'checkpoint=cleared'
+        else:
+            state = (
+                f'failure={checkpoint.failure_count}, success={checkpoint.success_count}, '
+                f'pending={checkpoint.pending_action}'
+            )
+        logger.info(
+            f'Level single-step complete: action={action.value}, {state}; '
+            'stop after one committed game action'
+        )
+        self.finish_level_mode(success=False)
+
     def run_level_mode(self, config: RealmRaid) -> None:
         account = getattr(self.config, 'config_name', 'default')
         target_level = config.level_mode_config.target_level
@@ -835,6 +884,9 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
                 ):
                     self.finish_level_mode(success=False)
                 transaction_count += 1
+                self.finish_level_single_step(
+                    config, decision.action, transaction_count, store
+                )
                 continue
 
             if decision.action == LevelAction.ATTACK:
@@ -847,12 +899,18 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
                     self.finish_level_mode(success=False)
                 transaction_count += 1
                 checkpoint = store.load()
+                self.finish_level_single_step(
+                    config, decision.action, transaction_count, store
+                )
                 continue
 
             if decision.action == LevelAction.REFRESH:
                 if self.execute_level_refresh(snapshot, checkpoint, store):
                     transaction_count += 1
                     checkpoint = None
+                    self.finish_level_single_step(
+                        config, decision.action, transaction_count, store
+                    )
                     continue
                 refreshed = self.build_level_board_snapshot(screenshot=True)
                 if refreshed.refresh_available:

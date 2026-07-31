@@ -381,6 +381,7 @@ const fieldLabels = {
   number_attack: '攻击数量',
   number_base: '基础数量',
   target_level: '目标等级',
+  single_step: '单步测试',
   min_bounty: '最低悬赏等级',
   boss_number: '鬼王数量',
   use_collect: '使用收藏目标',
@@ -578,8 +579,12 @@ const fieldLabels = {
 
 const descriptions = {
   enable_help: '将这个任务加入调度器',
-  target_level_mode_enable_help: '启用按账号配置的目标等级模式；默认关闭，呱太特殊模式仍沿用上游流程',
+  target_level_mode_enable_help: '启用按账号配置的目标等级模式；开启后由新状态机接管退四、刷新和失败处理，相关旧选项不参与决策',
   target_level_help: '当前等级高于目标时降级，等于目标时保级，低于目标时升级',
+  single_step_test_help: '每次运行最多提交一次投降、挑战或刷新，测试期间建议保持开启',
+  exit_four_help: '仅旧流程生效；目标等级模式会自行计算投降次数',
+  three_refresh_help: '仅旧流程生效；目标等级模式不按三胜手动刷新',
+  when_attack_fail_help: '仅旧流程生效；目标等级模式按当前等级和 checkpoint 决策',
   next_run_help: '会根据间隔时间自动计算下一次运行时间',
   priority_help: '数字越低优先级越高，同优先级按加入顺序执行',
   success_interval_help: '任务成功后，按此间隔再次执行',

@@ -3,6 +3,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 
+from tasks.RealmRaid.config import LevelModeConfig
 from tasks.RealmRaid.level_mode import (
     BoardSnapshot,
     CheckpointStore,
@@ -46,6 +47,9 @@ def board(
 
 
 class LevelModeDecisionTest(unittest.TestCase):
+    def test_single_step_is_safe_default(self):
+        self.assertTrue(LevelModeConfig().single_step)
+
     def test_broken_levels_are_imputed_from_four_visible_cards(self):
         levels, imputed, source = resolve_broken_levels(
             (0, 0, 0, 0, 0, 58, 58, 58, 58),
@@ -120,6 +124,28 @@ class LevelModeDecisionTest(unittest.TestCase):
         self.assertEqual(checkpoint.level_mode, LevelMode.RECOVERY_HOLD)
         self.assertTrue(checkpoint.recovery_hold)
         self.assertEqual(decide_next_action(snapshot, checkpoint).action, LevelAction.SURRENDER)
+
+    def test_different_board_signature_does_not_reuse_failure_count(self):
+        original = board(
+            level=59,
+            broken=(1, 2),
+            attack_record=2,
+            signature='board-a',
+        )
+        checkpoint = create_checkpoint('oas1', original, 59, LevelMode.HOLD)
+        checkpoint.failure_count = 3
+        changed = board(
+            level=59,
+            broken=(1, 2),
+            attack_record=2,
+            signature='board-b',
+        )
+
+        reconciled = reconcile_checkpoint('oas1', changed, 59, checkpoint)
+
+        self.assertEqual(reconciled.level_mode, LevelMode.RECOVERY_HOLD)
+        self.assertEqual(reconciled.failure_count, 0)
+        self.assertTrue(reconciled.recovery_hold)
 
     def test_no_ticket_stops(self):
         snapshot = board(level=59, tickets=0)

@@ -1,18 +1,18 @@
 <#
-  一键启动「无游戏联调栈」：mock Core (:22268) + 真实 Bridge (:22367) + UI-claude (:4175)
+  一键启动「无游戏联调栈」：mock Core (:22268) + 隔离 Bridge (:22368) + UI-claude (:4175)
 
   用途：不启动游戏、模拟器和真实 OAS Core，就把整套控制中心跑起来——
   用于界面开发、演示、以及上游更新后的快速回归。
   mock Core 的接口与真实 Core 对齐（见 bridge/tests/mock_core.py 顶部说明），
-  数据全在内存里，不写任何真实配置文件。
+  mock Core 数据在内存里；Bridge 元数据写入 output/dev-stack，不接触正式数据库。
 
   ★ 这是“演示/联调栈”：界面里显示的“Core 在线”指向的是 mock Core（模拟数据），
     不会控制任何真实设备，也不会读写真实配置。真实使用请改用项目根目录的 启动.bat。
 
   与真实环境的关系：
     - 真实使用时不要运行本脚本；照常 server.py + start-bridge.ps1 + UI 即可；
-    - mock Core 用 22268 端口，即使真实 Core (:22267) 在跑也互不冲突；
-      但 Bridge 端口 22367 是共用的，联调前先关掉已有 Bridge。
+    - mock Core 用 22268，测试 Bridge 用 22368，不复用正式 22267/22367；
+    - 测试 Bridge 强制使用独立 SQLite 目录，并向测试脚本报告隔离模式。
 
   用法：
     Set-Location D:\OSAyys
@@ -21,7 +21,7 @@
 #>
 param(
   [int]$MockCorePort = 22268,
-  [int]$BridgePort = 22367,
+  [int]$BridgePort = 22368,
   [int]$UiPort = 4175
 )
 
@@ -30,6 +30,8 @@ $launcher = $PSScriptRoot
 $root = (Resolve-Path (Join-Path $launcher '..\..')).Path
 $bridgeDir = Join-Path $root 'control-center\bridge'
 $uiDir = Join-Path $root 'control-center\desktop\release\UI-claude'
+$testDataDir = Join-Path $root 'output\dev-stack\bridge-data'
+New-Item -ItemType Directory -Path $testDataDir -Force | Out-Null
 
 # 与 start-bridge.ps1 相同的解释器选择顺序
 $rootPython = Join-Path $root '.venv\Scripts\python.exe'
@@ -56,7 +58,8 @@ Set-Location '$bridgeDir'
 Start-Sleep -Seconds 2
 Write-Host "[2/3] Bridge     -> http://127.0.0.1:$BridgePort（指向 mock Core）"
 Start-Process powershell -WindowStyle Normal -ArgumentList '-NoExit', '-ExecutionPolicy', 'Bypass', '-File',
-  (Join-Path $launcher 'start-bridge.ps1'), '-Port', "$BridgePort", '-CoreUrl', "http://127.0.0.1:$MockCorePort"
+  (Join-Path $launcher 'start-bridge.ps1'), '-Port', "$BridgePort", '-CoreUrl', "http://127.0.0.1:$MockCorePort",
+  '-DataDir', $testDataDir, '-IntegrationTest'
 
 Start-Sleep -Seconds 2
 Write-Host "[3/3] UI-claude  -> http://127.0.0.1:$UiPort"
@@ -68,5 +71,7 @@ Write-Host "全部拉起。打开 http://127.0.0.1:$UiPort/" -ForegroundColor Gr
 Write-Host '★ 提醒：这是演示/联调栈。界面里的“Core 在线”是 mock Core（模拟数据），' -ForegroundColor Yellow
 Write-Host '        不会控制任何真实设备、也不会读写真实配置。真实使用请改用 启动.bat。' -ForegroundColor Yellow
 Write-Host '联调回归：'
+Write-Host "  `$env:OAS_TEST_BRIDGE_URL='http://127.0.0.1:$BridgePort'"
+Write-Host "  `$env:OAS_TEST_MOCK_URL='http://127.0.0.1:$MockCorePort'"
 Write-Host "  接口层：cd control-center\bridge; python tests\test_integration.py"
-Write-Host "  界面层：cd $uiDir; node tools\e2e-real.mjs"
+Write-Host "  界面层：`$env:UI_CLAUDE_BASE='http://127.0.0.1:$UiPort/'; cd $uiDir; node tools\e2e-real.mjs"

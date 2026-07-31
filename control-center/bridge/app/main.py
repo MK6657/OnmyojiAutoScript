@@ -34,10 +34,13 @@ from .repository import MetadataRepository
 from .runtime import RuntimeRegistry
 
 
-BRIDGE_VERSION = "1.1.3"  # 1.1.3: 配合上游 C1 修复放宽间隔到 99 天，见 handoff/16
+BRIDGE_VERSION = "1.1.4"  # 1.1.4: 集成测试模式、mock Core 和 SQLite 强隔离
 ROOT = Path(os.getenv("OAS_CONTROL_CENTER_ROOT", str(Path(__file__).resolve().parents[2])))
-DATA_DIR = Path(os.getenv("OAS_CONTROL_CENTER_DATA_DIR", str(ROOT / "data")))
+DEFAULT_DATA_DIR = ROOT / "data"
+DATA_DIR = Path(os.getenv("OAS_CONTROL_CENTER_DATA_DIR", str(DEFAULT_DATA_DIR)))
 CORE_URL = os.getenv("OAS_CORE_URL", "http://127.0.0.1:22267")
+INTEGRATION_TEST_MODE = os.getenv("OAS_INTEGRATION_TEST", "").strip().lower() in {"1", "true", "yes"}
+INTEGRATION_DATA_ISOLATED = DATA_DIR.resolve() != DEFAULT_DATA_DIR.resolve()
 # 已启用任务的缓存时长。任何写操作都会立刻失效对应账号的缓存，
 # 所以这个值只影响「别处改了配置文件」这类外部变更的感知延迟。
 TASK_CACHE_TTL = float(os.getenv("OAS_TASK_CACHE_TTL", "45"))
@@ -418,6 +421,9 @@ async def health() -> dict[str, Any]:
         "bridge": "ok",
         "core": "ok" if core_ok else "offline",
         "core_url": CORE_URL,
+        "integration_test": INTEGRATION_TEST_MODE,
+        "data_dir": str(DATA_DIR.resolve()) if INTEGRATION_TEST_MODE else None,
+        "data_isolated": INTEGRATION_TEST_MODE and INTEGRATION_DATA_ISOLATED,
         "version": BRIDGE_VERSION,
     }
 

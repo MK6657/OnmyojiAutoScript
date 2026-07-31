@@ -285,10 +285,7 @@ def checkpoint_matches(
         return False
     if checkpoint.board_signature and snapshot.board_signature:
         if checkpoint.board_signature != snapshot.board_signature:
-            # Level-only signatures are weak and may change only after a refresh. A monotonic
-            # success count is stronger evidence that the task is still on the same board.
-            if snapshot.success_count < checkpoint.success_count:
-                return False
+            return False
     return True
 
 

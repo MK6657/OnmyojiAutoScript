@@ -217,3 +217,37 @@ updated_at
 修补为：每轮退出键最多点击一次；等待 3 秒仍识别不到确认模板时，只按确认按钮 ROI 中心点击一次；失败结算同样只点击一次并等待状态变化；不通过清空全局点击记录绕过安全保护。新增 2 个离线用例，分别验证模板命中和 ROI 兜底时退出键均只点击一次。
 
 用户提出疑问后已停止继续实机验证。`oas1` 控制中心状态已确认变为“已停止”，游戏停在庭院，个人突破下次调度为 2026-08-01 12:10:07。当前 checkpoint 保留 `failure_count=2` 和一笔待对账投降，后续重新测试前必须先按当前棋盘证据恢复，不能直接重复计数。
+
+## 12. 晚间实测前安全化收尾
+
+用户同意按“单事务验证优先”的方式继续。已增加以下约束：
+
+1. `level_mode_config.single_step` 默认开启；每次 RealmRaid 运行最多提交一次投降、挑战或手动刷新，提交后返回庭院并结束本轮任务。
+2. 目标等级模式内出现 `GameStuckError` 或 `GameTooManyClickError` 时，保留动作前写入的 pending checkpoint，只结束 RealmRaid，不再转入全局杀游戏重启流程；旧流程的异常策略不变。
+3. 开发期 `LEVEL_DEBUG`、`CAPTURE_BOARD`、`CAPTURE_ONLY` 均恢复为关闭；关闭目标等级模式后可正常回退上游旧流程，不再被素材采集开关提前结束。
+4. 棋盘签名改为九个对手名字区域的 Otsu 二值化哈希，排除卡片明暗、失败箭头和破印；同一真实棋盘在两张不同时刻截图上签名一致。checkpoint 的棋盘签名改为严格匹配，不允许只凭成功数单调增加沿用旧失败计数。
+5. 配置界面明确标注：开启目标等级模式后，旧流程的 `exit_four`、`three_refresh`、`when_attack_fail` 不参与新状态机决策。
+6. 12:09 的日志显示第三次投降已完整经过退出确认、失败结算并返回棋盘，但旧函数因使用 ROI 兜底而返回 False，导致 checkpoint 没有提交。晚间实测前将当前 checkpoint 对账为 `failure_count=3`、清除 pending；两次在确认弹窗中触发强制重启的尝试不计入已确认失败。
+
+晚间测试只需启动已停止的 `oas1`。预期本次只再投降一次，使 checkpoint 从 3 变为 4，随后自动返回庭院；不要在同一次运行中继续挑战。确认失败数为 4、票数仍为 20/30 后，下一次单步运行才允许进入一次成功挑战测试。
+
+## 13. 2026-07-31 集成测试污染恢复与隔离
+
+12:30 误将 `control-center/bridge/tests/test_integration.py` 指向正式 22367 Bridge。该脚本不是只读测试，实际创建了 `oas-int`，修改了 `oas1` 的御魂调度与截图方式，并把任务显示顺序写入正式 SQLite。游戏账号当时已停止，checkpoint 未被测试覆盖，未产生新的游戏动作。
+
+恢复结果：
+
+1. 根据 Core 日志确认 `oas1` 于 11:36 从 `config/template.json` 重建，御魂字段已恢复为 `next_run=2023-01-01 00:00:00`、`success_interval=01 00:00:00`。
+2. 根据 11:52 的绑定日志把 `script.device.screenshot_method` 恢复为 `nemu_ipc`。
+3. 删除测试账号 `oas-int`，清空测试写入的 `oas1` 任务显示顺序；checkpoint 保持失败 3 次、成功 5 次、无 pending。
+4. 补回 `realm_raid.level_mode_config.single_step=true`，RealmRaid 仍为到期状态，`oas1` 保持停止，供晚间手工启动后只执行一个动作。
+
+隔离规则：
+
+1. `start-dev-stack.ps1` 默认使用 mock Core 22268、测试 Bridge 22368 和 `output/dev-stack/bridge-data` 独立 SQLite，不复用正式 22267/22367 与 `control-center/data`。
+2. 测试 Bridge 必须设置 `OAS_INTEGRATION_TEST=1` 并使用非正式数据目录，health 才同时报告 `integration_test=true` 和 `data_isolated=true`。
+3. `test_integration.py` 与 `e2e-real.mjs` 必须显式传入 `OAS_TEST_BRIDGE_URL`、`OAS_TEST_MOCK_URL`，并在任何写操作前核对端口、mock stats、Bridge 的 `core_url`、测试模式和数据目录。
+4. 测试脚本不再支持对真实 Core 运行；验证真实账号只采用专门的只读检查或由用户确认后的单动作实机流程。
+5. mock Core 默认字段来源固定为 `control-center/bridge/tests/fixtures/oas1.json`，不再自动读取用户的 `config/oas1.json`；显式覆盖缺失时最多回退到通用 `config/template.json`。
+
+离线验证结果：RealmRaid 18/18、GeneralBattle 2/2、Bridge 单元脚本 18/18、隔离 Bridge 与 mock Core 集成 16/16；Python/Node/PowerShell 语法、JSON 和 `git diff --check` 通过。E2E 安全门已验证会拒绝空 URL 与正式 22367；完整浏览器 E2E 因当前未安装 Playwright 未运行，不影响晚间单动作游戏实测。

@@ -4,28 +4,37 @@
 Bridge 再通过真 HTTP/WebSocket 访问 mock Core——覆盖单元测试摸不到的路径：
 缓存与调度快照、WebSocket 运行时、值规范化落到 Core 解析器、错误码翻译。
 
-运行前先启动两层（用户机器示例）：
+运行前先启动隔离的两层（用户机器示例）：
     cd D:\\OSAyys\\control-center\\bridge
     .venv\\Scripts\\python.exe -m uvicorn tests.mock_core:app --port 22268
-    # 另一窗口（注意 OAS_CORE_URL 指向 mock）
+    # 另一窗口：Core、Bridge 数据库和端口都必须与正式环境隔离
     set OAS_CORE_URL=http://127.0.0.1:22268
-    .venv\\Scripts\\python.exe -m uvicorn app.main:app --port 22367
+    set OAS_CONTROL_CENTER_DATA_DIR=D:\\OSAyys\\output\\dev-stack\\bridge-data
+    set OAS_INTEGRATION_TEST=1
+    .venv\\Scripts\\python.exe -m uvicorn app.main:app --port 22368
 然后：
+    set OAS_TEST_BRIDGE_URL=http://127.0.0.1:22368
+    set OAS_TEST_MOCK_URL=http://127.0.0.1:22268
     .venv\\Scripts\\python.exe tests\\test_integration.py
 
-也可以把 Bridge 指向【真实 Core】跑同一套用例（只读用例会通过，
-涉及创建/改值的用例会真实写入，请只在测试配置上执行）。
+本脚本包含创建账号、修改任务配置、启动/停止账号和写入 SQLite 的用例，
+安全预检不通过时会立即退出，禁止对正式 22367 Bridge 或真实 Core 执行。
 """
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
-BRIDGE = "http://127.0.0.1:22367/api/v1"
-MOCK = "http://127.0.0.1:22268"
+BRIDGE_ROOT = os.getenv("OAS_TEST_BRIDGE_URL", "").rstrip("/")
+MOCK = os.getenv("OAS_TEST_MOCK_URL", "").rstrip("/")
+BRIDGE = f"{BRIDGE_ROOT}/api/v1"
+PRODUCTION_DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 
 results: list[tuple[str, str, str]] = []
 
@@ -70,6 +79,45 @@ def stats() -> dict:
 def field_value(account: str, task: str, group: str, name: str):
     _, config = call("GET", f"{BRIDGE}/accounts/{account}/tasks/{task}/config")
     return next(f["value"] for f in config["groups"][group] if f["name"] == name)
+
+
+def require_isolated_environment() -> None:
+    """Fail before the first mutation unless Bridge is explicitly test-only."""
+    if not BRIDGE_ROOT or not MOCK:
+        raise RuntimeError("必须显式设置 OAS_TEST_BRIDGE_URL 和 OAS_TEST_MOCK_URL")
+
+    bridge_url = urllib.parse.urlsplit(BRIDGE_ROOT)
+    mock_url = urllib.parse.urlsplit(MOCK)
+    loopback = {"127.0.0.1", "localhost", "::1"}
+    if bridge_url.hostname not in loopback or mock_url.hostname not in loopback:
+        raise RuntimeError("集成测试只允许访问本机回环地址")
+    if bridge_url.port == 22367:
+        raise RuntimeError("拒绝使用正式 Bridge 端口 22367；请启动隔离的 22368 实例")
+
+    status, mock_stats = call("GET", f"{MOCK}/__mock__/stats")
+    if status != 200 or not isinstance(mock_stats, dict) or "args_calls" not in mock_stats:
+        raise RuntimeError(f"OAS_TEST_MOCK_URL 不是预期的 mock Core：{status} {mock_stats}")
+
+    status, health = call("GET", f"{BRIDGE}/health")
+    if status != 200 or not isinstance(health, dict):
+        raise RuntimeError(f"测试 Bridge 不可用：{status} {health}")
+    if health.get("integration_test") is not True:
+        raise RuntimeError("Bridge 未以 OAS_INTEGRATION_TEST=1 启动")
+    if health.get("data_isolated") is not True:
+        raise RuntimeError("Bridge 未使用隔离数据目录")
+    if str(health.get("core_url", "")).rstrip("/") != MOCK:
+        raise RuntimeError(f"Bridge 未指向指定 mock Core：{health.get('core_url')!r}")
+
+    data_dir = health.get("data_dir")
+    if not data_dir:
+        raise RuntimeError("Bridge 未报告隔离数据目录")
+    if Path(str(data_dir)).resolve() == PRODUCTION_DATA_DIR.resolve():
+        raise RuntimeError("Bridge 仍在使用正式 control-center/data，拒绝运行")
+
+    status, accounts = call("GET", f"{BRIDGE}/accounts")
+    account_ids = {item.get("id") for item in accounts} if status == 200 and isinstance(accounts, list) else set()
+    if account_ids != {"oas1", "oas2", "oas3"}:
+        raise RuntimeError(f"测试账号集合不符合 mock Core：{sorted(account_ids)}")
 
 
 @check("health：Bridge 版本 >= 1.1.2 且 Core 在线")
@@ -266,6 +314,12 @@ def t_no_storm():
 
 
 def main() -> int:
+    try:
+        require_isolated_environment()
+    except Exception as error:  # noqa: BLE001
+        print(f"安全预检失败，未执行任何写操作：{error}", file=sys.stderr)
+        return 2
+
     tests = [v for k, v in sorted(globals().items()) if k.startswith("t_") and callable(v)]
     for test in tests:
         test()

@@ -13,8 +13,8 @@
     （真实 Core 在 `config.get_next()` 处抛 RequestHumanTakeover）——验证 Bridge
     的秒断退避，不修会出现每秒重连风暴。
 
-任务字段结构从真实的 config/*.json 派生（自动向上查找项目根的 config 目录），
-因此任务名、分组名、字段名与真实环境一致。全部数据在内存里，不写任何文件。
+任务字段结构默认来自 tests/fixtures/oas1.json，也可通过 OAS_MOCK_CONFIG 显式覆盖；
+不会自动读取用户的 config/oas1.json。全部运行数据在内存里，不写任何配置文件。
 
 启动（用户机器，Bridge 的虚拟环境即可）：
     cd D:\\OSAyys\\control-center\\bridge
@@ -51,7 +51,9 @@ def discover_config() -> Path | None:
         return local
     probe = HERE
     for _ in range(8):
-        for name in ("oas1.json", "template.json"):
+        # Never infer from a user's account file. A mock fallback may use only
+        # the generic template, otherwise local account settings leak into tests.
+        for name in ("template.json",):
             candidate = probe / "config" / name
             if candidate.exists():
                 return candidate
