@@ -1,0 +1,89 @@
+只读审查已完成。我以 `env -u PYTHONPATH` 环境假设为前提，未运行任何命令修改文件、未安装依赖、未启动服务；仅用标准库 `sqlite3 :memory:` 复现了一次 schema CHECK 约束行为（纯内存、不触碰项目数据）。以下为最终报告。
+
+---
+
+# coordinate-calibrator storage/domain/ports/adapters 层只读审查报告
+
+审查范围已全部通读（见末尾"已读文件"）。行号以当前工作树 `D:\coordinate-calibrator\src\` 为准。
+
+## ① 历史声明核对表（10 条）
+
+| # | 声明 | 判定 | 证据行号 |
+|---|------|------|----------|
+| 1 | CC-BUNDLE-001：bundle 画布尺寸共享 8192 边界 + 唯一 group 数量受限 | ✅ 已实施 | `bundles.py:30` `MAX_CANVAS_DIMENSION=8192`；`bundles.py:275-276` `_canvas_spec` 校验 `width/height > 8192` 拒绝（与 `api/schemas.py:13-14,120-121` `le=8192` 一致）；`bundles.py:33` `MAX_GROUPS_PER_WORKSPACE=200`，`bundles.py:387`、`bundles.py:389-443`（`seen_groups` 唯一性 + `imported_group_keys ∪ existing_group_keys ≤ 200`） |
+| 2 | 0.3.7 bundle 全量语义配额预校验 + 导出持有 workspace 锁/排序 session 锁/单一快照 | ✅ 已实施 | `bundles.py:447-449` `import_bundle` 先 `_read_zip` 再 `_prevalidate_import`（351-444，含 workspace/canvas/session/background/annotation/group 配额全套）*之后*才 business write；`bundles.py:175-182` `_session_snapshot` 用 `ExitStack` 对 `sorted(set(session_ids))` 逐个 `_session_lock` + `read_snapshot()`；`bundles.py:184-186` export_project 再包 `_workspace_lock`；`bundles.py:206-248` export_workspace 重试 3 次取锁+快照，`requested≠lock_ids` 时重试 |
+| 3 | CC-INTEGRITY-001：reconcile 对 ready 行校验文件存在/大小/SHA-256 | ✅ 已实施 | `runtime.py:1916-1958` `reconcile_artifacts`：对每个 `state=='ready'` 工件 `safe_path`→`is_file()`（缺→`reason="missing"`），读盘计算 `actual_size`/`actual_sha256` 对比 `expected_size`/`expected_sha256`（1942-1945 区分 truncated/replaced） |
+| 4 | audit-20260809 P2：永久删除把文件放入无配额无界 quarantine | ❌ 仍存在（未修复） | `runtime.py:541-593` `permanently_delete_canvases` 逐文件 `quarantine_file` 移入 `quarantine/<日>/…`（`artifacts.py:245-284`），**无任何配额/过期/GC**；`reserve_artifact` 配额只统计 DB `artifacts` 表 staging/ready 行（`repository.py:2880-2896`），quarantine 目录文件不计数、不清理 |
+| 5a | 0.3.7 Nemu/ADB 单一活动 capture owner + 每帧 runtime 身份代数校验 | ✅ 已实施 | owner：`runtime.py:748-765` `_claim_external_source`/`_release_external_source` 用 `_source_owners` 按 `device:serial:instance` 键互斥；每帧：`runtime.py:1196-1204` capture 时调 `current_runtime_identity`，`adb.py:66-72`、`nemu_ipc.py:261-269` 与 `_runtime_identity` 不符抛 `CaptureIdentityChanged`，外层 `runtime.py:1302-1308` publish `target_lost` 并 `return` 停止采集 |
+| 5b | 0.3.8 generic 模拟器不再仅凭设备列表唯一项继承 ADB serial（需品牌 PID/实例/端口证据） | ⚠️ 无法判定（范围内无对应代码） | 审查范围内 `capture/*.py` **不存在任何**"generic 模拟器进程枚举/唯一设备继承 serial"的实现；`AdbFrameSource.__init__`（`adb.py:26-51`）强制显式 `serial` 且拒绝 CR/LF，无自动继承路径；MuMu 端口映射仅在 `common.py:125-133` `instance_id_from_serial`（16384+idx*32，offset∈{0,1,2}）与 `nemu_ipc.py:533-541` 同款。该"修复"针对的旧路径不在此层，可能位于范围外文件或该缺陷从未落入此层 |
+| 6 | 0.3.8 `_local_endpoint_pid` 读原始字节只解析 ASCII 地址/PID | ✅ 已实施 | `common.py:136-168`：`subprocess.run([... "netstat","-ano","-p","tcp"], capture_output=True, ...)` **无 `text=True`**，stdout 为 bytes；`columns[0].upper() != b"TCP"`、`state != b"LISTENING"`、`local.endswith(f":{port}".encode())` 全字节比较，只取 `columns[1]`/`columns[4]` 两个 ASCII 字段，不再依赖活动代码页 |
+| 7 | 0.3.7 鼠标事件保留原生时间/注入标志 + 注入拒绝 + 有序预览环 before<click<after | ✅ 已实施 | `mouse.py:24-25` `LLMHF_INJECTED`/`LLMHF_LOWER_IL_INJECTED`（Windows 低级钩子标志，非 LLM，**无误报**）；`mouse.py:47-50` `WindowsMouseEvent.native_time_ms/native_flags`；`mouse.py:205-215` hook_proc 读 `data.time`/`data.flags`；`mouse.py:154-160` 注入标志直接 return False；`models.py:209-227` `has_verified_frame_evidence` 校验 `frame_id==before_frame_id` + `before<click<after` + 64 位 hex sha；`runtime.py:3237-3270` `_select_mouse_evidence_unlocked` 在有序预览环选 before/after |
+| 8 | audit-20260809 原生调用超时后需源重绑定/重启，而非强制线程终止 | ✅ 基本实施（残留线程为设计内） | `nemu_ipc.py:309-341`：超时 `future.cancel()`（不再 kill 线程），`_mark_timeout` 置 `_blocked=True`，`capture`/`open` 在 `_blocked`/`_in_flight` 下拒绝并要求 reapply 源（275-292）；线程不会永久卡死因 `_NemuProcessClient` socket 已 `settimeout`（`nemu_ipc.py:95`）；旧源 `close()` 走 `_executor.shutdown(wait=False, cancel_futures=True)`（372） |
+| 9 | audit-20260809 P2：部分 Session 序列化/报告读取无锁遍历字典 | ❌ 仍存在（未修复） | `statistics` 读取路径 `runtime.py:3316-3323` `report()` 与 `runtime.py:3367-3370` `build_annotation_report(...)` 均**未**持有 `_session_lock`，直接遍历 `session.annotations`/`session.samples`（`as_dict` 同样无锁遍历，`runtime.py:151-160`），与 capture worker/mouse callback 的写入并发 |
+| 10a | audit-20260809 P3：`build_report()` 声称 Iterable 但遍历输入两次，generator 会出错 | ❌ 仍存在（未修复） | `statistics.py:187` `selected = [s for s in samples ...]`（第 1 次）后再 `statistics.py:188` `_accepted_points(samples, ...)`（内部 `statistics.py:157` 再次 `[s for s in samples ...]`）——generator 第二次遍历为空，结果错。当前调用点（`runtime.py:3323`）传 `dict.values()` 视图可重复迭代，故运行时侥幸正常，但 API 契约缺陷仍在 |
+| 10b | audit-20260809 P3：半开区间边缘坐标可显示 `(1280,720)` 越界舍入值 | ⚠️ 仍存在（显示层，待实机） | 后端 half-open clamp 正确（`transforms.py:25-27` `nextafter(1.0,0.0)` 保证 <1）；但前端 `app.js:1972-1975` `coordinateReadout` 用 `Math.round(canvasPoint.x/y)`，1279.6→1280 越界显示。纯显示问题，本轮范围非主责，标待实机确认 |
+
+## ② 新发现问题清单
+
+**N1 🔴 `mark_artifact_damaged` 写入非法 state，删除受损工件路径必然抛 `IntegrityError`，并使 reconcile 中断且文件库/DB 状态分裂**（置信度=已证实）
+- 现象：`repository.py:3057-3064` `mark_artifact_damaged` 执行 `UPDATE artifacts SET state='damaged' …`，但 schema CHECK 约束仅允许 `('staging','ready','delete_pending')`（`repository.py:570`）。
+- 证据：我用标准库 `sqlite3 :memory:` 按 `_schema_statements` 同款建表后执行该 UPDATE，**100% 抛出 `sqlite3.IntegrityError: CHECK constraint failed: state IN (...)`**（仅内存复现，未触碰项目数据）。
+- 影响：`runtime.py:1959-1982` 在 `reconcile_artifacts(apply_repairs=True, quarantine=True)` 下——正是 `maintenance.py:178` `quarantine` 命令的运行路径——先把文件 `quarantine_file` 移入 quarantine、再把 `quarantine_items` 置 `quarantined`，随后 `mark_artifact_damaged` 抛错：
+  - reconcile 首个受损工件即异常中断（异常无捕获，向上冒到 maintenance.to_json）；
+  - 文件已被移走，但 `artifacts` 行仍是 `state='ready'` 且指向已不存在的路径 → 文件系统与 DB 状态不一致；
+  - 后续所有受损工件不再处理。
+- 注：`tests/test_full_remediation.py:320-330` 只测 `reconcile_artifacts()`（`apply_repairs=False`）的报告值，未覆盖 repairs 路径，故套件未捕获。且 `damaged` 亦不在 `_validate_schema` 的 `required_sql_fragments["artifacts"]`（`repository.py:786`）中，进一步印证枚举不合法。
+- 建议方向（供后续，本轮不改）：要么给 artifacts 表增加 `damaged` 枚举并同步 `_validate_schema`，要么 `mark_artifact_damaged` 改为 `state='delete_pending'`/直接删行；并让 reconcile 对单工件异常继续处理后续项。
+
+**N2 🟡 quarantine 目录完全无配额、无过期、无 GC**（置信度=已证实，即历史项 #4 的独立复述）
+- `artifacts.py:245-284` `plan_quarantine`/`quarantine_file` 把文件移入 `root/quarantine/<YYYYMMDD>/…`；`permanently_delete_canvases`（`runtime.py:541-593`）与 `reconcile_artifacts` 的 orphan 分支（`runtime.py:2072-2089`）持续写入。无字节/文件数上限（`ArtifactStore.usage()` 虽 os.walk 到 quarantine，但配额守卫只基于 DB artifacts 表 staging/ready 行），长期永久删除累积磁盘无回收路径。
+
+**N3 🟡 file-move 与 DB 标记不同顺序导致的收敛缺陷**（置信度=已证实，N1 的衍生）
+- `reconcile_artifacts` 对受损工件先 `quarantine_file`（文件系统，不可回滚）再 `mark_artifact_damaged`（DB）；一旦后者失败即留下"文件已移走、DB 仍 ready"的中间态。对比 `permanently_delete_canvases` 正确的补偿模式（`runtime.py:575-593` catch 后 `restore_quarantine` 回滚）——reconcile 缺同样的补偿。
+
+**N4 🟡 annotation 配额计数 total（含软删除）vs 文档 "active" 措辞**（置信度=已证实）
+- `runtime.py:2675` `if len(session.annotations) >= self.max_annotations` 计数的是 session 内存 dict 全量条目；软删除只 `replace(current, …, deleted_at=_now())` 保留在 dict（`runtime.py:2823`），因此历史删除累积可永久耗尽 "200 个活动标注" 的配额。文档口径与计数语义不符（延续 audit B4，仍未修）。
+
+**N5 🟢 SQL 注入——未发现**（置信度=已证实，归入通过项）
+- `repository.py` 全部写读均为 `?` 占位符参数化；唯一 f-string 用于 `IN ({placeholders})` 的占位符个数（`placeholders=",".join("?" for _ in unique_ids)`，不含任何用户值，见 `repository.py:2140,2175,2228,2816`）；`list_canvas_summaries` 的 LIKE 搜索做了 `\ % _` 转义（`repository.py:1986-1988`）。PRAGMA/表名均为固定字符串。
+
+**N6 🟡 bundle 画布**「8192×8192」无像素积上限，comparison 可超量分配**（置信度=已证实）
+- `bundles.py:275-276` `_canvas_spec` 只查 `width/height ≤ 8192`，**不查 `width*height`**；对比单帧截图有 `MAX_FRAME_PIXELS=32_000_000` 上限（`common.py:30,39`）。`comparison.py:24-30` `_canonical_rgb` 会把任意 payload `resize` 到 `(canvas.width, canvas.height)`——8192×8192≈67M 像素，`ImageChops.difference`+`split`+`lighter` 复数副本峰值内存数百 MB。`compare_backgrounds`（`runtime.py:2587-2630`）消费的正是 session.canvas 尺寸。这正是 CC-BUNDLE-001 曾担心的 "later comparison can allocate" 的残余桩——只限了单边没限乘积。
+
+**N7 🟢/🟡 路径安全基本成立，附 Windows 保留名注意事项**（置信度=高概率）
+- `artifacts.py safe_path/safe_root_path`（58-91）做 `is_absolute`/`..`/`.` 拒绝 + `_validate_component` 正则 `[A-Za-z0-9_.-]+` + 逐级 `_reject_reparse`（拒绝 symlink/junction，`st_file_attributes & 0x400`）。我用 stdlib 实测 `D:data`、`a:b`、`C:Program Files` 这类盘符相对路径会被 `abspath` 展开后 `relative_to(base)` 拒绝或吞到 root 内子路径，不逃逸出 data 根。但 `con.png`/`nul` 等 Windows 保留设备名可被 `safe_path` 接受（`safe_path` 不校验保留名）——写入阶段 `open("xb")` 会抛 OSError 而非写坏，风险低。HTTP 层 session_id/annotation_id 均有正则/uuid 约束，不能直接注入任意 relative_name。
+
+**N8 🟢 文件原子写/fsync 实现良好**（置信度=已证实，归入通过项）
+- `save_bytes`/`save_bounded`：tmp + `flush` + `os.fsync` + `os.replace`（`artifacts.py:98-109,179-190`）；`promote_staged` 先校验 SHA-256 再 `os.replace`（116-137）；`quarantine_file`/`restore_quarantine` 均先 hash 校验再 `os.replace`。单进程内 `ArtifactStore._lock` RLock 串行化。
+
+**N9 🟡 nemu 超时线程残留（低风险）**（置信度=高概率）
+- `nemu_ipc.py:309-341` 超时后 `future.cancel()` 不终止 executor 线程；该线程最多存活至底层 socket timeout（`nemu_ipc.py:95` `settimeout(self.timeout_seconds)`，超时在 `_receive_packet` 触发 `terminate()` 并抛错），故不会永久卡死，但存在 `timeout_seconds` 量级的死线程。`close()` 用 `shutdown(wait=False)`（372）不等待。连接不重用：每次 `from_descriptor` 重新 spawn 子进程 + 新 socket。设计符合 audit 建议方向，遗留线程为已知残余。
+
+## ③ 通过项
+
+- **SQL 注入防护**：见 N5，全参数化，无拼接（`repository.py` 全文件）。
+- **坐标数学四向旋转一致且逆正确**（独立推导）：`transforms.py:38-45` screen→canvas 与 `coordinate_math.js:39-49` image→canvas 四向公式逐一相同（0: (nx,ny)；90: (ny,1-nx)；180: (1-nx,1-ny)；270: (1-ny,nx)）；`transforms.py:64-71` canvas→screen 与 `coordinate_math.js:58-61` 互为严格逆矩阵（90° 代入检验 (nx,ny)→(ny,1-nx)→(1-(1-nx),ny)=(nx,ny)）。半开 clamp 双侧一致（`_half_open_unit`=nextafter vs `halfOpenMaximum`=size-ε）。
+- **`_local_endpoint_pid` 字节解析**：见 #6，已彻底 ASCII 化，无活动代码页依赖。
+- **文件原子写 + fsync + SHA-256 链**：见 N8；`_record_frame`（`runtime.py:1651-1782`）文件写→promote→单事务 `commit_frame_snapshot`（`repository.py:2935-3055`），异常补偿清理文件+删 artifact 行；`_apply_imported_frame`（`runtime.py:2367-2416`）对 mutable fields deepcopy 快照回滚；`import_bundle`（`bundles.py:643-654`）失败补偿 close_session + delete_workspace_if_empty。
+- **bundle 路径/压缩/哈希安全**：zip 遍历/盘符/符号链接拒绝、file_size 与 unpacked 上限、压缩比 2000 上限、manifest 全量 SHA-256+size 核验、undeclared 文件拒绝（`bundles.py:41-111`）。
+- **ArtifactStore reparse 防护**：symlink/junction 拒绝贯穿 `session_dir/safe_path/safe_root_path/delete_session/quarantine`（`artifacts.py:32-51`）。
+- **LLMHF_* 常量**：确认是 Windows LowLevelMouseHookFlags 钩子注入标志而非 LLM 相关，无误报风险。
+- **`permanently_delete_canvases` 回滚补偿**：文件移动失败后 `restore_quarantine` 逐个回滚并 record `canvas_delete_rollback_failed`（`runtime.py:575-593`）——正确的事务收敛模板。
+
+## ④ 无法判定项
+
+- **#5b（0.3.8 generic 模拟器 serial 继承修复）**：审查范围内 `capture/*.py` 无 generic 模拟器进程枚举/继承逻辑，无法在范围内验证该"修复已实施"；既可能位于范围外文件，也可能该缺陷从未落入这一层。需扩大 grep 范围（如 windows/provider.py 的窗口枚举 → capture 绑定链路，及 API 层设备列表端点）才能定论。
+- **#10b 半开区间边缘坐标 `(1280,720)` 显示**：后端 clamp 已正确，显示越界发生在 `app.js:1972-1975` 的 `Math.round`（前端层，不在本轮后端范围），建议由前端审查确认并给出实测证据。
+
+---
+
+### 已读文件清单（全量通读）
+`storage/repository.py`(3351)、`storage/bundles.py`(654)、`storage/artifacts.py`(312)、`domain/models.py`、`transforms.py`、`geometry.py`、`comparison.py`、`statistics.py`、`ports/{frame_source,mouse_observer,window_provider}.py`、`adapters/capture/{screen,adb,nemu_ipc,common,nemu_worker}.py`、`adapters/windows/{provider,mouse}.py`、`adapters/oas/{exporter,readonly}.py`；并交叉核对了 `api/runtime.py`(3482)、`api/app.py`、`api/schemas.py`、`web/coordinate_math.js`、`web/app.js`(坐标显示)、`maintenance.py`、`docs/audit-20260809.md` 及 `work/logs/2026-08-{10,11}*.md`。
+
+### 主要结论
+- 10 条历史声明中 **6 条完全落地**（CC-BUNDLE-001、bundle 预校验+导出锁、CC-INTEGRITY-001、capture owner+每帧身份校验、netstat 字节解析、鼠标证据链），**2 条仍为未改的开放缺陷**（quarantine 无界、无锁遍历字典），**1 条部分**（build_report 双遍历在调用点侥幸无害但契约仍在），**2 条无法在范围内定论**（generic 模拟器 serial 修复、边缘显示）。
+- 最重要的独立新发现是 **N1（🔴 已证实）**：`mark_artifact_damaged` 写 `state='damaged'` 违反表 CHECK 约束，使 `maintenance quarantine`/reconcile 的 repair 路径必然抛 `IntegrityError` 并留下文件库/DB 分裂状态——这是纯静态+内存复现即可证实的问题，无需实机。
+- 其余为 🟡 观察项（quarantine 无界、配额 total-vs-active 口径、bundle 无像素积上限导致 comparison 内存放大、nemu 超时短时线程残留）。
+
+### 未做/约束
+未修改任何文件、未安装依赖、未启动服务、未操作游戏客户端、未连项目 SQLite（仅用内存库复现 CHECK 约束）。未运行项目测试套件（只读契约）。

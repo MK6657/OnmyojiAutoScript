@@ -142,7 +142,7 @@ class ScriptTask(GameUi, GeneralBattle, SwitchSoul, SecretAssets):
                 self.gold_100(False)
             self.close_buff()
         self.set_next_run(task='Secret', success=True, finish=True)
-        raise TaskEnd('Secret')
+        raise TaskEnd.completed('Secret')
 
     def find_battle(self, screenshot: bool = False) -> int or None:
         """
@@ -291,7 +291,7 @@ class ScriptTask(GameUi, GeneralBattle, SwitchSoul, SecretAssets):
             self.set_next_run(task='Secret',
                               finish=True,
                               target=time_now.replace(hour=9, minute=0, second=0, microsecond=0))
-            raise TaskEnd('Secret')
+            raise TaskEnd.completed('Secret')
 
 
 if __name__ == '__main__':

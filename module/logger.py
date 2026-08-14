@@ -3,9 +3,11 @@
 # github https://github.com/runhey
 import sys
 
+import atexit
 import logging
 import os
 import shutil
+import tempfile
 from datetime import datetime, timedelta, date
 from io import TextIOBase
 from pathlib import Path
@@ -129,10 +131,31 @@ class RichFileHandler(RichHandler):
 pyw_name = os.path.splitext(os.path.basename(sys.argv[0]))[0]
 
 
+def _is_test_context() -> bool:
+    """DeepSeek-13 1.2: tests must never write into the production log/ tree."""
+    if os.environ.get('OAS_TEST_LOGDIR'):
+        return True
+    if os.environ.get('PYTEST_CURRENT_TEST'):
+        return True
+    argv0 = os.path.basename(sys.argv[0]).lower()
+    if argv0.startswith('pytest'):
+        return True
+    joined = ' '.join(sys.argv).lower()
+    if 'unittest' in joined:
+        return True
+    return False
+
+
 def set_file_logger(name=pyw_name, *, do_cleanup=False):
     if '_' in name:
         name = name.split('_', 1)[0]
-    log_file = f'./log/{date.today()}_{name}.txt'
+    if _is_test_context():
+        log_dir = os.environ.get('OAS_TEST_LOGDIR') or os.path.join(
+            tempfile.gettempdir(), 'oas-test-logs')
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, f'{date.today()}_{name}.txt')
+    else:
+        log_file = f'./log/{date.today()}_{name}.txt'
     try:
         file = open(log_file, mode='a', encoding='utf-8')
     except FileNotFoundError:
@@ -205,7 +228,24 @@ class FlutterLogStream(TextIOBase):
     def write(self, msg: str) -> int:
         if isinstance(msg, bytes):
             msg = msg.decode("utf-8")
-        self._func(msg)
+        if self._func is None:
+            return len(msg)
+        try:
+            self._func(msg)
+        except (BrokenPipeError, OSError, ValueError) as e:
+            # DeepSeek-13 1.1c: a broken log pipe (orphan worker whose Core died)
+            # must never kill the worker. Degrade permanently to file-only and
+            # report the incident once through the file handler.
+            self._func = None
+            try:
+                for h in list(logger.handlers):
+                    if isinstance(h, RichFileHandler):
+                        h.console.print(
+                            f"[worker log pipe broken: {e}] console output degraded to file-only",
+                            markup=False,
+                        )
+            except Exception:
+                pass
         return len(msg)
 
 
@@ -263,10 +303,12 @@ def _get_renderables(
 
 
 def print(*objects: ConsoleRenderable, **kwargs):
-    for hdlr in logger.handlers:
+    for hdlr in list(logger.handlers):
         if isinstance(hdlr, FlutterHandler):
             for renderable in _get_renderables(hdlr.console, *objects, **kwargs):
-                hdlr.console.file._func(str(renderable))
+                # DeepSeek-14 O14-2: go through the stream's write() so the
+                # BrokenPipeError protection in FlutterLogStream applies.
+                hdlr.console.file.write(str(renderable))
         elif isinstance(hdlr, RichHandler):
             hdlr.console.print(*objects)
 
@@ -365,6 +407,21 @@ logger.set_func_logger = set_func_logger
 logger.rule = rule
 logger.print = print
 logger.log_file: str
+
+def _close_file_handlers() -> None:
+    # DeepSeek-14 P2: close the file handler at exit so short-lived processes
+    # (tests/workers) never emit ResourceWarning for the log file.
+    for handler in list(logger.handlers):
+        console = getattr(handler, 'console', None)
+        file = getattr(console, 'file', None)
+        if file is not None and hasattr(file, 'close') and file not in (sys.stdout, sys.stderr):
+            try:
+                file.close()
+            except Exception:
+                pass
+
+
+atexit.register(_close_file_handlers)
 
 logger.set_file_logger()
 logger.hr('Start', level=0)

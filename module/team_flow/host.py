@@ -136,13 +136,29 @@ class Host(Mqtt, Player):
     def _player_to_config(self):
         for key, value in self.multi_tasks.items():
             if key == 'orochi':
-                self.config.task_delay(task='Orochi', target=value.next_run)
+                self.config.task_delay(
+                    task='Orochi', target=value.next_run,
+                    reason='team flow synchronized Orochi next_run',
+                    caller='TeamFlowHost',
+                )
             elif key == 'fallen_sun':
-                self.config.task_delay(task='FallenSun', target=value.next_run)
+                self.config.task_delay(
+                    task='FallenSun', target=value.next_run,
+                    reason='team flow synchronized FallenSun next_run',
+                    caller='TeamFlowHost',
+                )
             elif key == 'eternity_sea':
-                self.config.task_delay(task='EternitySea', target=value.next_run)
+                self.config.task_delay(
+                    task='EternitySea', target=value.next_run,
+                    reason='team flow synchronized EternitySea next_run',
+                    caller='TeamFlowHost',
+                )
             elif key == 'evo_zone':
-                self.config.task_delay(task='EvoZone', target=value.next_run)
+                self.config.task_delay(
+                    task='EvoZone', target=value.next_run,
+                    reason='team flow synchronized EvoZone next_run',
+                    caller='TeamFlowHost',
+                )
             elif key == 'exploration':
                 # TODO 等待探索完成
                 pass
@@ -168,4 +184,3 @@ if __name__ == '__main__':
     host.q_publish.put(['Strategy' ,host.publish_data()])
     host.q_publish.put(['Strategy' ,host.publish_data()])
     sleep(46)
-

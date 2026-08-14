@@ -1,4 +1,5 @@
 
+import time
 from collections import deque
 from datetime import datetime
 
@@ -31,6 +32,14 @@ class Device(Platform, Screenshot, Control, AppControl):
     stuck_long_wait_list = ['BATTLE_STATUS_S', 'PAUSE', 'LOGIN_CHECK', 'PREPARE_BEFORE_BATTLE']
 
     def __init__(self, *args, **kwargs):
+        # The frame id is the identity of the last successfully published
+        # screenshot.  Recognition caches must never cross this boundary.
+        self.frame_id = 0
+        self._image = None
+        self._last_frame_published_at = None
+        self._recognition_cache = {}
+        self._recognition_cache_generation = 0
+
         for trial in range(4):
             try:
                 super().__init__(*args, **kwargs)
@@ -59,6 +68,73 @@ class Device(Platform, Screenshot, Control, AppControl):
         if self.config.script.device.screenshot_method == 'auto':
             self.run_simple_screenshot_benchmark()
 
+    @property
+    def image(self):
+        return self._image
+
+    @image.setter
+    def image(self, value):
+        previous = getattr(self, '_image', None)
+        self._image = value
+        if value is not previous and hasattr(self, '_recognition_cache'):
+            self.invalidate_recognition_cache('image_replaced')
+
+    def invalidate_recognition_cache(self, reason='manual'):
+        """Drop all recognition results tied to the current image state."""
+        cache = getattr(self, '_recognition_cache', None)
+        if cache is not None:
+            cache.clear()
+        self._recognition_cache_generation = getattr(
+            self, '_recognition_cache_generation', 0
+        ) + 1
+        logger.debug(
+            'RECOGNITION_CACHE_INVALIDATE '
+            f'reason={reason} frame_id={getattr(self, "frame_id", 0)} '
+            f'generation={self._recognition_cache_generation}'
+        )
+
+    def recognition_cache_get(self, key):
+        cache = getattr(self, '_recognition_cache', {})
+        if key in cache:
+            return True, cache[key]
+        return False, None
+
+    def recognition_cache_set(self, key, value):
+        cache = getattr(self, '_recognition_cache', None)
+        if cache is None:
+            return
+        # A frame normally has far fewer rules than this.  Keep a guard for
+        # diagnostic/manual callers that never publish a new frame.
+        if len(cache) >= 512:
+            cache.clear()
+            logger.debug('RECOGNITION_CACHE_CLEAR reason=capacity')
+        cache[key] = value
+
+    def publish_frame(self, started_at=None):
+        """Publish one successful frame and expose stable timing evidence."""
+        now = time.monotonic()
+        previous = self._last_frame_published_at
+        self._last_frame_published_at = now
+        self.frame_id = getattr(self, 'frame_id', 0) + 1
+        self.invalidate_recognition_cache('new_frame')
+        duration_ms = None
+        if started_at is not None:
+            duration_ms = (now - started_at) * 1000
+        interval_ms = None if previous is None else (now - previous) * 1000
+        shape = getattr(getattr(self, '_image', None), 'shape', None)
+        duration_text = 'unknown' if duration_ms is None else f'{duration_ms:.1f}'
+        interval_text = 'unknown' if interval_ms is None else f'{interval_ms:.1f}'
+        logger.debug(
+            f'SCREENSHOT_PUBLISHED frame_id={self.frame_id} '
+            f'durationMs={duration_text}'
+        )
+        logger.debug(
+            f'SCREENSHOT_TIMING frame_id={self.frame_id} '
+            f'intervalMs={interval_text}'
+        )
+        logger.debug(f'SCREENSHOT_CONTRACT frame_id={self.frame_id} shape={shape}')
+        return self.frame_id
+
     def run_simple_screenshot_benchmark(self):
         """
         Perform a screenshot method benchmark, test 3 times on each method.
@@ -71,9 +147,14 @@ class Device(Platform, Screenshot, Control, AppControl):
         from module.daemon.benchmark import Benchmark
         bench = Benchmark(config=self.config, device=self)
         method = bench.run_simple_screenshot_benchmark()
-        # Set
-        self.config.script.device.screenshot_method = method
-        self.config.save()
+        if method:
+            self.config.script.device.screenshot_method = method
+            self.config.save()
+        else:
+            logger.warning(
+                'Screenshot benchmark produced no contract-valid method; '
+                'keep screenshot_method=auto'
+            )
 
     def handle_night_commission(self, daily_trigger='21:00', threshold=30):
         """
@@ -120,8 +201,9 @@ class Device(Platform, Screenshot, Control, AppControl):
         # self.config.script.device.screenshot_method = 'scrcpy'
         if self.config.script.device.screenshot_method == 'scrcpy':
             self._scrcpy_server_stop()
-        if self.config.Emulator_ScreenshotMethod == 'nemu_ipc':
+        if self.config.script.device.screenshot_method == 'nemu_ipc':
             self.nemu_ipc_release()
+        self.invalidate_recognition_cache('release_during_wait')
 
     def stuck_record_add(self, button):
         """

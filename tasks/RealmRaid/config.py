@@ -38,7 +38,7 @@ class LevelModeConfig(BaseModel):
     )
     single_step: bool = Field(
         title='Single Step Test',
-        default=True,
+        default=False,
         description='single_step_test_help',
     )
 
@@ -62,8 +62,6 @@ class RealmRaid(ConfigBase):
     raid_config: RaidConfig = Field(default_factory=RaidConfig)
     general_battle_config: GeneralBattleConfig = Field(default_factory=GeneralBattleConfig)
     switch_soul_config: SwitchSoulConfig = Field(default_factory=SwitchSoulConfig)
-
-
 
 
 

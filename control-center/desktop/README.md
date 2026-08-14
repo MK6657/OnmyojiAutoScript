@@ -1,33 +1,39 @@
 # OAS 控制中心桌面版
 
-桌面版参考 `D:\助手\annie-1.0.152` 的 Electron + 内置 Python 结构：
+桌面版使用 Electron 显示 `control-center/frontend` 的生产构建，并携带 PyInstaller 打包的 Bridge。
 
-- Electron 负责窗口和本地生产版前端；
-- Bridge 使用 PyInstaller 打包为 `oas-control-bridge.exe`；
-- OAS Core 仍保持原项目服务，默认连接 `127.0.0.1:22267`，不与上游代码耦合。
+```text
+control-center/frontend
+  -> Vite dist
+  -> desktop/ui
+  -> Electron portable
+  -> 内置 Bridge :22367
+  -> 独立 OAS Core :22267
+```
 
 ## 构建
-
-在 PowerShell 中运行：
 
 ```powershell
 Set-Location D:\OSAyys\control-center\desktop
 .\build.ps1
 ```
 
-产物位于 `release\OAS-Control-Center-0.1.0-portable.exe`。
-
-如果 Core 使用其他端口：
+依赖已经安装时可以使用：
 
 ```powershell
-$env:OAS_CORE_URL = 'http://127.0.0.1:22270'
 .\build.ps1 -SkipNpmInstall
 ```
 
-仅修改前端时可以跳过 Bridge 重打包：
+只修改前端并且 `bridge-dist/oas-control-bridge.exe` 已经是正确版本时，可以跳过 Bridge 重打包：
 
 ```powershell
 .\build.ps1 -SkipNpmInstall -SkipBridge
 ```
 
-桌面版会把 UI 元数据放在当前用户目录，不会把可写数据放进 Electron 安装包。
+输出：`release\OAS-Control-Center-0.1.0-portable.exe`。
+
+`desktop/ui`、`bridge-dist`、`data-seed`、`build` 和 `release` 都是生成目录，不是源码。不要直接修改其中内容，也不要用旧 portable 判断当前源码。
+
+当前目录中保留的 portable 生成于 2026-07-26，早于唯一前端收口。完成下一次桌面阶段验收前，它只能作为旧版本回退，不代表当前源码。
+
+桌面版不会启动 OAS Core。运行 portable 前应确认 Core 已经在 `127.0.0.1:22267` 运行。

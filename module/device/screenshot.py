@@ -53,6 +53,7 @@ class Screenshot(Adb, DroidCast, Scrcpy, Window, NemuIpc):
         Returns:
             np.ndarray:
         """
+        started_at = time.monotonic()
         self._screenshot_interval.wait()
         self._screenshot_interval.reset()
 
@@ -62,6 +63,11 @@ class Screenshot(Adb, DroidCast, Scrcpy, Window, NemuIpc):
                 self.screenshot_adb  # 第二个参数默认的是screenshot_adb
             )
             self.image = method()
+
+            # Some MuMu versions return a portrait frame while the game is
+            # still laid out in the fixed 1280x720 coordinate system.  Keep
+            # every downstream matcher on that canonical frame.
+            self.image = self._handle_orientated_image(self.image)
 
             # if self.config.Emulator_ScreenshotDedithering:
             #     # This will take 40-60ms
@@ -77,6 +83,9 @@ class Screenshot(Adb, DroidCast, Scrcpy, Window, NemuIpc):
             else:
                 continue
 
+        publish_frame = getattr(self, 'publish_frame', None)
+        if callable(publish_frame):
+            publish_frame(started_at=started_at)
         return self.image
 
     def _handle_orientated_image(self, image):
@@ -87,11 +96,22 @@ class Screenshot(Adb, DroidCast, Scrcpy, Window, NemuIpc):
         Returns:
             np.ndarray:
         """
-        width, height = image_size(self.image)
+        width, height = image_size(image)
         if width == 1280 and height == 720:
             return image
 
-        # Rotate screenshots only when they're not 1280x720
+        # MuMu can report orientation=0 for a portrait frame after an
+        # in-game detail view opens.  The frame itself is authoritative here:
+        # the current client needs the same counter-clockwise normalization as
+        # the existing HOME-key-on-the-right path, and minitouch must use the
+        # matching logical orientation for the following click.
+        if width == 720 and height == 1280 and self.orientation == 0:
+            logger.warning(
+                'Portrait screenshot received with logical orientation 0; '
+                'using MuMu portrait fallback orientation 1'
+            )
+            self.orientation = 1
+
         if self.orientation == 0:
             pass
         elif self.orientation == 1:
@@ -161,9 +181,6 @@ class Screenshot(Adb, DroidCast, Scrcpy, Window, NemuIpc):
             if interval != origin:
                 logger.warning(f'Optimization.ScreenshotInterval {origin} is revised to {interval}')
                 self.config.script.optimization.screenshot_interval = interval
-            # Allow nemu_ipc to have a lower default
-            if self.config.Emulator_ScreenshotMethod == 'nemu_ipc':
-                interval = limit_in(origin, 0.1, 0.2)
         elif interval == 'combat':
             origin = self.config.script.optimization.combat_screenshot_interval
             interval = limit_in(origin, 0.3, 1.0)

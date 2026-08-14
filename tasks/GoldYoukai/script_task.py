@@ -116,7 +116,7 @@ class ScriptTask(GameUi, GeneralBattle, GeneralRoom, GeneralInvite, SwitchSoul, 
             self.close_buff()
 
         self.set_next_run(task='GoldYoukai', success=True, finish=False)
-        raise TaskEnd('GoldYoukai')
+        raise TaskEnd.completed('GoldYoukai')
 
 
 if __name__ == '__main__':

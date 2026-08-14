@@ -32,7 +32,7 @@ class ScriptTask(GameUi, PetsAssets):
         self.ui_click(self.I_PET_EXIT, self.I_CHECK_MAIN)
 
         self.set_next_run(task='Pets', success=True, finish=True)
-        raise TaskEnd('Pets')
+        raise TaskEnd.completed('Pets')
 
     def _feed(self):
         """

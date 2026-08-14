@@ -21,8 +21,9 @@ from module.base.timer import Timer
 from module.exception import (GameNotRunningError, GamePageUnknownError)
 from module.logger import logger
 from tasks.Component.GeneralBattle.assets import GeneralBattleAssets
+from tasks.Exploration.assets import ExplorationAssets
 from tasks.GameUi.assets import GameUiAssets
-from tasks.GameUi.page import Page, PageRegistry, page_main, random_click
+from tasks.GameUi.page import Page, PageRegistry, page_main
 from tasks.Restart.assets import RestartAssets
 from tasks.SixRealms.assets import SixRealmsAssets
 from tasks.base_task import BaseTask
@@ -30,18 +31,39 @@ from tasks.ActivityShikigami.assets import ActivityShikigamiAssets
 
 
 class GameUi(BaseTask, GameUiAssets):
-    ui_current: Page = None
-    ui_close = [GameUiAssets.I_BACK_MALL, GeneralBattleAssets.I_CONFIRM,
+    _ui_current: Page = None
+    ui_close = [ExplorationAssets.I_E_EXIT_CONFIRM, ExplorationAssets.O_E_EXIT_CONFIRM_TEXT,
+                GameUiAssets.I_MAIN_PROTECTION_BACK, GameUiAssets.I_BACK_MALL, GeneralBattleAssets.I_CONFIRM,
                 BaseTask.I_UI_BACK_RED, BaseTask.I_UI_BACK_YELLOW,
                 GameUiAssets.I_BACK_FRIENDS, GameUiAssets.I_BACK_DAILY,
                 GameUiAssets.I_REALM_RAID_GOTO_EXPLORATION,
                 GameUiAssets.I_SIX_GATES_GOTO_EXPLORATION, SixRealmsAssets.I_EXIT_SIXREALMS,
-                ActivityShikigamiAssets.I_SKIP_BUTTON, ActivityShikigamiAssets.I_RED_EXIT, BaseTask.I_UI_BACK_BLUE]
+                # Activity story pages can put a confirmation modal over the
+                # top-right skip button.  Dismiss the modal first; otherwise
+                # the generic unknown-page recovery clicks the covered
+                # skip button repeatedly and trips the click watchdog.
+                ActivityShikigamiAssets.I_CONFIRM_SKIP, ActivityShikigamiAssets.I_SKIP_BUTTON,
+                ActivityShikigamiAssets.I_RED_EXIT, BaseTask.I_UI_BACK_BLUE]
 
     def __init__(self, config, device):
+        self._ui_current = None
         super().__init__(config, device)
         # 初始化时动态导入所有 page 模块
         self._import_all_pages()
+
+    @property
+    def ui_current(self) -> Page:
+        return self._ui_current
+
+    @ui_current.setter
+    def ui_current(self, value: Page):
+        previous = getattr(self, '_ui_current', None)
+        self._ui_current = value
+        if previous != value:
+            device = getattr(self, 'device', None)
+            invalidate = getattr(device, 'invalidate_recognition_cache', None)
+            if callable(invalidate):
+                invalidate('page_state_changed')
 
     @staticmethod
     def _import_all_pages():
@@ -93,6 +115,60 @@ class GameUi(BaseTask, GameUiAssets):
             skip_first_screenshot = False
         return False
 
+    @staticmethod
+    def _main_protection_back_point(image):
+        """Find the current skin's protection-screen back button safely.
+
+        New MuMu/game skins use a blue row of four circular controls in the
+        upper-left instead of the older gold protection-arrow template.  The
+        first circle is the back button.  Require a stable aligned row before
+        returning a point so ordinary page arrows and artwork are ignored.
+        """
+        if image is None or getattr(image, 'ndim', 0) != 3:
+            return None
+        try:
+            import cv2
+
+            origin_x, origin_y = 15, 15
+            crop = image[origin_y:100, origin_x:320]
+            gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+            gray = cv2.medianBlur(gray, 5)
+            circles = cv2.HoughCircles(
+                gray,
+                cv2.HOUGH_GRADIENT,
+                dp=1.2,
+                minDist=35,
+                param1=80,
+                param2=20,
+                minRadius=18,
+                maxRadius=34,
+            )
+            if circles is None:
+                return None
+            candidates = sorted(
+                (
+                    float(x),
+                    float(y),
+                    float(radius),
+                )
+                for x, y, radius in circles[0]
+                if 20 <= x <= 290 and 20 <= y <= 70
+            )
+            if len(candidates) < 3 or candidates[0][0] > 80:
+                return None
+            row = candidates[:4]
+            if row[-1][0] - row[0][0] < 120:
+                return None
+            if max(item[1] for item in row) - min(item[1] for item in row) > 18:
+                return None
+            gaps = [right[0] - left[0] for left, right in zip(row, row[1:])]
+            if any(gap < 45 or gap > 95 for gap in gaps):
+                return None
+            return round(origin_x + row[0][0]), round(origin_y + row[0][1])
+        except Exception as error:  # noqa: BLE001
+            logger.debug(f'Protection back structure detection unavailable: {error}')
+            return None
+
     def ui_get_current_page(self, skip_first_screenshot=True) -> Page:
         """
         获取当前页面
@@ -122,6 +198,35 @@ class GameUi(BaseTask, GameUiAssets):
             # 如果10S还没有到底，那么就抛出异常
             if timeout.reached():
                 break
+            # 长时间无操作会进入保护界面。它可能被 I_CHECK_MAIN 的背景
+            # 模板误判为庭院，必须优先点击左上角返回箭头再重新识别。
+            # The protection arrow changes tint with the active courtyard skin;
+            # keep margin below the asset's nominal threshold so one frame of
+            # animation cannot leave the scheduler on an unknown page.
+            if self.appear_then_click(
+                GameUiAssets.I_MAIN_PROTECTION_BACK,
+                interval=0.5,
+                threshold=0.65,
+            ):
+                logger.warning('Protection screen detected, click top-left back arrow')
+                self.ui_current = None
+                timeout = Timer(10, count=20).start()
+                continue
+            protection_point = self._main_protection_back_point(
+                getattr(self.device, 'image', None)
+            )
+            if protection_point is not None:
+                self.device.click(
+                    *protection_point,
+                    control_name='MAIN_PROTECTION_BACK_HEURISTIC',
+                )
+                logger.warning(
+                    'Protection screen detected by aligned control row, '
+                    f'click back at {protection_point}'
+                )
+                self.ui_current = None
+                timeout = Timer(10, count=20).start()
+                continue
             # Known pages
             for page in self.ui_pages:
                 if not page.check_button:
@@ -134,8 +239,17 @@ class GameUi(BaseTask, GameUiAssets):
             if self.try_close_unknown_page():
                 timeout = Timer(10, count=20).start()
             else:
-                # entirely unknown page, click safe random area
-                self.click(random_click(), interval=4)
+                # An unknown page may still be an active battle, a board
+                # transition, or a page whose layout has drifted.  The old
+                # reward-area random click could activate real controls there
+                # (including the friends entry) and make the original failure
+                # harder to recover.  Wait for a known close marker instead;
+                # the bounded loop will raise GamePageUnknownError if none
+                # appears.
+                logger.warning(
+                    'Unknown ui page remains; skip unsafe SAFE_RANDOM_CLICK '
+                    'and wait for a supported close marker'
+                )
             # wait to ui
             sleep(0.3)
             app_check()

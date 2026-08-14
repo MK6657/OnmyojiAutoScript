@@ -22,7 +22,7 @@ class ScriptTask(LoginHandler):
         """
         if not self.delay_pending_tasks():
             self.app_restart()
-        raise TaskEnd('ScriptTask end')
+        raise TaskEnd.completed('ScriptTask end')
 
     def app_stop(self):
         logger.hr('App stop')

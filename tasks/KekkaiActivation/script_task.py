@@ -61,7 +61,7 @@ class ScriptTask(KU, KekkaiActivationAssets):
         self.ui_get_current_page()
         self.ui_goto(page_main)
 
-        raise TaskEnd('KekkaiActivation')
+        raise TaskEnd.completed('KekkaiActivation')
 
     @cached_property
     def dict_card_image(self) -> dict:
@@ -359,7 +359,7 @@ class ScriptTask(KU, KekkaiActivationAssets):
         # 保存配置并设置下次执行
         self.config.save()
         self.set_next_run("KekkaiActivation", target=next_run)
-        raise TaskEnd
+        raise TaskEnd.completed('KekkaiActivation completed')
 
     def check_max_lv(self, shikigami_class: ShikigamiClass = ShikigamiClass.N):
         """

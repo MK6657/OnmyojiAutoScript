@@ -69,7 +69,7 @@ class ScriptTask(GeneralBattle, GeneralInvite, GeneralBuff, GeneralRoom, GameUi,
         else:
             self.set_next_run('EvoZone', finish=False, success=False)
 
-        raise TaskEnd
+        raise TaskEnd.completed('EvoZone completed')
 
     def evozone_enter(self) -> bool:
         logger.info('Enter evozone')

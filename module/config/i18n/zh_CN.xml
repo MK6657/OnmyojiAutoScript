@@ -374,9 +374,11 @@ window_background >>> DroidCast_raw >  ADB_nc >> DroidCast > uiautomator2 ~= ADB
 	<message><source>Random Click Swipt Enable</source><translation>战斗时随机点击或者随机滑动</translation></message>
 	
 	<message><source>lock_team_enable_help</source><translation>如果锁定阵容将无法启用预设队伍、加成功能</translation></message>
-	<message><source>preset_enable_help</source><translation>将会在第一次战斗的时候切换队伍预设</translation></message>
-	<message><source>preset_group_help</source><translation>可选[1~7]</translation></message>
-	<message><source>preset_team_help</source><translation>可选[1~5]</translation></message>
+	<message><source>preset_enable_help</source><translation>第一次进入战斗准备界面时，按游戏内分组名称和队伍名称切换预设</translation></message>
+	<message><source>preset_group_name_help</source><translation>填写右侧预设分组的完整名称；程序会滚动查找，不使用固定序号</translation></message>
+	<message><source>preset_team_name_help</source><translation>填写中间队伍预设的完整名称；发现同名队伍会停止并提示先重命名</translation></message>
+	<message><source>preset_group_help</source><translation>旧版固定位置兼容字段；填写名称后不再使用</translation></message>
+	<message><source>preset_team_help</source><translation>旧版固定位置兼容字段；填写名称后不再使用</translation></message>
 	<message><source>buff_enable_help</source><translation>在准备阶段开启加成不太符合直觉，暂时还未实现，而且挺多的战斗是不允许准备阶段开启加成的</translation></message>
 	<message><source>green_enable_help</source><translation>在战斗开始的一瞬间点击绿标，无反馈点击</translation></message>
 	<message><source>green_mark_help</source><translation>可选[左一, 左二, 左三, 左四, 左五, 主阴阳师]</translation></message>
@@ -394,11 +396,13 @@ window_background >>> DroidCast_raw >  ADB_nc >> DroidCast > uiautomator2 ~= ADB
     <name>Args</name>
 	<message><source>Emergency</source><translation>突发检测</translation></message>
 	<message><source>FriendInvitation</source><translation>当出现协作邀请时</translation></message>
+	<message><source>Long Idle Buff Prompt Mode</source><translation>长时间未使用加成弹窗</translation></message>
 	<message><source>Invitation Detect Interval</source><translation>检测间隔</translation></message>
 	<message><source>WhenNetworkAbnormal</source><translation>当网络异常时</translation></message>
 	<message><source>WhenNetworkError</source><translation>当网络出错需要重新连接服务器时</translation></message>
 	<message><source>Home Client Clear</source><translation>启用庭院客户端清空缓存</translation></message>
 	<message><source>friend_invitation_help</source><translation>默认全部接受</translation></message>
+	<message><source>long_idle_buff_prompt_mode_help</source><translation>disabled关闭；detect_block只识别并安全停止；enforce识别后自动确认</translation></message>
 	<message><source>invitation_detect_interval_help</source><translation>默认每隔10秒检测一次是否有协作</translation></message>
 	<message><source>when_network_abnormal_help</source><translation>默认会先等待10S</translation></message>
 	<message><source>when_network_error_help</source><translation>重启游戏</translation></message>
@@ -579,17 +583,17 @@ mode_3策略是刷到五个契灵后开始结契，选择高级、中级盘来�
 	<message><source>WhenAttackFail</source><translation>挑战失败时</translation></message>
 	<message><source>Three Refresh</source><translation>每三次就刷新</translation></message>
 	<message><source>Number Base</source><translation>突破卷数量大于等于 X 时才会挑战</translation></message>
-	<message><source>number_attack_help</source><translation>默认30，可选范围[1~30]，没有挑战卷自动退出任务（标记为成功）</translation></message>
+	<message><source>number_attack_help</source><translation>默认30，范围1到30。目标等级模式按本次实际成功消耗的突破券计数，正常战败不占额度；旧流程仍按挑战尝试次数计数</translation></message>
 	<message><source>target_level_mode_enable_help</source><translation>按账号启用新的目标等级模式；默认关闭。开启后由目标等级状态机接管升降级、退四和失败刷新，下方旧流程的打九退四、每三次刷新和失败处理选项不参与决策；呱太特殊模式仍使用上游流程</translation></message>
 	<message><source>target_level_help</source><translation>当前九宫格等级高于此值时降级，等于时打九退四保级，低于时尽可能全胜升级；范围1到60</translation></message>
-	<message><source>single_step_test_help</source><translation>测试期建议开启；每次运行最多提交一次投降、挑战或刷新，然后返回庭院并停止本轮任务</translation></message>
+	<message><source>single_step_test_help</source><translation>仅供人工分步验收。开启后每次调度只提交一个投降、挑战或刷新动作；正式使用应关闭，由个人突破持续执行到突破券达到保留值、刷新冷却或安全阻塞</translation></message>
 	<message><source>exit_four_help</source><translation>仅上游旧流程生效；目标等级模式会根据当前等级和 checkpoint 自行计算投降次数</translation></message>
 	<message><source>order_attack_help</source><translation>使用过滤器，保持默认即可</translation></message>
 	<message><source>when_attack_fail_help</source><translation>仅上游旧流程生效。Exit：直接退出任务，标记为失败
 Continue：挑战其他的直至没有可挑战的才刷新
 Refresh：直接刷新，如果刷新操作进入CD，将标记为失败并退出</translation></message>
 	<message><source>three_refresh_help</source><translation>仅上游旧流程生效；目标等级模式不按三次胜利手动刷新</translation></message>
-	<message><source>number_base_help</source><translation>旨在检查突破卷数量，如果当前的数量没有大于等于这个值，将标记为成功并退出</translation></message>
+	<message><source>number_base_help</source><translation>需要保留的突破券数量。目标等级模式会持续执行，直到当前券数小于或等于该值后正常结束；设为0表示尽量刷完</translation></message>
 </context>	
 <context>
     <name>Args</name>

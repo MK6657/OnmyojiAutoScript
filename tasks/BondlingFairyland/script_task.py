@@ -52,7 +52,7 @@ class ScriptTask(GameUi, GeneralInvite, GeneralRoom, BondlingBattle, SwitchSoul,
                 self.ui_get_current_page()
                 self.ui_goto(page_main)
                 self.set_next_run(task='BondlingFairyland', finish=True, success=True)
-                raise TaskEnd
+                raise TaskEnd.completed('BondlingFairyland completed')
             logger.info(f'契忆数量: {cu} 小于 {MAX_COUNT}, 继续任务')
         logger.hr('第二步, 切换御魂', 2)
         self.switch_soul()
@@ -70,7 +70,7 @@ class ScriptTask(GameUi, GeneralInvite, GeneralRoom, BondlingBattle, SwitchSoul,
             self.run_search(cong.bondling_config)
             self.ui_goto_page(page_main)
             self.set_next_run(task='BondlingFairyland', finish=True, success=True)
-            raise TaskEnd
+            raise TaskEnd.completed('BondlingFairyland completed')
         match cong.bondling_config.user_status:
             case UserStatus.handoff1:
                 self.limit_count //= 2
@@ -200,7 +200,7 @@ class ScriptTask(GameUi, GeneralInvite, GeneralRoom, BondlingBattle, SwitchSoul,
         self.ui_get_current_page()
         self.ui_goto(page_main)
         self.set_next_run(task='BondlingFairyland', finish=True, success=True)
-        raise TaskEnd
+        raise TaskEnd.completed('BondlingFairyland completed')
 
     def run_member(self):
         logger.hr('Start run member', 2)
@@ -263,7 +263,7 @@ class ScriptTask(GameUi, GeneralInvite, GeneralRoom, BondlingBattle, SwitchSoul,
             self.ui_get_current_page()
             self.ui_goto(page_main)
             self.set_next_run(task='BondlingFairyland', finish=True, success=True)
-            raise TaskEnd
+            raise TaskEnd.completed('BondlingFairyland completed')
 
     def switch_ball(self):
         logger.hr('Start switch ball', 2)
@@ -325,7 +325,7 @@ class ScriptTask(GameUi, GeneralInvite, GeneralRoom, BondlingBattle, SwitchSoul,
         self.ui_get_current_page()
         self.ui_goto(page_main)
         self.set_next_run(task='BondlingFairyland', finish=True, success=True)
-        raise TaskEnd
+        raise TaskEnd.completed('BondlingFairyland completed')
 
     def run_stone(self, bondling_stone_enable: bool):
         """

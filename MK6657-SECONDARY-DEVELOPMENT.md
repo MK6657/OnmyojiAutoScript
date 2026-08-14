@@ -7,7 +7,7 @@
 当前基线来自上游提交 `b7497a3521c8cee1fe837f3e125e43506e42c7e9`。本分支主要维护：
 
 - OAS Core、进程状态、WebSocket 和 Windows 启动链修补。
-- 独立控制中心、Bridge、UI-claude 前端与 portable 构建来源。
+- 独立控制中心、Bridge、唯一 React/Vite 前端与 portable 构建来源。
 - 个人结界突破等任务流程的本地增强、识别资源和验证记录。
 - `handoff/` 下的上游差异、问题审计、恢复说明和 `Codex-` 文档。
 
@@ -16,7 +16,7 @@
 1. 上游原功能与 MK6657 二开内容分层记录，不直接丢失上游基线。
 2. 通用修补、业务定制和临时调试分别留档，避免上游更新时无法对照。
 3. 本机配置、日志、数据库、依赖目录、测试截图和打包产物不进入仓库。
-4. 当前默认控制中心前端源码为 `control-center/desktop/release/UI-claude/`；`control-center/frontend/` 作为旧前端对照保留。
+4. 当前控制中心唯一前端源码为 `control-center/frontend/`；浏览器、隔离联调和 portable 都从这里构建，不再保留平行生产前端。
 5. 未完成的个人结界突破卡级功能以 `handoff/Codex-04-个人结界突破半成品进度与规则.md` 为进度基线。
 
 项目审计入口：`handoff/Codex-README.md`。

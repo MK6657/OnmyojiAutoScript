@@ -1,0 +1,89 @@
+# DeepSeek-11 轮：coordinate-calibrator 根因定位 + 现状复核报告
+
+> 执行：只读子代理。未修改/创建任何文件，未跑测试，未启停服务，SQLite 未查询成功（见 §4）。代码行号以当前工作树为准（src 全部文件 mtime 为 08-11 10:43，审计后无代码变更）。
+
+## 一、F1 复核结论：已证实，根因链完整成立
+
+| 环节 | 证据 | 判定 |
+|---|---|---|
+| 写方 | storage/repository.py:3057-3064 mark_artifact_damaged → UPDATE artifacts SET state='damaged',updated_at=?；唯一调用方 api/runtime.py:1982 | 已证实 |
+| CHECK | repository.py:570 state TEXT NOT NULL CHECK(state IN ('staging','ready','delete_pending'))，不含 'damaged' | 已证实 |
+| 触发链 | maintenance.py:178 quarantine 命令 → reconcile_artifacts(apply_repairs=True, quarantine=True)（maintenance.py:177-178） | 已证实 |
+| 先移后写 | runtime.py:1970-1982：plan_quarantine → add_quarantine_item → quarantine_file（os.replace 移文件，不可逆）→ update_quarantine_state('quarantined') → 最后 mark_artifact_damaged（1982），且 1916-1982 循环内无任何 try/except | 已证实 |
+| 无补偿 | 全函数（1913-2090）无 restore_quarantine 回滚；对比模板 runtime.py:575-593（permanently_delete_canvases 的 except 分支：reversed(moved) 逐项 restore_quarantine + update_quarantine_state('restored')，失败仅 logger.error 后继续，再 raise）——reconcile 缺同款补偿 | 已证实 |
+| 必现性 | UPDATE 写 'damaged' 违反表级 CHECK → sqlite3.IntegrityError 100% 必现（09 轮父代理内存复现已实证；本轮代码事实自洽） | 已证实 |
+| 分裂后果 | 文件已入 quarantine/（quarantine_items 行 state='quarantined'），artifacts 行仍 ready 指向缺失路径；且 reconcile 在首个受损工件即中止，后续受损工件全部不再处理 | 已证实 |
+| 测试盲区 | tests/test_full_remediation.py:303-330 对 damaged-ready 路径仅 apply_repairs=False（line 320 只调报告）；repairs 路径只有 orphans 分支测试（line 212-236）；mark_artifact_damaged 无任何测试命中 → 146/146 全绿未捕获 | 已证实 |
+
+一处审计表述修正：09 轮称"test_full_remediation.py 只覆盖 apply_repairs=False 的报告路径"——实为孤儿文件的 repairs 路径有测试（line 227 reconcile_artifacts(apply_repairs=True, quarantine=True) 走的是 orphans 分支 → delete_artifact_record line 2025，非 mark_artifact_damaged），但 damaged-ready 工件的 repairs 路径确实无测试。核心结论（F1 阻断、必现、无补偿）不变。
+
+F1 结论：F1 成立且为当前唯一阻断级缺陷；maintenance quarantine 在存在受损 ready 工件时必然 IntegrityError 中断并留下文件/DB 分裂。
+
+## 二、F16 租约乒乓根因（重点）
+
+### 2.1 现象复述（日志统计，logs/uvicorn-20260812-164720.stdout.log，无时间戳，用 ?ts= 帧参数定标）
+
+- 全日志错误码统计：423×337（与 09 轮"337 次"一致）、409×8、404×5、405×1、401×1；0 条 500/traceback。
+- 本日志内两段风暴：sess_2ff0c574e8da4534bb26（08-12 晚 ~20:00-20:50，heartbeat 423×34 + acquire 200×39）与 sess_ed365db17ac544b0ad32（08-13 晨，heartbeat 423×283 + acquire 200×284）。
+- ed365db1 时间线（按行密度与 ts 锚点推估）：健康期（行 1780-4934，3078 次 heartbeat 全 200，约 8h+）→ 行 4935 突发翻转：自该行起心跳全 423 → 风暴持续至行 5501，其后 13h 静默，行 5502-5508 为 20:00 健康探测。
+- 风暴结构：283/283 对全部为 heartbeat 423 → acquire 200（同端口紧跟）；266 个独立源端口，仅 8 个端口复用 → 每次请求基本新连接，符合浏览器 fetch 行为。
+- 速率推演：风暴约 566 行 ≈ 283 对 ≈ 94 分钟 → ~3 对/分钟。若心跳保持 10s（app.js:3966），单客户端应 6 对/min、双客户端 12+/min——与观测（3/min）不符；3 个客户端 × 后台节流 ~1/min 恰好吻合。
+
+### 2.2 代码链路（已证实）
+
+- 后端：repository.py:3197-3223 acquire_lease —— 仅当"现有租约未过期且 owner 不同"才 423（line 3204-3205）；同 owner 或已过期 → 无条件顶替（fencing+1，新 lease_id）。repository.py:3259-3270 heartbeat_lease —— UPDATE ... WHERE lease_id=? AND expires_at>now，rowcount≠1 → 423（TTL 30s，app.py:850 固定传 30）。assert_lease（3225-3236）过期即删行。
+- 前端：web/app.js:549-565 heartbeatSessionLease 每 10s（3966）；失败 catch 分支（558-564）→ lease_id=null → recoverSessionLease(true) → 立即 acquire，无退避/无冷却。acquireLeaseFor（477-493）owner_id=state.tabId, ttl_seconds=30；idempotencyKey('lease')（238-243）每次调用生成新 UUID → acquire 不可能命中幂等缓存重放（F6 排除）。
+- 前端控制租约：app.js:1-2 CONTROL_LEASE_MS=15000（localStorage，15s）；heartbeatControl（3746-3768）每 4s（4190）；被占时转 readOnly 并 releaseLeaseFor（3759）；readOnly 且控制租约过期则 takeOverControl（3770-3793）→ acquireLeaseFor。
+- WS：workspace 事件 WS 启动即 5+2 路并发（stderr.log:5-18）→ 多标签页并存是常态；session 事件 WS 仅 capturing/armed 才连（3334），风暴 session 无采集故无 WS，未观察到 WS 重连风暴。
+
+### 2.3 根因判定（四候选逐一裁定）
+
+| 候选 | 裁定 | 证据 |
+|---|---|---|
+| ① 同 session 多客户端互踢 | 是（必要前提，方向正确），但机制需修正：非 10s 高频互踢，而是后台节流下 TTL 过期后的"唤醒互抢" | 266 独立端口/283 对；启动即 5 标签页挂同一 workspace WS；健康期单客户端 → 风暴期多客户端 |
+| ② TTL 与心跳间隔不匹配 | 是（核心机制）：30s TTL vs 浏览器后台标签页节流后 ~60s 实际心跳间隔 | 风暴速率 ~3 对/min ≈ 3 客户端 × 1/min，与 10s 心跳假设（≥6 对/min）定量不符（已证实）；30s TTL < 60s 节流间隔（代码事实） |
+| ③ 幂等重放旧租约（F6） | 否（排除为驱动）：idempotencyKey 每次新 UUID，acquire 无重放路径 | app.js:238-243；F6 作为契约缺口仍成立，但非本风暴来源 |
+| ④ 其他 | 是（放大器）：a) 前端 heartbeat 失败立即重抢无退避（app.js:558-564）；b) 控制租约 15s TTL 在节流（4s→60s）下必然过期 → readOnly 标签页反复 takeOverControl 抢服务端租约（app.js:3746-3793） | 代码已证实；行为链为高概率 |
+
+### 2.4 完整根因链（本轮新增的关键洞察）
+
+1. 风暴起始：单客户端长期稳定持有（8h+）→ 某一时刻新客户端 acquire 顶替 → 存量客户端持有的 lease_id 瞬时集体失效（heartbeat 的 WHERE lease_id=? 全部不匹配）→ 行 4935 全量 423 的突发翻转。一旦进入此态，自持续循环无需再触发：每个客户端每次唤醒都"423 → 立即 acquire 200（顶替）→ 其余客户端下次唤醒 423 → …"。
+2. 循环维持：283/283 对全为 hb423→ac200，证明每次 acquire 均成功——只因 acquire 的互斥检查（3204）只挡"异 owner + 存活"，在"已过期"或"同 owner"时全部放行；而节流下的心跳间隔必然大于 TTL，acquire 时租约恒为过期态。
+3. 前端放大：失败即重抢（无退避）使每个节流唤醒都变成一次顶替；控制租约 15s TTL 与节流不兼容，多标签页互相 takeover 又注入额外 acquire。
+4. owner 归属：同 owner（共享 tab_id：标签页复制/会话恢复/iframe 嵌入共享 sessionStorage）与异 owner（普通多标签）两种路径均可产生该日志形态；起始瞬间倾向同 owner，但行密度估算不足以定论 → 待查（需 SQLite leases.owner_id 历史）。
+
+F16 根因结论：①同 session 多客户端（前端多标签/重复页面并存）＋②30s TTL 与后台节流后实际心跳间隔（≥60s）不匹配＋④前端 heartbeat 失败立即重抢无退避、控制租约节流失效，三者耦合的自持续乒乓；F6 幂等重放（③）排除。09 轮"同 session 多客户端互踢"方向正确，但应修正为"后台节流下的 TTL 过期唤醒互抢"而非 10s 高频互踢（速率证据不支持后者）。
+
+对 09 轮 F16 表述的两处修正：① "前端被抢占无 UI 提示"——app.js:562 存在 setOperationStatus('会话租约已失效…') 分支，但只在 recover 失败（acquire 423）时触发；乒乓循环中 acquire 恒 200 → 用户全程无感知，现象上等于无提示，表述基本成立；② "heartbeat 失败静默置空 lease 下次再抢"——正确（558-560），且"下次再抢"是立即而非等下次定时器，属放大器细节。
+
+## 三、现状扫描（09 轮之后，08-13）
+
+### 3.1 日志（已证实）
+- 无新错误：08-13 白天日志（行 4935-5508）除租约风暴延续至 ~07:10 外，仅 20:00 健康探测；全日志 0 条 500/traceback/IntegrityError 现场（F1 未在生产触发）。
+- coordinate-calibrator.log：仅 4 行，最后写入 08-12 20:05:30，08-13 零写入。
+- uvicorn-20260812-164720.stderr.log：仅启动 + WS accepts，最后写入 08-12 20:48:30，无错误。
+- 服务未重启：.service.json pid=25064、started_at_unix=1786524440（08-12 16:47:20）与审计基线一致；index.sqlite3-shm mtime 20:36:30（今日）→ DB 活跃（读），WAL 0 字节（已 checkpoint）。
+
+### 3.2 数据（已证实）
+- index.sqlite3 mtime 08-13 10:52:39：无对应 HTTP 活动，疑为风暴期事务的 WAL checkpoint 落盘（低危观察项，待查）。
+- 08-12 晚间新增 4 个 session（sess_ed365db17ac544b0ad32、sess_c9d2523c19384f379e03、sess_dfa91bfca85240018868、sess_4df5ff4293b64910a652），各仅 frame_000001.png；sess_57f8423e26744840a707 为采集会话（frame_007133/007313，08-12 19:59-21:36）。
+- outputs/、work/ 均为 08-08~08-10 旧产物，无 08-13 变更。
+
+### 3.3 新发现清单（09 轮未覆盖）
+1. 【新】乒乓"风暴起始"触发路径：单客户端 8h+ 稳定持有 → 新客户端一次 acquire 顶替 → 存量 lease_id 集体失效 → 级联（行 4935 突发翻转）。09 轮只统计了现象，未定位此触发机制。
+2. 【新】控制租约（localStorage 15s）与浏览器后台节流不兼容：4s heartbeatControl 节流至 ~60s → 控制租约必过期 → 多标签页互相 takeover 注入额外 acquire（高概率，机制推演）。
+3. 【新】acquire 无限频/无退避：同 owner 顶替不受任何频率限制，fencing_token 单会话可涨至数百（283 次 acquire）；fencing_token 在"同 owner 顶替"下不提供互斥语义。
+4. 【可观测性】uvicorn access log 无时间戳，乒乓周期只能靠 ?ts= 帧参数估算——建议接入方为 access log 补时间（09 轮未提）。
+
+## 四、缺失证据（无法判定处）
+
+1. SQLite 只读查询未执行（pwsh 工具本轮故障，重试多次失败）：leases 表当前 owner_id/fencing_token、sessions/frames 计数、idempotency_operations 统计均未取得 → 无法最终区分"同 owner（共享 tab_id）"与"异 owner 交替"两种乒乓路径，也无法复核"17 行全过期"。
+2. 精确风暴时间窗：估算为 08-13 ~06:00-07:10，需服务端 access log 加时间戳后复核。
+3. 客户端侧事实：标签页数量、是否 iframe 嵌入/会话恢复（决定 tab_id 是否共享）——服务端不可见；OSAyys 侧已 grep 确认无任何组件调用校准 API（22880/lease 均 0 命中，排除"控制中心作为第二客户端"假说，互踢发生在校准 UI 自身多标签之间）。
+4. 进程存活：.service.json（pid 25064）+ shm 活跃间接佐证服务在跑，但 Get-Process 未执行成功（pwsh 故障）。
+
+## 五、结论汇总
+
+- F1：已证实。写方（repository.py:3057-3064）写 'damaged' 违反表 CHECK（repository.py:570），先移文件后写 DB、无补偿（runtime.py:1959-1982 无 try/except、无 restore_quarantine 回滚，对照模板 runtime.py:575-593），首个受损工件即中断全量 reconcile；测试盲区确认（damaged-ready repairs 路径 0 测试）。阻断级缺陷维持。
+- F16 根因：同 session 多客户端（前端多标签/重复页面）＋ 30s TTL 与后台节流心跳间隔（≥60s）不匹配 ＋ 前端失败立即重抢无退避/控制租约节流失效，三者耦合的自持续循环；风暴由一次新客户端 acquire 顶替触发（存量 lease_id 集体失效）；F6 幂等重放排除。修复方向：heartbeat 失败加退避/冷却、acquire 同 owner 限频或引入"last-acquired"窗口、TTL 与服务端已知客户端心跳超时对齐（服务端记录 last heartbeat 而非前端自报）、控制租约改为服务端租约单一权威、access log 补时间戳。
+- 现状：08-13 无新错误、无新 session/帧；服务未重启（pid 25064）；唯一持续异常即 ed365db1 上的租约乒乓（已在 08-13 ~07:10 后自然静默，20:00 页面打开后未见复发）。

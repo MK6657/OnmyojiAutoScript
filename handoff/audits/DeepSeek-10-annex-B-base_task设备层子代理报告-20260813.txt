@@ -1,0 +1,71 @@
+所有证据收集完毕，测试套件已跑。以下为最终审查报告。
+
+---
+
+# D:\OSAyys 未提交变更只读审查报告（base_task + 通用组件 + 设备层）
+
+**审查范围**：`git diff HEAD(1724ce44)` 中 tasks/base_task.py(615行)、tasks/Component/GeneralBattle/GeneralBuff/SwitchSoul/ReplaceShikigami/CommonPopup(新增)、module/device/*、module/atom/{animate,image}.py、module/exception.py、module/daemon/benchmark.py，并逐条重验历史已知缺陷。全程只读，未改任何文件；测试全部用 `env -u PYTHONPATH .venv/Scripts/python.exe -B` 执行。
+
+## ① 变更摘要
+
+| 文件 | 变更内容 |
+|---|---|
+| tasks/base_task.py | `_burst` 好友邀请处理迁移至 CommonPopup 分发器；`screenshot()` → `protected_screenshot()`（每帧走有界弹窗分发）；新增 `UiClickFailure` 结构化失败 + ui_get_reward/ui_click/ui_click_until_disappear 全部加 timeout/action 预算并返回 True/False；新增帧级识别缓存 `_ocr_cached/_detect_cached/_recognition_cache_key`（key 含 roi/mode/method/keyword/score/preprocess）；`set_next_run` 增加 caller/reason 透传 |
+| tasks/Component/CommonPopup/（新增，1132 行） | 通用弹窗分发器（dispatcher 643 行）：有界轮次/动作/时限、fail-closed（超预算/坏帧/帧不推进/设备身份变化 → GameStuckError）；好友邀请 handler（保留 accept→WantedQuests 跨任务 next_run）；证据记录器 |
+| GeneralBattle/general_battle.py（+1962 行） | run_general_battle 全链路重构：结算页"点击屏幕继续"消费（OCR+视觉启发+中央/底部兜底点击）、battle_wait 300s deadline、自动/手动模式确认（_ensure_auto_battle_mode，ADB 兜底）、绿标点击改为 2 次有界尝试+颜色槽位确认（detect-only）、按名预设切换（扫描/去重/最近验证快路径）、准备按钮多通道识别+安全中心点击、I_REWARD 需结果上下文才判赢 |
+| GeneralBattle 新增 green_mark_detector.py(582行)/battle_outcome.py/preset_name_selector.py | HSV 轮廓箭头检测器 + 槽位归属 + 帧级稳定确认；战斗结果结构化记录；预设名规范化/合并/去重 |
+| GeneralBuff | open/close_buff、reject_invite 全部 deadline 化；`set_switch_area` 改为返回局部副本（不再改共享资产）；get_area 增加关键词先验；I_AWAKE 0.8→0.7、I_CLOUD 0.8→0.65（皮肤漂移注释） |
+| module/exception.py（+220 行） | TaskEnd 结构化：outcome/reason/statistics/next_run/failure_action + completed/deferred/stopped/failed/aborted 工厂；TaskExecutionResult + coerce/from_task_end/next_failure_count |
+| module/config | `task_delay` 返回 ScheduleDecision（新 schedule_contract.py），接受 caller/reason |
+| script.py | 调度器消费 TaskEnd→TaskExecutionResult；failure_record 按 RESET/INCREMENT/PRESERVE 更新；可恢复失败先 task_delay 再重试 |
+| module/device/* | 设备级识别缓存（frame_id/publish_frame/invalidate，click/swipe/drag/换向/重连均失效缓存）；screenshot 用参数而非 self.image 归一化 + 竖屏回退 orientation=1；删除死代码 nemu 0.1-0.2 clamp；drag() 字段修正；adb 路径按 adbutils.__file__ 解析；handle 解析重构 |
+| nemu_ipc.py | BGRA2BGR→RGBA2RGB 色彩修复；分辨率缓存+失效；超时/重连日志化 |
+| benchmark.py | 5 次预热+30 样本+P50/P95；新增 1280x720x3 uint8 契约校验器（不合格方法拒绝推荐）；device.py 侧 method 为空时保持 auto |
+
+## ② 历史缺陷现状核对表
+
+| 缺陷 | 判定 | 证据 |
+|---|---|---|
+| match_multi_scale 循环变量写回 bug | ✅ 已修复 | module/atom/image.py:263-276 `best_size` 随最优尺度更新，写回用 best_size；module/atom/test_image_multi_scale.py 1/1 通过 |
+| nemu_ipc 超时线程残留（无锁重连） | ❌ 仍存在 | nemu_ipc.py 全文无 Lock/Semaphore/threading/join（grep 0 命中）；`asyncio.wait_for(0.15)` 取消 future 但 executor 线程仍留在 ctypes DLL 内，retry 超时后 `init()→self.reconnect()` 无串行化。本次 diff 只加了 NEMU_IPC_TIMEOUT 日志（~319-335 行），未加锁/join |
+| Config.\_\_getattr\_\_ 静默 None 家族 | 🟡 部分 | 机制仍在（module/config/config.py:148-160 静默返回 None）；但已知错误引用全部清理：`Emulator_ScreenshotMethod` 活动引用 0 处（仅 backups/handoff 存档）；screenshot.py 死 clamp 分支已删除；device.py:204、control.py:241(drag)、benchmark.py run() 均改用 `script.device.screenshot_method/control_method`。机制本身（拼错静默失效）作为设计风险保留 |
+| GeneralBuff 动态 ROI 类属性污染 | ✅ 已修复 | general_buff.py `set_switch_area` 改为 `copy.copy` + 新 list 返回局部副本（gold_50/exp_50/soul/awake 全部走 `_set_switch_state`）；不再有对共享 I_OPEN_YELLOW/I_CLOSE_RED 的 roi_back 赋值 |
+| 绿标模板黑色背景 | 🟡 部分 | **模板文件缺陷仍存在**：PIL 普查 gb_green_marker.png 黑色占比 42.0%、gb_green_marker_bottom.png 28.5%、gb_green_marker_left_top.png 36.4%（全不透明 RGBA，19-37px；对照 TrueOrochi/ActivityShikigami 绿 PNG 均 0%）。阈值仍 0.8（assets.py:129-133）。但主链路不再依赖模板授权点击：确认走颜色槽位检测器，模板仅用于诊断 max_score；且默认 `OAS_GREEN_MARK_COLOR_SLOT_MODE=detect_only` 会把 confirmed 降级为 unconfirmed（general_battle.py:1424-1432） |
+| TaskEnd 结构化落地 | ✅ 已修复 | module/exception.py TaskEnd 全家族 + TaskExecutionResult；script.py:508-584 消费并更新 failure_record；tasks/ 54 文件 114 处 raise 全部为类方法（completed 53/aborted 2/deferred 2/failed 2/stopped 2），0 处裸 `raise TaskEnd("...")`；仅 GotoMain 无 set_next_run（命令型任务，合理） |
+
+## ③ 新发现
+
+| # | 级别 | 现象 | 证据 | 置信度 | 建议 |
+|---|---|---|---|---|---|
+| N1 | 🟡中 | 非 nemu_ipc 截图方式（ADB/窗口等）下，好友邀请出现 → handler 要求 'capture' 能力缺失 → BLOCKED → GameStuckError → 游戏重启+失败计数。旧 `_burst` 对所有截图方式都自动点击 | friend_invitation.py:23 `required_deadline_capabilities=('capture',)`；dispatcher.py:518-538 缺能力即 _fail；base_task.py:122-140 capture_deadline_capable 仅 nemu_ipc 为 True | 高（控制流确定） | 缺能力时降级为"仅检测不点击"或改用无 deadline 的单次点击，而非 fail-closed 崩任务 |
+| N2 | 🟡中 | 分发器要求帧尺寸严格 ==(1280,720)，否则每帧 BLOCKED→GameStuckError。非 16:9 窗口/未归一化帧的用户会被每帧判死 | dispatcher.py:122-133 `_frame_invalid_reason` EXPECTED_SIZE 严格相等 | 高 | 与 N1 同源；对尺寸不合法帧记 WARNING 跳过分发而非 raise |
+| N3 | 🟢低 | 绿标确认默认 detect_only：即使颜色检测器确认命中也被改写为 unconfirmed（待"五锚点+红色样本"验证）→ 绿标点击仍是 2 次无确认盲点，结果仅入日志/战斗统计 | general_battle.py:1424-1432 | 高 | 属作者明确的保守设计；收集实测证据后开 enforce |
+| N4 | 🟢低 | 每帧 3 次识别缓存失效（image setter×1-2 + publish_frame×1），点击/滑动再失效 → 缓存仅服务同帧多次 OCR；每次失效刷 DEBUG 日志 | device.py:72-85 setter、device.py:120-127 invalidate、screenshot.py publish_frame | 高 | 合并同帧失效为一次；DEBUG 日志可加采样 |
+| N5 | 🟢低 | ReplaceShikigami 素材分类兜底：`fallback_attempts>=1` 恒真，首个未命中帧立即开扇+点素材，跳过正常重试路径，且无验证即 `return True` | replace_shikigami.py diff（switch_shikigami_class 内新增块） | 高（逻辑明确，影响取决于实际皮肤） | 先走 1-2 次正常路径再兜底；兜底后截图验证分类选中 |
+| N6 | 🟢低 | `_common_popup_ocr_text` 每次弹窗 OCR 起一个 daemon 线程，若 detect_text 挂死线程滞留无上限（有 deadline 保护调用方，线程本身无） | base_task.py:171-197 | 高（机制）；调用频率低 | 可复用单 worker+queue；至少记录线程数 |
+| N7 | 🟢低 | exp_50/exp_100 旧版"开关不可见时滑动列表"逻辑被删除，新 `_set_switch_state` 遇 unknown 直接返回 False | general_buff.py diff（exp_50/exp_100 精简） | 中 | 加成列表超一屏的账号可能切换失败，需实机确认 |
+| N8 | 🟡中 | module/server/tests 39 项中 9 项 ERROR，全部 AccountLeaseError("held by another Core: oas1")——本机有真实 oas1 Core 进程在跑（tasklist 见多个 python.exe），测试用真实账户租约命名空间，不隔离运行中进程 | test_script_process.py 使用真实 'oas1' 账户名；复现单测确认 | 高 | 测试改用 uuid4 账户名/临时租约目录，使其 hermetic |
+| N9 | 🟢低 | task_delay 声明返回 ScheduleDecision，但 `task 不存在/无 scheduler` 时返回 None（config.py:402-407） | module/config/config.py:400-407 | 高 | 类型注解与实际不符，改 `ScheduleDecision \| None` 或抛错 |
+
+**备注（非缺陷）**：ui_click_until_disappear 返回值由隐式 None 变 True/False——已 grep 全部调用方均为 fire-and-forget（不消费返回值），无影响。ui_get_reward 旧版超时也恒返回 True（谎言），新版返回 False 属修正，调用方如 Exploration/solo.py:117 已按 bool 使用，合理。
+
+## ④ 通过项
+
+- **测试全绿**：GeneralBattle 116、CommonPopup 27、GeneralBuff 22、device 12、daemon 3、config 18、atom multi_scale 1、server 30/39（9 项为 N8 环境干扰）全部 OK。
+- base_task UI 系列全部有 deadline/action 预算，失败结构化（UiClickFailure）+ 不再无限 while（battle_wait 300s deadline + GameStuckError，general_battle.py:675-741）。
+- 弹窗分发器 fail-closed 设计：帧不推进/设备身份变化/黑帧/超预算均显式 GameStuckError，不再静默。
+- 历史越权点：旧 `_burst` 接受邀请后 `set_next_run('WantedQuests')` 保留在新 handler（friend_invitation.py:151-158）——行为一致未丢失；cross-task set_next_run 普查与上轮一致（ActivityShikigami→SoulsTidy、Duel→TalismanPass、Exploration→RealmRaid+MemoryScrolls、GuildActivityMonitor/Restart 属设计内），无新增越权写。
+- benchmark 有 1280x720 RGB 契约校验，修复"未验证基准选错分辨率"隐患（benchmark.py:87-121、device.py:150-159 空结果保持 auto）。
+- `_handle_orientated_image` 改按入参处理（原读 self.image 的 bug 修复）；drag() 错误字段修复；RGBA→RGB 通道修复有明确注释依据。
+- diff 范围内新增代码无裸 `except:`（handle.py:389 为上游遗留，非本次变更）；新增 while 循环基本有 deadline，遗留无界 while 均为旧代码（_switch_preset_team_legacy:2083、lock_team:2406/2414）。
+- 资产一致性抽查：click.json/ocr.json 与代码引用 itemName 一致（C_PREPARE_SAFE/C_BATTLE_MODE_SAFE/O_EXIT_CONFIRM 等按惯例只存在于代码，符合仓库既有模式）。
+
+## ⑤ 无法判定项
+
+1. **nemu_ipc RGBA vs BGRA 通道修复的正确性**：无实机帧对比，无法确认旧版是否真的红蓝互换（注释理由充分但需一帧截图验证）。
+2. **绿标颜色槽位检测器实机命中率**：detect_only 模式下无确认样本，需 OAS_GREEN_MARK_DIAGNOSTICS=1 + 实机战斗验证（代码内注明"五个锚点+红色样本"门槛）。
+3. **弹窗分发器实机表现**：每帧分发开销、N1/N2 触发概率、idle_buff 关键词（"15分钟/未使用加成/自动关闭/再次打开"）在不同皮肤的 OCR 稳定性，均需当日日志佐证。
+4. **GeneralBuff 阈值下调（0.7/0.65）后的误报风险**：注释给出实测依据（0.757/0.725/0.526），但新皮肤外的场景需实机回归。
+5. **N5 兜底点击与 N9 滚动删除的实机影响**：取决于具体账号皮肤与加成列表长度，纯静态无法下结论。
+
+**总评**：本轮变更质量显著高于历史轮次——所有历史 P0/P1（match_multi_scale、ROI 污染、TaskEnd 结构、越权 next_run、无效基准）均已落地或收敛，配套测试到位；剩余开放项集中在 nemu_ipc 线程残留（历史遗留、本轮只加了日志）与弹窗分发器对非 nemu 截图方式的 fail-closed 过度严苛（N1/N2，建议降级而非崩任务）。

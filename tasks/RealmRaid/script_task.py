@@ -21,15 +21,24 @@ from tasks.base_task import BaseTask
 # reload 失败不影响任务运行（退回到已缓存的旧模块），所以是安全的。
 try:
     import importlib as _importlib
+    import tasks.RealmRaid.assets as _realm_raid_assets_module
+    import tasks.Component.GeneralBattle.assets as _general_battle_assets_module
     import tasks.Component.GeneralBattle.general_battle as _general_battle_module
+    _importlib.reload(_realm_raid_assets_module)
+    # GeneralBattle inherits the click rules at import time. Reload the asset
+    # module first or updated green-mark coordinates remain cached in the class.
+    _importlib.reload(_general_battle_assets_module)
     _importlib.reload(_general_battle_module)
 except Exception as _reload_error:  # noqa: BLE001
     from module.logger import logger as _reload_logger
-    _reload_logger.warning(f'reload general_battle failed, use cached module: {_reload_error}')
+    _reload_logger.warning(f'reload RealmRaid modules failed, use cached modules: {_reload_error}')
 
-from tasks.Component.GeneralBattle.general_battle import GeneralBattle
+from tasks.Component.GeneralBattle.general_battle import GeneralBattle, PresetLookupError
+from tasks.Component.GeneralBattle.preset_name_selector import InvalidPresetConfigError
+from tasks.Component.GeneralBattle.preset_name_selector import normalize_preset_name
+from tasks.Component.SwitchSoul.assets import SwitchSoulAssets
 from tasks.GameUi.game_ui import GameUi
-from tasks.GameUi.page import page_realm_raid, page_main, page_shikigami_records
+from tasks.GameUi.page import page_battle, page_realm_raid, page_main, page_shikigami_records
 from tasks.RealmRaid.assets import RealmRaidAssets
 from tasks.RealmRaid.config import RealmRaid, RaidMode, AttackNumber, WhenAttackFail
 from tasks.RealmRaid.level_mode import (
@@ -39,17 +48,21 @@ from tasks.RealmRaid.level_mode import (
     LevelMode,
     PendingAction,
     RealmRaidCheckpoint,
+    cached_board_levels,
     decide_next_action,
     generation_changed,
     reconcile_checkpoint,
-    resolve_broken_levels,
     schedule_after_cooldown,
 )
 from tasks.Component.SwitchSoul.switch_soul import SwitchSoul
 
 
 from module.logger import logger
-from module.exception import GameStuckError, GameTooManyClickError, TaskEnd
+from module.exception import (
+    GameStuckError,
+    GameTooManyClickError,
+    TaskEnd,
+)
 from module.atom.image_grid import ImageGrid
 from module.atom.image import RuleImage
 from module.atom.click import RuleClick
@@ -143,11 +156,172 @@ class LevelOcr(RuleOcr):
             return image
 
 
+class BrokenLevelOcr(LevelOcr):
+    """Read the still-visible level plaque after a card has been marked broken."""
+
+    LEVEL_MIN = 1
+    LEVEL_MAX = 60
+
+    def ocr(self, image, keyword=None):
+        """Use a high-contrast pass first, then retain the adaptive fallback.
+
+        The current broken-card artwork makes the adaptive pass read the real
+        ``60`` plaque as ``BO`` on some frames. Otsu reliably separates that
+        plaque, while a few other levels lose their second digit under Otsu.
+        Keep the bounded fallback and prefer a two-digit value when available.
+        """
+        self._broken_ocr_variant = 'otsu'
+        primary = self.ocr_single_line(image)
+        if isinstance(primary, int) and self.LEVEL_MIN <= primary <= self.LEVEL_MAX:
+            if primary >= 10:
+                return primary
+
+        self._broken_ocr_variant = 'adaptive'
+        fallback = self.ocr_single_line(image)
+        if isinstance(fallback, int) and 10 <= fallback <= self.LEVEL_MAX:
+            return fallback
+        return primary or fallback or 0
+
+    def pre_process(self, image):
+        try:
+            if image is None or image.size == 0:
+                return image
+
+            # The broken overlay darkens both the plaque and its digits. Restrict
+            # OCR to the digit body, then use a local threshold instead of the
+            # absolute brightness threshold used by normal cards.
+            inner = image[8:26, 5:28]
+            if inner.shape[:2] != (18, 23):
+                return super().pre_process(image)
+            gray = cv2.cvtColor(inner, cv2.COLOR_RGB2GRAY) if inner.ndim == 3 else inner
+            if getattr(self, '_broken_ocr_variant', 'otsu') == 'otsu':
+                _, light = cv2.threshold(
+                    gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+                )
+            else:
+                light = cv2.adaptiveThreshold(
+                    gray,
+                    255,
+                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                    cv2.THRESH_BINARY,
+                    11,
+                    0,
+                )
+            binary = 255 - light
+            binary = cv2.copyMakeBorder(
+                binary, 8, 8, 10, 10, cv2.BORDER_CONSTANT, value=255
+            )
+            binary = cv2.resize(
+                binary, None, fx=5, fy=5, interpolation=cv2.INTER_CUBIC
+            )
+            return cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f'已攻破等级铭牌预处理失败，退回普通规则：{error}')
+            return super().pre_process(image)
+
+
+class AttackRecordOcr(RuleOcr):
+    """Reject low-confidence digits for the 0-9 attack record counter.
+
+    The global digit OCR accepts scores down to 0.30 when any digit is present.
+    On the current RealmRaid artwork that turned a clearly displayed 4 into a
+    score-0.36 6. A rejected result remains auxiliary evidence: the nine broken
+    stamps still provide the committed win count, while a high-confidence
+    counter mismatch continues to make the board unsafe.
+    """
+
+    min_score = 0.6
+
+    def after_process(self, result):
+        # Digit.after_process turns an empty OCR result into 0.  That value is
+        # indistinguishable from a real empty-board counter, so preserve the
+        # uncertainty and let the visible broken marks remain the fallback.
+        if result is None or not str(result).strip():
+            return None
+        text = str(result)
+        for old, new in {
+            'I': '1', 'D': '0', 'S': '5', 'B': '8',
+            '？': '2', '?': '2', 'd': '6', 'o': '0', 'O': '0', '→': '1',
+        }.items():
+            text = text.replace(old, new)
+        digits = ''.join(char for char in text if char.isdigit())
+        if not digits:
+            return None
+        return int(digits)
+
+    def ocr(self, image, keyword=None):
+        result = self.ocr_single(image)
+        if result is None or result == '':
+            return None
+        return int(result)
+
+
 class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
     medal_grid: ImageGrid = None
+    MEDAL_RELAXED_THRESHOLD = 0.75
 
     def run(self):
-        self.run_2()
+        try:
+            self.run_2()
+        except (GameStuckError, GameTooManyClickError) as error:
+            if not self.config.realm_raid.level_mode_config.enable:
+                raise
+            # Cover navigation and preset pre-application as well as the board
+            # loop. The global handler would otherwise schedule a game restart.
+            logger.error(
+                'Target level mode task aborted without restarting the game: '
+                f'{type(error).__name__}: {error}'
+            )
+            try:
+                self.dump_board('level_mode_task_error')
+            except Exception as dump_error:  # noqa: BLE001
+                logger.warning(f'Level mode error screenshot failed: {dump_error}')
+            retry_at = ScriptTask.level_short_retry_target()
+            logger.info(
+                f'Target level mode exception retry scheduled at {retry_at.isoformat(timespec="seconds")}'
+            )
+            self.set_next_run(
+                task='RealmRaid',
+                success=False,
+                finish=True,
+                server=False,
+                target=retry_at,
+            )
+            raise TaskEnd.failed(
+                'RealmRaid target-level setup failed',
+                next_run=retry_at,
+            )
+
+    def open_current_team_preset(self, timeout: float = 15) -> None:
+        """Open the current Records team-preset page without its obsolete page check."""
+        self.screenshot()
+        if self._is_current_preset_page():
+            return
+        if self.appear(SwitchSoulAssets.I_SOUL_PRESET, threshold=0.8):
+            self._open_records_preset_page(timeout=timeout)
+            return
+
+        # The upstream Records page check is stale in the current game version.
+        # Only use the generic navigator to reach the still-recognizable courtyard,
+        # then enter Records and wait for its current Preset control directly.
+        self.ui_get_current_page()
+        self.ui_goto(page_main)
+
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            self.screenshot()
+            if self.appear_then_click(
+                self.I_MAIN_GOTO_SHIKIGAMI_RECORDS,
+                interval=1,
+            ):
+                break
+            time.sleep(0.3)
+        else:
+            raise PresetLookupError(
+                '无法从庭院进入式神录，已停止本次任务，未开始挑战'
+            )
+
+        self._open_records_preset_page(timeout=timeout)
 
     def is_ticket(self) -> bool:
         """
@@ -162,7 +336,7 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
             return False
         return True
 
-    def medal_fire(self) -> bool:
+    def medal_fire(self, timeout: float = 30.0) -> bool:
         """
         点击勋章
         :return:
@@ -170,14 +344,15 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
         # 点击勋章的挑战 和挑战
         time.sleep(0.2)
         is_click = False
-        while 1:
+        deadline = time.monotonic() + max(1.0, float(timeout))
+        while time.monotonic() < deadline:
             self.screenshot()
 
-            if self.appear(self.I_FIRE, threshold=0.8):
+            if self._realm_raid_fire_visible():
                 break
 
             if self.appear_then_click(self.I_SOUL_RAID, interval=1.5):
-                while 1:
+                while time.monotonic() < deadline:
                     self.screenshot()
                     if self.appear_then_click(self.I_SOUL_RAID, interval=1.5):
                         continue
@@ -192,17 +367,93 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
 
             if is_click:
                 continue
+        else:
+            raise GameStuckError(
+                f'RealmRaid medal selection did not reach the attack button within {timeout:.1f}s'
+            )
         logger.info(f'Click Medal')
 
         # 点击挑战
         self.wait_until_appear(self.I_FIRE, wait_time=15)
-        while 1:
+        while time.monotonic() < deadline:
             self.screenshot()
-            if self.appear_then_click(self.I_FIRE, interval=2):
+            if self._click_realm_raid_fire(interval=2):
                 continue
-            if not self.appear(self.I_FIRE, threshold=0.8):
+            if not self._realm_raid_fire_visible():
                 break
+        else:
+            raise GameStuckError(
+                f'RealmRaid attack button did not disappear within {timeout:.1f}s'
+            )
         logger.info(f'Click {self.I_FIRE.name}')
+        return True
+
+    def _realm_raid_fire_visible(self) -> bool:
+        """Recognize both the legacy board button and the current detail-card button."""
+        return self.appear(self.I_FIRE, threshold=0.8) or self.appear(self.I_FIRE_CURRENT)
+
+    def _click_realm_raid_fire(self, interval: float = 1.0) -> bool:
+        """Click the first confirmed RealmRaid attack-button variant."""
+        if self.appear_then_click(self.I_FIRE, interval=interval, threshold=0.8):
+            return True
+        return self.appear_then_click(self.I_FIRE_CURRENT, interval=interval)
+
+    def _realm_raid_partition_targets(self, order: int) -> list[RuleClick]:
+        """Return bounded, semantic click areas for one target card.
+
+        The medal OCR selects the card order, but the old fallback treated the
+        entire partition ROI as a hitbox.  That made a retry click blank card
+        pixels and falsely logged it as a successful selection.  Keep each
+        candidate small and explainable: the first medal is the historical
+        working anchor, followed by the portrait area used by the current
+        card layout.  The name area is intentionally excluded because a
+        selected card treats it as a Friend Book entry point.
+        """
+        source = self.partition[order - 1]
+        x, y, width, height = (int(value) for value in source.roi_front)
+
+        def area(left: int, top: int, candidate_width: int, candidate_height: int,
+                 suffix: str) -> RuleClick:
+            left = max(0, left)
+            top = max(0, top)
+            candidate_width = max(1, min(candidate_width, 1280 - left))
+            candidate_height = max(1, min(candidate_height, 720 - top))
+            roi = (left, top, candidate_width, candidate_height)
+            return RuleClick(roi_front=roi, roi_back=roi,
+                             name=f'{source.name}:{suffix}')
+
+        matched = getattr(self, '_level_target_image', None)
+        if matched is not None:
+            try:
+                center = matched.front_center()
+                logger.info(
+                    f'RealmRaid target selection uses matched medal evidence: '
+                    f'target={order}, center={center}; click candidates are bounded'
+                )
+            except Exception as error:  # noqa: BLE001
+                logger.debug(f'RealmRaid matched medal evidence unavailable: {error}')
+
+        self._level_target_image = None
+        return [
+            area(
+                x + 6,
+                y + height - 51,
+                min(42, width - 12),
+                32,
+                'first_medal',
+            ),
+            area(
+                x - 62,
+                y + 14,
+                60,
+                min(78, height - 20),
+                'portrait',
+            ),
+        ]
+
+    def _realm_raid_partition_target(self, order: int) -> RuleClick:
+        """Backward-compatible access to the primary target click area."""
+        return self._realm_raid_partition_targets(order)[0]
 
     def execute_round(self, config: RealmRaid) -> bool:
         """
@@ -217,16 +468,20 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
         if config.raid_config.raid_mode == RaidMode.NORMAL:
             logger.info(f'Execute round, retreat four attack nine')
             self.medal_fire()
-            self.run_general_battle_back(config.general_battle_config)
+            if not self.run_general_battle_back(config.general_battle_config):
+                return False
 
             self.medal_fire()
-            self.run_general_battle_back(config.general_battle_config)
+            if not self.run_general_battle_back(config.general_battle_config):
+                return False
 
             self.medal_fire()
-            self.run_general_battle_back(config.general_battle_config)
+            if not self.run_general_battle_back(config.general_battle_config):
+                return False
 
             self.medal_fire()
-            self.run_general_battle_back(config.general_battle_config)
+            if not self.run_general_battle_back(config.general_battle_config):
+                return False
 
         # 打九次
         for i in range(9):
@@ -239,19 +494,254 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
         return True
 
     # ------------------------------------------------------------------------------------------------------------------
+    def prepare_realm_raid_battle(self, config: RealmRaid) -> None:
+        """Run the single RealmRaid preparation phase.
+
+        Team preset and soul preset remain separate business intents, but they
+        share one navigation/lock boundary.  This prevents the old soul entry
+        from failing before the newer named team entry gets a chance to run.
+        """
+        battle_config = config.general_battle_config
+        soul_config = config.switch_soul_config
+        self._battle_preset_preapplied = False
+        # The named preset flow deliberately unlocks the first battle. The
+        # next battle, not the lock icon alone, proves that locking took effect.
+        self._battle_lock_expected_active = False
+
+        preset_group_name = str(getattr(battle_config, 'preset_group_name', '') or '').strip()
+        preset_team_name = str(getattr(battle_config, 'preset_team_name', '') or '').strip()
+        team_name_partial = bool(preset_group_name or preset_team_name)
+        team_name_complete = bool(preset_group_name and preset_team_name)
+        team_requested = bool(getattr(battle_config, 'preset_enable', False))
+        soul_by_name = bool(getattr(soul_config, 'enable_switch_by_name', False))
+        soul_by_index = bool(getattr(soul_config, 'enable', False)) and not soul_by_name
+        soul_requested = soul_by_name or soul_by_index
+        self._lock_after_first_battle_pending = bool(
+            team_requested and team_name_complete and battle_config.lock_team_enable
+        )
+        self._team_preset_covers_soul = False
+
+        logger.info(
+            'PREPARE_START '
+            f'team_requested={team_requested}, soul_requested={soul_requested}, '
+            f'lock_desired={getattr(battle_config, "lock_team_enable", False)}'
+        )
+
+        if team_requested and team_name_partial and not team_name_complete:
+            raise InvalidPresetConfigError(
+                '预设队伍配置不完整：分组名称和队伍名称必须同时填写'
+            )
+
+        # Validate the numeric compatibility path before navigating anywhere.
+        # The disabled default -1,-1 remains valid because soul_by_index is false.
+        if soul_by_index:
+            SwitchSoul.validate_switch_config(
+                True,
+                soul_config.switch_group_team,
+            )
+
+        unlock_confirmed = True
+        if team_requested and team_name_complete and battle_config.lock_team_enable:
+            # Lock state is only meaningful on the RealmRaid board.  Reach it
+            # before attempting the unlock, then the preset helpers can return
+            # to Records and the caller will enter the board again afterward.
+            self.ui_get_current_page()
+            self.ui_goto(page_realm_raid)
+            logger.info('LOCK_STATE desired=locked, unlock_required=true')
+            unlock_confirmed = self.ensure_lock(False, timeout=12)
+            logger.info(
+                f'LOCK_STATE unlock_result={"confirmed" if unlock_confirmed else "unconfirmed"}'
+            )
+        else:
+            logger.info(
+                'LOCK_STATE '
+                f'desired={"locked" if battle_config.lock_team_enable else "unlocked"}, '
+                'unlock_required=false'
+            )
+
+        if team_requested and team_name_complete:
+            if not unlock_confirmed:
+                # User-confirmed fallback: an unconfirmed unlock must not block
+                # soul preparation and the current battle attempt.
+                logger.warning(
+                    'TEAM_PRESET_RESULT result=skipped_unlock_unconfirmed; '
+                    'continue with soul preset and current team'
+                )
+            else:
+                try:
+                    self.open_current_team_preset()
+                    self.preapply_preset_team_from_records(
+                        preset_group_name,
+                        preset_team_name,
+                        page_already_open=True,
+                    )
+                except PresetLookupError as error:
+                    logger.error(f'Preset entry stopped before battle: {error}')
+                    raise
+                self._team_preset_covers_soul = bool(
+                    soul_by_name
+                    and normalize_preset_name(preset_group_name)
+                    == normalize_preset_name(soul_config.group_name)
+                    and normalize_preset_name(preset_team_name)
+                    == normalize_preset_name(soul_config.team_name)
+                )
+                logger.info('TEAM_PRESET_RESULT result=applied')
+        elif team_requested:
+            # Empty names keep the old numeric compatibility path inside the
+            # first battle's preparation page.
+            logger.info('TEAM_PRESET_RESULT result=deferred_legacy_compatibility')
+        else:
+            logger.info('TEAM_PRESET_RESULT result=disabled')
+
+        if soul_by_name:
+            if self._team_preset_covers_soul:
+                logger.info(
+                    'SOUL_PRESET_RESULT result=covered_by_team_preset; '
+                    'skip duplicate composite preset action'
+                )
+            else:
+                self.ui_get_current_page()
+                self.ui_goto(page_shikigami_records)
+                soul_result = self.run_switch_soul_by_name(
+                    soul_config.group_name,
+                    soul_config.team_name,
+                )
+                if soul_result is False:
+                    raise GameStuckError('RealmRaid named soul preset was not applied')
+                logger.info('SOUL_PRESET_RESULT result=applied_by_name')
+        elif soul_by_index:
+            self.ui_get_current_page()
+            self.ui_goto(page_shikigami_records)
+            self.run_switch_soul(soul_config.switch_group_team)
+            logger.info('SOUL_PRESET_RESULT result=applied_by_index')
+        else:
+            logger.info('SOUL_PRESET_RESULT result=disabled')
+
+        logger.info(
+            'PREPARE_RESULT result=ready '
+            f'team={team_requested}, soul={soul_requested}, '
+            f'lock_desired={battle_config.lock_team_enable}'
+        )
+
+    @staticmethod
+    def _realm_raid_page_name(page) -> str:
+        if page is None:
+            return 'none'
+        return getattr(page, 'name', str(page))
+
+    def _stop_realm_raid_for_scene(self, current_page, reason: str) -> None:
+        """Stop RealmRaid safely when the client is in an incompatible scene.
+
+        In particular, never use the generic page graph to leave an active battle
+        here.  A RealmRaid task can be scheduled while another task's battle is
+        still running, and clicking that battle's back control would change the
+        user's in-game state and potentially lose its result.
+        """
+        page_name = self._realm_raid_page_name(current_page)
+        logger.error(
+            'REALM_RAID_SCENE_GATE result=blocked '
+            f'current={page_name} reason={reason}'
+        )
+        try:
+            self.screenshot()
+            dump_board = getattr(self, 'dump_board', None)
+            if callable(dump_board):
+                dump_board(f'scene_guard_{reason}')
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f'RealmRaid scene-guard evidence save failed: {error}')
+
+        retry_at = self.level_short_retry_target()
+        self.set_next_run(
+            task='RealmRaid',
+            success=False,
+            finish=True,
+            server=False,
+            target=retry_at,
+        )
+        logger.warning(
+            'RealmRaid scene guard paused the task without touching the current page; '
+            f'retry scheduled at {retry_at.isoformat(timespec="seconds")}'
+        )
+        raise TaskEnd.deferred(
+            f'RealmRaid scene guard: {reason}',
+            next_run=retry_at,
+        )
+
+    def _realm_raid_startup_scene_guard(self):
+        """Reject startup from an active battle before preset/navigation code runs."""
+        current_page = self.ui_get_current_page()
+        logger.info(
+            'REALM_RAID_SCENE_GATE stage=startup '
+            f'current={self._realm_raid_page_name(current_page)}'
+        )
+        if current_page == page_battle:
+            self._stop_realm_raid_for_scene(
+                current_page,
+                reason='active_battle_page',
+            )
+        return current_page
+
+    def _confirm_realm_raid_board(self, config: RealmRaid) -> None:
+        """Require a fresh RealmRaid page before any lock or battle action."""
+        current_page = self.ui_get_current_page()
+        page_name = self._realm_raid_page_name(current_page)
+        if current_page == page_battle:
+            self._stop_realm_raid_for_scene(
+                current_page,
+                reason='active_battle_after_navigation',
+            )
+        if current_page != page_realm_raid:
+            self._stop_realm_raid_for_scene(
+                current_page,
+                reason=f'expected_realm_raid_got_{page_name}',
+            )
+
+        self.screenshot()
+        if not self.appear(self.I_CHECK_REALM_RAID, threshold=0.7):
+            self._stop_realm_raid_for_scene(
+                current_page,
+                reason='realm_raid_marker_missing',
+            )
+
+        ticket_state = 'unreadable'
+        ticket_values = None
+        try:
+            ticket_values = self.O_NUMBER.ocr(self.device.image)
+            if isinstance(ticket_values, tuple) and len(ticket_values) >= 3:
+                ticket_current, ticket_rest, ticket_total = ticket_values[:3]
+                ticket_state = f'{ticket_current}+{ticket_rest}/{ticket_total}'
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f'RealmRaid entry ticket OCR failed: {error}')
+
+        level_gate = (
+            'stable_board_observation'
+            if getattr(config.level_mode_config, 'enable', False)
+            else 'not_required'
+        )
+        logger.info(
+            'REALM_RAID_SCENE_GATE result=board_confirmed '
+            f'page={page_name} tickets={ticket_state} level_gate={level_gate}'
+        )
+
     def run_2(self):
         con = self.config.realm_raid
-        if con.switch_soul_config.enable:
-            self.ui_get_current_page()
-            self.ui_goto(page_shikigami_records)
-            self.run_switch_soul(con.switch_soul_config.switch_group_team)
-        if con.switch_soul_config.enable_switch_by_name:
-            self.ui_get_current_page()
-            self.ui_goto(page_shikigami_records)
-            self.run_switch_soul_by_name(con.switch_soul_config.group_name, con.switch_soul_config.team_name)
+        self._realm_raid_startup_scene_guard()
+        prepare = getattr(self, 'prepare_realm_raid_battle', None)
+        if prepare is None:
+            # Keep lightweight test/dry-run harnesses that only borrow run_2
+            # compatible with the new preparation boundary.
+            ScriptTask.prepare_realm_raid_battle(self, con)
+        else:
+            prepare(con)
 
         self.ui_get_current_page()
-        self.ui_goto(page_realm_raid)
+        navigation_result = self.ui_goto(page_realm_raid)
+        if navigation_result is False:
+            self._stop_realm_raid_for_scene(
+                getattr(self, 'ui_current', None),
+                reason='realm_raid_navigation_failed',
+            )
+        self._confirm_realm_raid_board(con)
 
         # 有呱太活动的时候第一次进入还会 出现一个弹窗
         self.screenshot()
@@ -279,10 +769,45 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
             if CAPTURE_ONLY and not con.level_mode_config.enable:
                 logger.info('CAPTURE_ONLY=True：素材已采集，本次任务到此结束，不进行任何挑战')
                 self.set_next_run(task='RealmRaid', success=True, finish=True)
-                raise TaskEnd
+                raise TaskEnd.completed('RealmRaid completed')
 
-        # 判断是不是锁定阵容
-        self.ensure_lock(con.general_battle_config.lock_team_enable)
+        # 页面切换后的首帧和 Nemu IPC 取帧可能晚于页面到达事件；目标等级模式仍
+        # 保持有限等待，给锁图标一个完整的稳定窗口，避免刚进页面就误判为未知状态。
+        lock_timeout = 5 if con.level_mode_config.enable else 12
+        lock_deferred_until_after_battle = getattr(
+            self, '_lock_after_first_battle_pending', False
+        )
+        if lock_deferred_until_after_battle:
+            logger.info(
+                'LOCK_STATE initial_lock=deferred; '
+                'first battle must complete before relock'
+            )
+            lock_confirmed = True
+            self._battle_lock_expected_active = False
+        else:
+            lock_confirmed = self.ensure_lock(
+                con.general_battle_config.lock_team_enable,
+                timeout=lock_timeout,
+            )
+            self._battle_lock_expected_active = bool(
+                con.general_battle_config.lock_team_enable and lock_confirmed
+            )
+        if not lock_confirmed:
+            retry_at = self.level_short_retry_target()
+            logger.error(
+                f'RealmRaid team lock state is unconfirmed; pause and retry at '
+                f'{retry_at.isoformat(timespec="seconds")}'
+            )
+            if con.level_mode_config.enable:
+                self.finish_level_mode(
+                    success=False,
+                    target=retry_at,
+                    reason='team_lock_unconfirmed',
+                )
+            self.finish_realm_raid_retry(
+                target=retry_at,
+                reason='team_lock_unconfirmed',
+            )
         # 判断是否是呱太活动
         frog = self.is_frog(True)
         if frog:
@@ -306,8 +831,21 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
                     self.dump_board('level_mode_action_error')
                 except Exception as dump_error:  # noqa: BLE001
                     logger.warning(f'Level mode error screenshot failed: {dump_error}')
-                self.set_next_run(task='RealmRaid', success=False, finish=True)
-                raise TaskEnd
+                retry_at = ScriptTask.level_short_retry_target()
+                logger.info(
+                    f'Target level mode action retry scheduled at {retry_at.isoformat(timespec="seconds")}'
+                )
+                self.set_next_run(
+                    task='RealmRaid',
+                    success=False,
+                    finish=True,
+                    server=False,
+                    target=retry_at,
+                )
+                raise TaskEnd.failed(
+                    f'RealmRaid target-level action failed: {error}',
+                    next_run=retry_at,
+                )
 
 
         # 开始循环
@@ -362,14 +900,14 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
                 logger.info('Now is the first one')
                 if con.raid_config.exit_four:
                     logger.info('Exit four enable')
-                    self.fire(index)
-                    self.run_general_battle_back(con.general_battle_config, exit_four=True)
-                    self.fire(index)
-                    self.run_general_battle_back(con.general_battle_config, exit_four=True)
-                    self.fire(index)
-                    self.run_general_battle_back(con.general_battle_config, exit_four=True)
-                    self.fire(index)
-                    self.run_general_battle_back(con.general_battle_config, exit_four=True)
+                    for _ in range(4):
+                        self.fire(index)
+                        if not self.run_general_battle_back(
+                                con.general_battle_config, exit_four=True):
+                            self.finish_realm_raid_retry(
+                                target=self.level_short_retry_target(),
+                                reason='surrender_unconfirmed',
+                            )
             elif self.check_medal_is_frog(frog, medal, index):
                 # 如果挑战的这只是呱太的话，就要把锁定改为不锁定
                 con.general_battle_config.lock_team_enable = False
@@ -377,6 +915,7 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
             last_battle = self.run_general_battle(con.general_battle_config)
             if lock_before:
                 con.general_battle_config.lock_team_enable = lock_before
+                self.retry_lock_after_battle(con.general_battle_config)
             # 检查是否每三次领一个奖励
             if self.reward_detect_click(False):
                 logger.info('Rewards of three wins')
@@ -407,7 +946,68 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
         self.ui_get_current_page()
         self.ui_goto(page_main)
         self.set_next_run(task='RealmRaid', success=success, finish=True)
-        raise TaskEnd
+        if success:
+            raise TaskEnd.completed('RealmRaid completed')
+        raise TaskEnd.failed('RealmRaid battle flow failed')
+
+    def finish_realm_raid_retry(
+        self,
+        target: datetime,
+        reason: str,
+        leave_current_page: bool = True,
+    ) -> None:
+        """Leave RealmRaid without a global restart and retry after a short delay."""
+        if leave_current_page:
+            try:
+                self.ui_click(self.I_BACK_RED, self.I_CHECK_EXPLORATION)
+                self.ui_get_current_page()
+                self.ui_goto(page_main)
+            except Exception as error:  # noqa: BLE001
+                logger.warning(f'Leave RealmRaid page failed during retry scheduling: {error}')
+        else:
+            logger.info(
+                'RealmRaid retry keeps current page untouched: '
+                f'reason={reason}'
+            )
+        self.set_next_run(
+            task='RealmRaid',
+            success=False,
+            finish=True,
+            server=False,
+            target=target,
+        )
+        logger.info(
+            f'RealmRaid retry scheduled: reason={reason}, '
+            f'target={target.isoformat(timespec="seconds")}'
+        )
+        raise TaskEnd.failed(
+            f'RealmRaid retry after explicit failure: {reason}',
+            next_run=target,
+        )
+
+    def retry_lock_after_battle(self, battle_config, timeout: float = 5.0) -> bool:
+        """Retry the post-battle lock without blocking the next preparation.
+
+        A failed re-lock is recoverable: the next battle still exposes the
+        Prepare button, so that battle may proceed while this guard retries on
+        the following board frame.
+        """
+        if not getattr(battle_config, 'lock_team_enable', False):
+            self._battle_lock_expected_active = False
+            return True
+        if self.ensure_lock(True, timeout=timeout):
+            self._battle_lock_expected_active = True
+            logger.info(
+                'LOCK_AFTER_BATTLE result=indicator_confirmed '
+                'validation=pending_next_battle'
+            )
+            return True
+        self._battle_lock_expected_active = False
+        logger.warning(
+            'LOCK_AFTER_BATTLE result=unconfirmed; '
+            'next battle will use Prepare and retry the lock'
+        )
+        return False
 
     # ------------------------------------------------------- 目标等级模式（二开 Codex-05）
 
@@ -434,14 +1034,15 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
     @cached_property
     def attack_record_ocr(self) -> RuleOcr:
         # 数字位于“攻破记录”下方。0 的 OCR 结果与空结果相同，因此 0 只在没有破印时采用。
-        roi = (205, 595, 40, 38)
-        return RuleOcr(roi=roi, area=roi, mode='Digit', method='Default',
-                       keyword='', name='realm_raid_attack_record')
+        roi = (210, 595, 30, 35)
+        return AttackRecordOcr(roi=roi, area=roi, mode='Digit', method='Default',
+                               keyword='', name='realm_raid_attack_record')
 
     def detect_level_board_marks(self, image=None) -> tuple[frozenset[int], frozenset[int]]:
         if image is None:
             image = self.device.image
 
+        started_at = time.perf_counter()
         broken = set()
         for index, click in enumerate(self.partition, start=1):
             self.level_broken_sign.roi_back = tuple(click.roi_back)
@@ -456,6 +1057,12 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
 
         # “破”印本身包含红色，且目标已经不可挑战；不把它同时当作失败箭头。
         failure_marked.difference_update(broken)
+        logger.info(
+            'REALM_RAID_BOARD_TIMING phase=marks '
+            f'durationMs={(time.perf_counter() - started_at) * 1000:.1f} '
+            f'brokenChecks={len(self.partition)} failureChecks={len(self.false_roi)} '
+            f'broken={len(broken)} failure={len(failure_marked)}'
+        )
         return frozenset(broken), frozenset(failure_marked)
 
     @staticmethod
@@ -487,7 +1094,11 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
         if image is None:
             image = self.device.image
         try:
-            text = str(self.O_FRESH_TIME.ocr_single(image) or '')
+            cached_ocr = getattr(self, '_ocr_cached', None)
+            if callable(cached_ocr) and image is getattr(self.device, 'image', None):
+                text = str(cached_ocr(self.O_FRESH_TIME, operation='ocr_single') or '')
+            else:
+                text = str(self.O_FRESH_TIME.ocr_single(image) or '')
         except Exception as error:  # noqa: BLE001
             logger.warning(f'Refresh CD OCR failed: {error}')
             return None
@@ -508,27 +1119,49 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
         screenshot: bool = True,
         expected_level: int = 0,
         expected_board_signature: str = '',
+        trust_expected_level: bool = False,
+        level_cache: RealmRaidCheckpoint | None = None,
+        use_checkpoint_cache: bool = False,
     ) -> BoardSnapshot:
+        # Compatibility-only arguments: checkpoint evidence must never replace
+        # any of the nine levels used to calculate the current board mode.
+        _ = expected_level, expected_board_signature, trust_expected_level
         if screenshot:
             self.screenshot()
         image = self.device.image
-        raw_levels = tuple(self.read_levels(image))
+        timing_started = time.perf_counter()
+        marks_started = time.perf_counter()
         broken, failure_marked = self.detect_level_board_marks(image)
+        marks_ms = (time.perf_counter() - marks_started) * 1000
+        layout_started = time.perf_counter()
         layout_signature = self._layout_hash(image, self.partition)
-
-        trusted_expected_level = 0
-        if expected_board_signature and expected_board_signature == layout_signature:
-            trusted_expected_level = expected_level
-        levels, imputed, imputation_source = resolve_broken_levels(
-            raw_levels,
-            broken,
-            expected_level=trusted_expected_level,
-        )
+        layout_ms = (time.perf_counter() - layout_started) * 1000
+        levels = ()
+        if use_checkpoint_cache:
+            levels = cached_board_levels(
+                level_cache,
+                layout_signature,
+                broken,
+                failure_marked,
+                now=datetime.now(),
+            )
+        if levels:
+            level_source = 'checkpoint-cache'
+            level_ms = 0.0
+        else:
+            level_started = time.perf_counter()
+            levels = tuple(self.read_levels(image, broken=broken))
+            level_ms = (time.perf_counter() - level_started) * 1000
+            level_source = 'ocr'
         challenge_level = self.current_challenge_level(levels)
         votes = Counter(level for level in levels if level).get(challenge_level, 0)
 
         try:
-            tickets_current, _tickets_rest, tickets_total = self.O_NUMBER.ocr(image)
+            cached_ocr = getattr(self, '_ocr_cached', None)
+            if callable(cached_ocr) and image is getattr(self.device, 'image', None):
+                tickets_current, _tickets_rest, tickets_total = cached_ocr(self.O_NUMBER)
+            else:
+                tickets_current, _tickets_rest, tickets_total = self.O_NUMBER.ocr(image)
         except Exception as error:  # noqa: BLE001
             logger.warning(f'Ticket OCR failed: {error}')
             tickets_current, tickets_total = -1, 30
@@ -536,13 +1169,17 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
             tickets_current, tickets_total = -1, 30
 
         try:
-            record_value = int(self.attack_record_ocr.ocr(image))
+            cached_ocr = getattr(self, '_ocr_cached', None)
+            if callable(cached_ocr) and image is getattr(self.device, 'image', None):
+                record_value = cached_ocr(self.attack_record_ocr)
+            else:
+                record_value = self.attack_record_ocr.ocr(image)
         except Exception as error:  # noqa: BLE001
             logger.warning(f'Attack record OCR failed: {error}')
-            record_value = -1
-        if record_value == 0:
-            attack_record = 0 if not broken else None
-        elif 1 <= record_value <= 9:
+            record_value = None
+        if record_value is None:
+            attack_record = None
+        elif 0 <= record_value <= 9:
             attack_record = record_value
         else:
             attack_record = None
@@ -561,36 +1198,176 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
             refresh_available=refresh_available,
             refresh_cd_seconds=refresh_cd_seconds,
             layout_signature=layout_signature,
+            level_source=level_source,
             captured_at=datetime.now(),
-            imputed=imputed,
         )
-        if snapshot.imputed:
-            logger.warning(
-                'Level OCR imputed only for broken cards: '
-                f'raw={list(raw_levels)}, resolved={list(snapshot.levels)}, '
-                f'imputed={sorted(snapshot.imputed)}, source={imputation_source}'
-            )
+        logger.info(
+            'REALM_RAID_BOARD_TIMING phase=snapshot '
+            f'totalMs={(time.perf_counter() - timing_started) * 1000:.1f} '
+            f'marksMs={marks_ms:.1f} layoutMs={layout_ms:.1f} '
+            f'levelOcrMs={level_ms:.1f} levelSource={level_source} '
+            f'cells={len(levels)}'
+        )
         logger.info(
             'Level board: '
             f'levels={list(snapshot.levels)}, current={snapshot.challenge_level}({snapshot.challenge_level_votes}), '
-            f'broken={sorted(snapshot.broken)}, imputed={sorted(snapshot.imputed)}, '
+            f'level_source={snapshot.level_source}, '
+            f'broken={sorted(snapshot.broken)}, '
             f'failed={sorted(snapshot.failure_marked)}, '
             f'record={snapshot.attack_record}, tickets={snapshot.tickets_current}/{snapshot.tickets_total}, '
             f'refresh={snapshot.refresh_available}, cd={snapshot.refresh_cd_seconds}'
         )
         return snapshot
 
+    @staticmethod
+    def _level_reward_overlay_heuristic(image) -> bool:
+        """Detect the dimmed 3/6/9 reward modal when its small template varies."""
+        if image is None or getattr(image, 'ndim', 0) != 3:
+            return False
+        height, width = image.shape[:2]
+        if width < 640 or height < 360:
+            return False
+
+        # The board is rendered at 1280x720. Scale the modal ROI for harmless
+        # compatibility with a resized capture while keeping the test cheap.
+        scale_x, scale_y = width / 1280, height / 720
+        x, y, w, h = (
+            round(450 * scale_x),
+            round(370 * scale_y),
+            round(380 * scale_x),
+            round(300 * scale_y),
+        )
+        roi = image[y:min(height, y + h), x:min(width, x + w)]
+        if roi.size == 0:
+            return False
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+        hsv = cv2.cvtColor(roi, cv2.COLOR_RGB2HSV)
+        hue, saturation, value = cv2.split(hsv)
+        warm = (
+            (hue <= 30)
+            & (saturation >= 70)
+            & (value >= 50)
+        )
+        cool = (
+            (hue >= 90)
+            & (hue <= 140)
+            & (saturation >= 70)
+            & (value >= 50)
+        )
+        # A ready board is bright in this region. The reward modal dims the
+        # board and adds a large colored reward object in the same area. The
+        # current client uses a blue object, while older clients used a
+        # red/orange one, so keep both signatures without lowering the global
+        # template threshold.
+        dimmed = float(gray.mean()) <= 105 and float((gray < 100).mean()) >= 0.55
+        return dimmed and (
+            float(warm.mean()) >= 0.12 or float(cool.mean()) >= 0.20
+        )
+
+    def level_reward_overlay_visible(self) -> bool:
+        """Return true for either the known reward template or its modal shape."""
+        if self.appear(self.I_SOUL_RAID, threshold=0.65):
+            return True
+        return self._level_reward_overlay_heuristic(self.device.image)
+
+    def dismiss_level_reward_overlay(self) -> None:
+        """Dismiss the modal without reusing a stale template click timer."""
+        template_clicked = self.appear_then_click(self.I_SOUL_RAID, threshold=0.65)
+        if template_clicked:
+            # The reward artwork can remain detectable after a tap that was
+            # accepted visually but did not advance the modal. Re-sample once
+            # before deciding that the template click was sufficient.
+            self.screenshot()
+            if not self.level_reward_overlay_visible():
+                return
+
+        image = self.device.image
+        height, width = image.shape[:2]
+        # Some client versions only respond to the visible bottom
+        # "tap-to-continue" area, while the reward artwork template can still
+        # match. Keep this deterministic and away from the refresh control.
+        x, y = width // 2, max(0, height - 45)
+        self.device.click(
+            x,
+            y,
+            control_name='REALM_RAID_REWARD_CONTINUE',
+        )
+        logger.info(f'RealmRaid reward continue fallback clicked at ({x},{y})')
+
     def wait_level_board(self, timeout: float = 25) -> bool:
         start = time.time()
+        timing_started = time.perf_counter()
+        reward_seen = False
+        reward_clear_since = None
+        reward_clicked = False
+        reward_click_at = 0.0
+        reward_attempts = 0
+        reward_logged = False
         while time.time() - start < timeout:
             self.screenshot()
-            if self.appear_then_click(self.I_SOUL_RAID, interval=1):
-                logger.info('Dismiss RealmRaid 3/6/9 reward')
+
+            # A slow preparation transition can leave us in real combat after
+            # GeneralBattle has returned false. Never interpret that combat frame
+            # as a RealmRaid reward modal and click its centre repeatedly.
+            is_in_real_battle = getattr(self, 'is_in_real_battle', None)
+            if is_in_real_battle is not None and is_in_real_battle(False):
+                logger.warning('RealmRaid board wait stopped: still in real battle')
+                logger.info(
+                    'REALM_RAID_BOARD_TIMING phase=wait result=real_battle '
+                    f'durationMs={(time.perf_counter() - timing_started) * 1000:.1f}'
+                )
+                return False
+
+            # The red back button remains visible behind the 3/6/9 reward overlay.
+            # Detect the overlay independently from the click cooldown so that a
+            # still-visible reward can never be mistaken for a ready board.
+            reward_visible = self.level_reward_overlay_visible()
+            if reward_visible:
+                reward_seen = True
+                reward_clear_since = None
+                if not reward_logged:
+                    logger.info('RealmRaid reward overlay detected; board OCR is blocked')
+                    reward_logged = True
+                if not reward_clicked or time.time() - reward_click_at >= 1.5:
+                    if reward_attempts >= 3:
+                        logger.warning(
+                            'RealmRaid reward overlay did not clear after 3 dismiss attempts'
+                        )
+                        return False
+                    self.dismiss_level_reward_overlay()
+                    reward_clicked = True
+                    reward_click_at = time.time()
+                    reward_attempts += 1
+                    logger.info('Dismiss RealmRaid 3/6/9 reward')
+                time.sleep(0.5)
                 continue
+
+            if reward_seen:
+                if reward_clear_since is None:
+                    reward_clear_since = time.time()
+                clear_duration = time.time() - reward_clear_since
+                if clear_duration < 1.0:
+                    time.sleep(min(0.5, 1.0 - clear_duration))
+                    continue
+                logger.info('RealmRaid reward overlay cleared; board is stable')
+                reward_seen = False
+                reward_clicked = False
+                reward_attempts = 0
+                reward_logged = False
+
             if self.appear(self.I_BACK_RED, threshold=0.7):
+                logger.info(
+                    'REALM_RAID_BOARD_TIMING phase=wait result=ready '
+                    f'durationMs={(time.perf_counter() - timing_started) * 1000:.1f}'
+                )
                 return True
             time.sleep(0.5)
         logger.warning(f'Wait RealmRaid board timeout after {timeout}s')
+        logger.info(
+            'REALM_RAID_BOARD_TIMING phase=wait result=timeout '
+            f'durationMs={(time.perf_counter() - timing_started) * 1000:.1f}'
+        )
         return False
 
     def observe_level_board(
@@ -598,27 +1375,89 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
         retries: int = 3,
         expected_level: int = 0,
         expected_board_signature: str = '',
+        pending_checkpoint: RealmRaidCheckpoint | None = None,
+        stable_reads: int = 2,
     ) -> BoardSnapshot | None:
+        _ = expected_level, expected_board_signature
         if not self.wait_level_board(timeout=20):
             return None
         last = None
-        for attempt in range(1, retries + 1):
+        stable_count = 0
+        self._last_level_observation = None
+        required_stable = max(1, int(stable_reads))
+        base_attempts = max(1, int(retries))
+        max_attempts = base_attempts
+        attempt = 0
+        while attempt < max_attempts:
+            attempt += 1
+            attempt_started = time.perf_counter()
             last = self.build_level_board_snapshot(
                 screenshot=True,
-                expected_level=expected_level,
-                expected_board_signature=expected_board_signature,
+                # A checkpoint is recovery metadata, never a replacement for
+                # the current nine OCR reads.  Reusing it here was the source
+                # of the single-frame level misread self-reinforcement loop.
+                level_cache=None,
             )
             if last.is_safe():
-                return last
-            logger.warning(f'Unsafe RealmRaid board evidence, retry {attempt}/{retries}')
+                logger.info(
+                    'REALM_RAID_BOARD_TIMING phase=observe '
+                    f'attempt={attempt} result=safe '
+                    f'durationMs={(time.perf_counter() - attempt_started) * 1000:.1f} '
+                    f'levelSource={last.level_source}'
+                )
+                if self._same_level_evidence(last, getattr(self, '_last_level_observation', None)):
+                    stable_count += 1
+                else:
+                    stable_count = 1
+                self._last_level_observation = last
+                if stable_count >= required_stable:
+                    return last
+                logger.info(
+                    f'Level board evidence stable {stable_count}/{required_stable}'
+                )
+                # A transient OCR frame can consume the base retry budget just
+                # before the first safe read. Reserve a short confirmation tail
+                # once a safe read arrives at the end of that budget.
+                if attempt >= max_attempts:
+                    max_attempts += required_stable - 1
+                time.sleep(0.8)
+                continue
+            stable_count = 0
+            self._last_level_observation = None
+            logger.warning(
+                f'Unsafe RealmRaid board evidence, retry {attempt}/{max_attempts}'
+            )
+            logger.info(
+                'REALM_RAID_BOARD_TIMING phase=observe '
+                f'attempt={attempt} result=unsafe '
+                f'durationMs={(time.perf_counter() - attempt_started) * 1000:.1f}'
+            )
             time.sleep(0.8)
         if last is not None:
             self.dump_board('unsafe')
-        return last
+        return last if last is not None and not last.is_safe() else None
+
+    @staticmethod
+    def _same_level_evidence(
+        current: BoardSnapshot,
+        previous: BoardSnapshot | None,
+    ) -> bool:
+        if previous is None:
+            return False
+        return (
+            current.levels == previous.levels
+            and current.challenge_level == previous.challenge_level
+            and current.challenge_level_votes == previous.challenge_level_votes
+            and current.broken == previous.broken
+            and current.failure_marked == previous.failure_marked
+            and current.attack_record == previous.attack_record
+            and current.tickets_current == previous.tickets_current
+        )
 
     def choose_level_target(self, snapshot: BoardSnapshot) -> int | None:
         attackable = sorted(snapshot.attackable)
         if not attackable:
+            self._level_target_image = None
             return None
 
         image = self.device.image.copy()
@@ -627,37 +1466,227 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
             image[y:y + h, x:x + w, ...] = 0
 
         target = self.order_medal.find_anyone(image)
+        if target is None:
+            # A transient reward/banner overlay can lower a valid medal row
+            # from 0.80 to around 0.78.  Retry only the configured medal
+            # templates at a bounded threshold before using a positional
+            # fallback; do not relax unrelated page recognition.
+            for candidate in self.order_medal.images:
+                if candidate.match(image, threshold=self.MEDAL_RELAXED_THRESHOLD):
+                    target = candidate
+                    logger.info(
+                        f'Medal order matched with relaxed threshold '
+                        f'{self.MEDAL_RELAXED_THRESHOLD:.2f}: {candidate.name}'
+                    )
+                    break
         if target:
             center = target.front_center()
             for index in attackable:
                 x, y, w, h = self.partition[index - 1].roi_front
                 if x < center[0] < x + w and y < center[1] < y + h:
+                    self._level_target_image = target
                     return index
+        self._level_target_image = None
         logger.warning(f'Medal order did not select a target; fallback to position {attackable[0]}')
         return attackable[0]
+
+    @staticmethod
+    def pending_snapshot_confirms_same_board(
+        checkpoint: RealmRaidCheckpoint,
+        snapshot: BoardSnapshot,
+    ) -> bool:
+        try:
+            pending = PendingAction(checkpoint.pending_action)
+        except ValueError:
+            return False
+
+        target = checkpoint.last_target
+        if pending == PendingAction.ATTACK:
+            auto_refreshed = (
+                checkpoint.pending_success_before >= 8
+                and snapshot.success_count == 0
+                and not snapshot.broken
+                and checkpoint.pending_tickets_before >= 0
+                and snapshot.tickets_current < checkpoint.pending_tickets_before
+            )
+            if auto_refreshed:
+                return False
+            return bool(
+                snapshot.success_count > checkpoint.pending_success_before
+                or (
+                    target in snapshot.broken
+                    and checkpoint.pending_tickets_before >= 0
+                    and snapshot.tickets_current < checkpoint.pending_tickets_before
+                )
+                or (
+                    checkpoint.pending_tickets_before >= 0
+                    and snapshot.tickets_current < checkpoint.pending_tickets_before
+                )
+                or (
+                    target
+                    and not checkpoint.pending_failure_marked_before
+                    and target in snapshot.failure_marked
+                )
+            )
+
+        if pending == PendingAction.SURRENDER:
+            return bool(
+                target
+                and not checkpoint.pending_failure_marked_before
+                and target in snapshot.failure_marked
+                and snapshot.tickets_current == checkpoint.pending_tickets_before
+            )
+        return False
+
+    @staticmethod
+    def level_attack_generation_changed(
+        before: BoardSnapshot,
+        after: BoardSnapshot,
+        won: bool,
+    ) -> bool:
+        """A confirmed defeat cannot trigger RealmRaid's automatic board refresh."""
+        if not won:
+            return False
+        return generation_changed(before, after)
 
     def recover_pending_level_action(
         self,
         checkpoint: RealmRaidCheckpoint,
         snapshot: BoardSnapshot,
         store: CheckpointStore,
-    ) -> None:
+    ) -> bool | None:
         try:
             pending = PendingAction(checkpoint.pending_action)
         except ValueError:
             pending = PendingAction.NONE
         if pending == PendingAction.NONE:
-            return
+            return None
+
+        # A ticket count increase is impossible within an in-flight attack or
+        # surrender. It proves that the checkpoint belongs to an earlier task
+        # run (for example, tickets were earned between retries), so keeping it
+        # would block the current board forever as an "ambiguous" action.
+        if (
+            pending in (PendingAction.ATTACK, PendingAction.SURRENDER)
+            and checkpoint.pending_tickets_before >= 0
+            and snapshot.tickets_current > checkpoint.pending_tickets_before
+        ):
+            logger.warning(
+                'Discard stale pending action after ticket count increased: '
+                f'{pending.value}, before={checkpoint.pending_tickets_before}, '
+                f'current={snapshot.tickets_current}'
+            )
+            store.clear()
+            return True
 
         target = checkpoint.last_target
         if pending == PendingAction.REFRESH:
+            if (
+                checkpoint.board_signature
+                and snapshot.board_signature
+                and checkpoint.board_signature != snapshot.board_signature
+                and snapshot.success_count == 0
+                and not snapshot.broken
+            ):
+                logger.warning('Recovered committed pending refresh: board generation changed')
+                store.clear()
+                return True
             checkpoint.pending_refresh = True
             store.save(checkpoint)
-            return
+            return True
+
+        if (
+            pending in (PendingAction.ATTACK, PendingAction.SURRENDER)
+            and checkpoint.pending_stage == 'selection'
+            and checkpoint.pending_tickets_before >= 0
+            and snapshot.tickets_current == checkpoint.pending_tickets_before
+            and checkpoint.board_signature == snapshot.board_signature
+            and target not in snapshot.broken
+        ):
+            # The action was persisted before target selection so a crash or
+            # failed medal/detail transition could be recovered safely.  No
+            # ticket, broken marker, or board generation changed here, so the
+            # battle cannot have committed; clear only the pre-battle marker
+            # and retry selection on this same board.
+            logger.warning(
+                'Recovered pre-battle pending action without board change: '
+                f'{pending.value}, target={target}; clear for safe replay'
+            )
+            checkpoint.remember_board(snapshot)
+            checkpoint.finish_action()
+            store.save(checkpoint)
+            return True
+
+        if (
+            pending == PendingAction.SURRENDER
+            and checkpoint.pending_failure_marked_before
+            and target in snapshot.failure_marked
+            and checkpoint.pending_tickets_before >= 0
+            and snapshot.tickets_current == checkpoint.pending_tickets_before
+        ):
+            # Repeated surrenders do not add another visible arrow.  If the
+            # process stopped between returning to the board and committing
+            # the checkpoint, the screen cannot prove whether that surrender
+            # happened.  Clear only the pending marker and replay it; an extra
+            # ticket-free surrender is safer than under-counting the hold/lower
+            # requirement or stopping on the same pending action forever.
+            logger.warning(
+                'Repeated surrender is visually ambiguous; clear pending '
+                'without counting it and replay safely'
+            )
+            checkpoint.remember_board(snapshot)
+            checkpoint.finish_action()
+            store.save(checkpoint)
+            return True
+
+        if (
+            pending == PendingAction.ATTACK
+            and checkpoint.pending_stage == 'battle'
+            and checkpoint.pending_failure_marked_before
+            and target in snapshot.failure_marked
+            and checkpoint.pending_tickets_before >= 0
+            and snapshot.tickets_current == checkpoint.pending_tickets_before
+            and checkpoint.board_signature == snapshot.board_signature
+        ):
+            # A failed attack does not consume a ticket. When the target's
+            # failure marker was already present and the same board returns
+            # with the same ticket count, there is no evidence of a committed
+            # win. Clear the stale marker and replay the attack instead of
+            # blocking every later run on an unverifiable battle.
+            logger.warning(
+                'Ambiguous failed attack is safe to replay; clear pending '
+                f'without counting it: target={target}'
+            )
+            checkpoint.remember_board(snapshot)
+            checkpoint.finish_action()
+            store.save(checkpoint)
+            return True
+
+        if (
+            pending == PendingAction.ATTACK
+            and checkpoint.pending_success_before >= 8
+            and snapshot.success_count == 0
+            and not snapshot.broken
+            and checkpoint.pending_tickets_before >= 0
+            and snapshot.tickets_current < checkpoint.pending_tickets_before
+        ):
+            logger.warning('Recovered ninth win followed by automatic board refresh')
+            store.clear()
+            return True
 
         committed = False
         if pending == PendingAction.ATTACK:
-            if snapshot.success_count > checkpoint.pending_success_before or target in snapshot.broken:
+            ticket_spent = (
+                checkpoint.pending_tickets_before >= 0
+                and snapshot.tickets_current < checkpoint.pending_tickets_before
+            )
+            if (
+                ticket_spent
+                and (
+                    snapshot.success_count > checkpoint.pending_success_before
+                    or target in snapshot.broken
+                )
+            ):
                 checkpoint.success_count = snapshot.success_count
                 committed = True
             elif (target and not checkpoint.pending_failure_marked_before
@@ -673,11 +1702,17 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
 
         if committed:
             logger.warning(f'Recovered committed pending action: {pending.value}, target={target}')
-        else:
-            logger.warning(f'Pending action has no conclusive evidence; it will be retried: '
-                           f'{pending.value}, target={target}')
-        checkpoint.finish_action()
+            checkpoint.remember_board(snapshot)
+            checkpoint.finish_action()
+            store.save(checkpoint)
+            return True
+
+        logger.warning(
+            'Pending action has no conclusive evidence; preserve it and stop: '
+            f'{pending.value}, target={target}'
+        )
         store.save(checkpoint)
+        return False
 
     def execute_level_surrender(
         self,
@@ -685,41 +1720,52 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
         checkpoint: RealmRaidCheckpoint,
         store: CheckpointStore,
         battle_config,
-    ) -> bool:
+    ) -> BoardSnapshot | None:
         target = self.choose_level_target(snapshot)
         if target is None:
             logger.warning('No attackable target for surrender')
-            return False
+            return None
 
         checkpoint.begin_action(PendingAction.SURRENDER, snapshot, target)
         store.save(checkpoint)
         logger.info(f'Level mode surrender: target={target}, failure={checkpoint.failure_count + 1}')
-        self.fire(target)
+        try:
+            self.fire(target)
+        except (GameStuckError, GameTooManyClickError):
+            if checkpoint.pending_stage == 'selection':
+                logger.warning(
+                    f'Clear pre-battle surrender pending after target selection failure: target={target}'
+                )
+                checkpoint.remember_board(snapshot)
+                checkpoint.finish_action()
+                store.save(checkpoint)
+            raise
+        checkpoint.pending_stage = 'battle'
+        store.save(checkpoint)
         action_ok = self.run_general_battle_back(battle_config, exit_four=True)
-        if not self.wait_level_board(timeout=25):
-            return False
         after = self.observe_level_board(
             expected_level=checkpoint.observed_level,
             expected_board_signature=checkpoint.board_signature,
+            pending_checkpoint=checkpoint,
         )
         if after is None or not after.is_safe():
-            return False
+            return None
         if after.tickets_current != snapshot.tickets_current:
             logger.warning('Surrender unexpectedly changed ticket count; stop without committing checkpoint')
             self.dump_board('surrender_ticket_changed')
-            return False
+            return None
+        self.retry_lock_after_battle(battle_config)
         if not action_ok and not (
             target not in snapshot.failure_marked and target in after.failure_marked
         ):
             logger.warning('Surrender result is ambiguous; keep pending action for recovery')
-            return False
+            return None
 
         checkpoint.failure_count += 1
-        checkpoint.success_count = after.success_count
-        checkpoint.board_signature = after.board_signature
+        checkpoint.remember_board(after)
         checkpoint.finish_action()
         store.save(checkpoint)
-        return True
+        return after
 
     def execute_level_attack(
         self,
@@ -727,27 +1773,46 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
         checkpoint: RealmRaidCheckpoint,
         store: CheckpointStore,
         battle_config,
-    ) -> bool:
+    ) -> BoardSnapshot | None:
         target = self.choose_level_target(snapshot)
         if target is None:
             logger.warning('No attackable target for attack')
-            return False
+            return None
 
         checkpoint.begin_action(PendingAction.ATTACK, snapshot, target)
         store.save(checkpoint)
         logger.info(f'Level mode attack: target={target}, success={snapshot.success_count}/9')
-        self.fire(target)
+        try:
+            self.fire(target)
+        except (GameStuckError, GameTooManyClickError):
+            if checkpoint.pending_stage == 'selection':
+                logger.warning(
+                    f'Clear pre-battle attack pending after target selection failure: target={target}'
+                )
+                checkpoint.remember_board(snapshot)
+                checkpoint.finish_action()
+                store.save(checkpoint)
+            raise
+        checkpoint.pending_stage = 'battle'
+        store.save(checkpoint)
         won = self.run_general_battle(battle_config)
-        if not self.wait_level_board(timeout=35):
-            return False
         after = self.observe_level_board(
             expected_level=checkpoint.observed_level,
             expected_board_signature=checkpoint.board_signature,
+            pending_checkpoint=checkpoint,
         )
         if after is None or not after.is_safe():
-            return False
+            return None
 
-        changed = generation_changed(snapshot, after)
+        self.retry_lock_after_battle(battle_config)
+
+        raw_generation_changed = generation_changed(snapshot, after)
+        changed = self.level_attack_generation_changed(snapshot, after, won)
+        if raw_generation_changed and not won:
+            logger.warning(
+                'Ignore board-signature drift after a confirmed defeat; '
+                'automatic refresh only follows the ninth win'
+            )
         if won:
             confirmed = (
                 changed
@@ -758,7 +1823,7 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
             if not confirmed:
                 logger.warning('Battle reported win but board/ticket evidence did not change')
                 self.dump_board('win_unconfirmed')
-                return False
+                return None
             logger.info(f'Level mode battle won: target={target}')
         else:
             checkpoint.failure_count += 1
@@ -772,22 +1837,37 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
             logger.info('RealmRaid board generation changed after battle')
             store.clear()
         else:
-            checkpoint.board_signature = after.board_signature
+            checkpoint.remember_board(after)
             store.save(checkpoint)
-        return True
+        return after
 
     def wait_level_generation_change(
         self,
         before: BoardSnapshot,
         timeout: float = 25,
+        level_cache: RealmRaidCheckpoint | None = None,
     ) -> BoardSnapshot | None:
         start = time.time()
+        previous = None
+        stable_count = 0
         while time.time() - start < timeout:
             if not self.wait_level_board(timeout=5):
                 continue
-            after = self.build_level_board_snapshot(screenshot=True)
+            after = self.build_level_board_snapshot(
+                screenshot=True,
+                level_cache=None,
+            )
             if after.is_safe() and generation_changed(before, after):
-                return after
+                if self._same_level_evidence(after, previous):
+                    stable_count += 1
+                else:
+                    stable_count = 1
+                previous = after
+                if stable_count >= 2:
+                    return after
+            else:
+                previous = None
+                stable_count = 0
             time.sleep(1)
         return None
 
@@ -796,24 +1876,46 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
         snapshot: BoardSnapshot,
         checkpoint: RealmRaidCheckpoint,
         store: CheckpointStore,
-    ) -> bool:
+    ) -> BoardSnapshot | None:
         checkpoint.begin_action(PendingAction.REFRESH, snapshot)
         checkpoint.pending_refresh = True
         store.save(checkpoint)
         if not self.check_refresh(screenshot=False):
             logger.info('Manual refresh is unavailable')
-            return False
+            return None
 
-        after = self.wait_level_generation_change(snapshot, timeout=25)
+        after = self.wait_level_generation_change(
+            snapshot,
+            timeout=25,
+            level_cache=checkpoint,
+        )
         if after is None:
             logger.warning('Manual refresh clicked but a new board was not confirmed')
             self.dump_board('refresh_unconfirmed')
-            return False
+            return None
         logger.info(f'Manual refresh confirmed: level {snapshot.challenge_level} -> {after.challenge_level}')
         store.clear()
-        return True
+        return after
 
-    def finish_level_mode(self, success: bool, target: datetime | None = None) -> None:
+    def finish_level_mode(
+        self,
+        success: bool,
+        target: datetime | None = None,
+        reason: str = '',
+    ) -> None:
+        manual_stop_reasons = {'test_paused', 'test_recovery_paused'}
+        deferred_reasons = {'refresh_cooldown'}
+        if success:
+            outcome = 'completed'
+        elif reason in manual_stop_reasons:
+            outcome = 'stopped'
+        elif reason in deferred_reasons:
+            outcome = 'deferred'
+        else:
+            outcome = 'failed'
+        logger.info(
+            f'Level mode exit: outcome={outcome}, reason={reason or "unspecified"}'
+        )
         try:
             self.ui_click(self.I_BACK_RED, self.I_CHECK_EXPLORATION)
             self.ui_get_current_page()
@@ -822,16 +1924,70 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
             logger.warning(f'Leave RealmRaid page failed; scheduler will recover next run: {error}')
         self.set_next_run(task='RealmRaid', success=success, finish=True,
                           server=target is None, target=target)
-        raise TaskEnd
+        statistics = {'level_mode_reason': reason or 'unspecified'}
+        if outcome == 'completed':
+            raise TaskEnd.completed(
+                'RealmRaid level mode completed',
+                statistics=statistics,
+                next_run=target,
+            )
+        if outcome == 'stopped':
+            raise TaskEnd.stopped(
+                'RealmRaid level mode stopped manually',
+                statistics=statistics,
+                next_run=target,
+            )
+        if outcome == 'deferred':
+            raise TaskEnd.deferred(
+                'RealmRaid level mode deferred',
+                statistics=statistics,
+                next_run=target,
+            )
+        raise TaskEnd.failed(
+            'RealmRaid level mode failed',
+            statistics=statistics,
+            next_run=target,
+        )
 
-    def finish_level_single_step(
+    @staticmethod
+    def level_short_retry_target(delay_seconds: int = 300) -> datetime:
+        """Retry recoverable target-level errors without waiting for the daily slot."""
+        return schedule_after_cooldown(
+            delay_seconds,
+            safety_buffer_seconds=0,
+        )
+
+    def confirm_level_auto_refresh(
+        self,
+        snapshot: BoardSnapshot,
+        checkpoint: RealmRaidCheckpoint,
+        store: CheckpointStore,
+    ) -> BoardSnapshot | None:
+        after = self.wait_level_generation_change(
+            snapshot,
+            timeout=25,
+            level_cache=checkpoint,
+        )
+        if after is None:
+            logger.warning('Ninth win did not produce a confirmed automatic refresh')
+            self.dump_board('auto_refresh_timeout')
+            return None
+        store.clear()
+        return after
+
+    def finish_level_test_step(
         self,
         config: RealmRaid,
         action: LevelAction,
         transaction_count: int,
         store: CheckpointStore,
     ) -> None:
-        if not config.level_mode_config.single_step or transaction_count < 1:
+        # Normal RealmRaid execution owns the whole ticket-draining workflow.
+        # Only the explicit development switch may pause after one committed action.
+        if not config.level_mode_config.single_step:
+            return
+        action_limit = self.level_action_limit(config)
+        if transaction_count < action_limit:
             return
         checkpoint = store.load()
         if checkpoint is None:
@@ -842,10 +1998,37 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
                 f'pending={checkpoint.pending_action}'
             )
         logger.info(
-            f'Level single-step complete: action={action.value}, {state}; '
-            'stop after one committed game action'
+            f'Level single-step paused: limit={action_limit}, '
+            f'action={action.value}, {state}'
         )
-        self.finish_level_mode(success=False)
+        self.finish_level_mode(success=False, reason='test_paused')
+
+    @staticmethod
+    def level_action_limit(config: RealmRaid) -> int | None:
+        if config.level_mode_config.single_step:
+            return 1
+        return None
+
+    @staticmethod
+    def level_transaction_safety_cap(config: RealmRaid) -> int:
+        """Fault guard only; normal completion is driven by tickets, not actions."""
+        return max(60, int(config.raid_config.number_attack) * 4)
+
+    @staticmethod
+    def level_ticket_stop_reason(
+        snapshot: BoardSnapshot,
+        config: RealmRaid,
+        tickets_at_start: int | None,
+    ) -> str:
+        reserve = max(0, int(config.raid_config.number_base))
+        if snapshot.tickets_current <= reserve:
+            return 'ticket_reserve_reached'
+        if tickets_at_start is None:
+            return ''
+        tickets_spent = max(0, tickets_at_start - snapshot.tickets_current)
+        if tickets_spent >= max(1, int(config.raid_config.number_attack)):
+            return 'ticket_spend_limit_reached'
+        return ''
 
     def run_level_mode(self, config: RealmRaid) -> None:
         account = getattr(self.config, 'config_name', 'default')
@@ -853,16 +2036,67 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
         store = CheckpointStore(account)
         checkpoint = store.load()
         transaction_count = 0
-        max_transactions = max(40, config.raid_config.number_attack + 20)
+        tickets_at_start = None
+        snapshot = None
+        max_transactions = self.level_transaction_safety_cap(config)
+        action_limit = self.level_action_limit(config)
+        logger.info(
+            'Level execution policy: '
+            f'single_step={config.level_mode_config.single_step}, '
+            f'action_limit={action_limit}, safety_cap={max_transactions}, '
+            f'ticket_spend_limit={config.raid_config.number_attack}, '
+            f'ticket_reserve={config.raid_config.number_base}'
+        )
 
-        while transaction_count < max_transactions:
-            snapshot = self.observe_level_board(
-                expected_level=checkpoint.observed_level if checkpoint else 0,
-                expected_board_signature=checkpoint.board_signature if checkpoint else '',
-            )
+        while True:
+            if snapshot is None:
+                snapshot = self.observe_level_board(
+                    expected_level=checkpoint.observed_level if checkpoint else 0,
+                    expected_board_signature=checkpoint.board_signature if checkpoint else '',
+                    pending_checkpoint=checkpoint,
+                )
             if snapshot is None or not snapshot.is_safe():
                 logger.warning('Target level mode stopped: board evidence is unsafe')
-                self.finish_level_mode(success=False)
+                self.finish_level_mode(
+                    success=False,
+                    target=self.level_short_retry_target(),
+                    reason='board_evidence_unsafe',
+                )
+
+            recovered = None
+            if checkpoint is not None:
+                recovered = self.recover_pending_level_action(checkpoint, snapshot, store)
+            if recovered is False:
+                self.finish_level_mode(
+                    success=False,
+                    target=self.level_short_retry_target(),
+                    reason='pending_action_ambiguous',
+                )
+            if recovered is True:
+                checkpoint = store.load()
+                recovery_committed = (
+                    checkpoint is None
+                    or checkpoint.pending_action == PendingAction.NONE.value
+                )
+                if config.level_mode_config.single_step and recovery_committed:
+                    logger.info('Level single-step complete: recovered pending action; stop')
+                    self.finish_level_mode(success=False, reason='test_recovery_paused')
+
+            if tickets_at_start is None:
+                tickets_at_start = snapshot.tickets_current
+            stop_reason = self.level_ticket_stop_reason(
+                snapshot,
+                config,
+                tickets_at_start,
+            )
+            if stop_reason:
+                tickets_spent = max(0, tickets_at_start - snapshot.tickets_current)
+                logger.info(
+                    'Target level mode ticket budget complete: '
+                    f'reason={stop_reason}, tickets={snapshot.tickets_current}, '
+                    f'spent={tickets_spent}'
+                )
+                self.finish_level_mode(success=True, reason=stop_reason)
 
             checkpoint = reconcile_checkpoint(
                 account=account,
@@ -870,7 +2104,6 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
                 target_level=target_level,
                 checkpoint=checkpoint,
             )
-            self.recover_pending_level_action(checkpoint, snapshot, store)
             store.save(checkpoint)
             decision = decide_next_action(snapshot, checkpoint)
             logger.info(
@@ -878,54 +2111,115 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
                 f'failure={decision.failure_count}, success={decision.success_count}, reason={decision.reason}'
             )
 
+            if decision.action == LevelAction.STOP:
+                logger.info('Target level mode finished: no RealmRaid tickets')
+                self.finish_level_mode(success=True, reason='no_tickets')
+
+            if (
+                transaction_count >= max_transactions
+                and decision.action in {
+                    LevelAction.SURRENDER,
+                    LevelAction.ATTACK,
+                    LevelAction.REFRESH,
+                }
+            ):
+                logger.warning(
+                    'Target level mode reached the abnormal transaction safety cap: '
+                    f'{max_transactions}'
+                )
+                self.finish_level_mode(
+                    success=False,
+                    target=self.level_short_retry_target(),
+                    reason='transaction_safety_cap',
+                )
+
             if decision.action == LevelAction.SURRENDER:
-                if not self.execute_level_surrender(
+                after = self.execute_level_surrender(
                     snapshot, checkpoint, store, config.general_battle_config
-                ):
-                    self.finish_level_mode(success=False)
+                )
+                if after is None:
+                    self.finish_level_mode(
+                        success=False,
+                        target=self.level_short_retry_target(),
+                        reason='surrender_unconfirmed',
+                    )
+                snapshot = after
                 transaction_count += 1
-                self.finish_level_single_step(
+                self.finish_level_test_step(
                     config, decision.action, transaction_count, store
                 )
                 continue
 
             if decision.action == LevelAction.ATTACK:
-                if self.current_count >= config.raid_config.number_attack:
-                    logger.warning(f'Level mode reached attack safety cap: {self.current_count}')
-                    self.finish_level_mode(success=False)
-                if not self.execute_level_attack(
+                after = self.execute_level_attack(
                     snapshot, checkpoint, store, config.general_battle_config
-                ):
-                    self.finish_level_mode(success=False)
+                )
+                if after is None:
+                    self.finish_level_mode(
+                        success=False,
+                        target=self.level_short_retry_target(),
+                        reason='attack_unconfirmed',
+                    )
+                snapshot = after
                 transaction_count += 1
                 checkpoint = store.load()
-                self.finish_level_single_step(
+                if (
+                    checkpoint is not None
+                    and decide_next_action(snapshot, checkpoint).action
+                    == LevelAction.WAIT_AUTO_REFRESH
+                ):
+                    after_refresh = self.confirm_level_auto_refresh(
+                        snapshot,
+                        checkpoint,
+                        store,
+                    )
+                    if after_refresh is None:
+                        self.finish_level_mode(
+                            success=False,
+                            target=self.level_short_retry_target(),
+                            reason='auto_refresh_unconfirmed',
+                        )
+                    snapshot = after_refresh
+                    checkpoint = None
+                self.finish_level_test_step(
                     config, decision.action, transaction_count, store
                 )
                 continue
 
             if decision.action == LevelAction.REFRESH:
-                if self.execute_level_refresh(snapshot, checkpoint, store):
+                after = self.execute_level_refresh(snapshot, checkpoint, store)
+                if after is not None:
+                    snapshot = after
                     transaction_count += 1
                     checkpoint = None
-                    self.finish_level_single_step(
+                    self.finish_level_test_step(
                         config, decision.action, transaction_count, store
                     )
                     continue
                 refreshed = self.build_level_board_snapshot(screenshot=True)
                 if refreshed.refresh_available:
-                    self.finish_level_mode(success=False)
+                    self.finish_level_mode(
+                        success=False,
+                        target=self.level_short_retry_target(),
+                        reason='manual_refresh_unconfirmed',
+                    )
                 snapshot = refreshed
                 decision = decide_next_action(snapshot, checkpoint)
 
             if decision.action == LevelAction.WAIT_AUTO_REFRESH:
-                after = self.wait_level_generation_change(snapshot, timeout=25)
+                after = self.confirm_level_auto_refresh(
+                    snapshot,
+                    checkpoint,
+                    store,
+                )
                 if after is None:
-                    logger.warning('Ninth win did not produce a confirmed automatic refresh')
-                    self.dump_board('auto_refresh_timeout')
-                    self.finish_level_mode(success=False)
-                store.clear()
+                    self.finish_level_mode(
+                        success=False,
+                        target=self.level_short_retry_target(),
+                        reason='auto_refresh_unconfirmed',
+                    )
                 checkpoint = None
+                snapshot = after
                 continue
 
             if decision.action == LevelAction.WAIT_COOLDOWN:
@@ -939,25 +2233,19 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
                 checkpoint.finish_action()
                 store.save(checkpoint)
                 logger.info(f'RealmRaid refresh cooling down; next run at {due.isoformat(timespec="seconds")}')
-                self.finish_level_mode(success=False, target=due)
-
-            if decision.action == LevelAction.STOP:
-                logger.info('Target level mode finished: no RealmRaid tickets')
-                self.finish_level_mode(success=True)
+                self.finish_level_mode(
+                    success=False,
+                    target=due,
+                    reason='refresh_cooldown',
+                )
 
             logger.warning(f'Target level mode stopped on unsafe action: {decision.action}')
             self.dump_board('level_mode_unsafe')
-            self.finish_level_mode(success=False)
-
-        logger.warning(f'Target level mode reached transaction safety cap: {max_transactions}')
-        self.finish_level_mode(success=False)
-
-
-
-
-
-
-
+            self.finish_level_mode(
+                success=False,
+                target=self.level_short_retry_target(),
+                reason='unsafe_action',
+            )
 
     # ----------------------------------------------------------------------------------------------------------------------
     # 2023.7.21 改版个人突破
@@ -972,11 +2260,11 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
         界面还显示「运行中」，日志却停在「Page arrived page_realm_raid」之后再无一行，
         用户完全看不出发生了什么（这正是 2026-07-27 复现的现象）。
 
-        现在改为：限时轮询 + 明确日志；超时就跳过「锁定阵容」这一步继续跑，
-        绝不再把整个任务吞掉。锁定状态不对顶多是阵容没锁，远好过永久卡死。
+        现在改为：限时轮询 + 明确日志；超时返回 False，由上层暂停本次任务并短重试，
+        不在阵容状态未知时继续消耗突破券。
         :param lock_team_enable: True 需要锁定阵容，False 需要解除锁定
         :param timeout: 最长尝试秒数
-        :return: True 表示达成目标状态；False 表示超时跳过
+        :return: True 表示达成目标状态；False 表示状态未知，需要上层暂停
         """
         start = time.time()
         want = 'lock' if lock_team_enable else 'unlock'
@@ -1008,8 +2296,37 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
                     logger.info(f'Team unlocked ({self.I_UNLOCK.name})')
                     return True
         logger.warning(f'Ensure team {want} timeout after {timeout}s: '
-                       f'识别不到锁定/未锁定图标，跳过这一步继续执行本任务。'
-                       f'（若阵容锁定状态不符合预期，请检查游戏内该图标是否被活动 UI 遮挡）')
+                       f'识别不到锁定/未锁定图标，交由上层暂停并短重试。'
+                       f'（请检查游戏内该图标是否被活动 UI 遮挡）')
+        # Keep the exact frame used by the final match attempt.  This is
+        # diagnostic-only: it does not click, alter state, or affect retry
+        # scheduling, and lets us distinguish a stale/wrong page from a
+        # template or threshold mismatch.
+        self.dump_board('lock_timeout')
+        try:
+            diagnostics = []
+            for label, target in (
+                ('lock', self.I_LOCK),
+                ('unlock', self.I_UNLOCK),
+                ('lock_2', self.I_LOCK_2),
+                ('unlock_2', self.I_UNLOCK_2),
+            ):
+                target.load_image()
+                source = target.corp(self.device.image)
+                template = target.image
+                if template is None or source.size == 0:
+                    score = 'unavailable'
+                else:
+                    result = cv2.matchTemplate(source, template, cv2.TM_CCOEFF_NORMED)
+                    score = f'{cv2.minMaxLoc(result)[1]:.4f}'
+                diagnostics.append(f'{label}={score}@{tuple(target.roi_back)}')
+            logger.info(
+                'RealmRaid lock match diagnostics: '
+                f'shape={getattr(self.device.image, "shape", None)}, '
+                + ', '.join(diagnostics)
+            )
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f'RealmRaid lock match diagnostics failed: {error}')
         return False
 
     def is_frog(self, screenshot: bool=True) -> bool:
@@ -1106,17 +2423,41 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
                                       keyword='', name=f'level_{row * 3 + col + 1}'))
         return rules
 
-    def read_levels(self, image=None) -> list:
+    @cached_property
+    def broken_level_ocr(self) -> list:
+        rules = []
+        for row, y in enumerate(self.LEVEL_ROI_Y):
+            for col, x in enumerate(self.LEVEL_ROI_X):
+                roi = (x, y, self.LEVEL_ROI_W, self.LEVEL_ROI_H)
+                rules.append(BrokenLevelOcr(
+                    roi=roi,
+                    area=roi,
+                    mode='Digit',
+                    method='Default',
+                    keyword='',
+                    name=f'broken_level_{row * 3 + col + 1}',
+                ))
+        return rules
+
+    def read_levels(self, image=None, broken=()) -> list:
         """读出九个位次的等级。读不到 / 明显不合理的位置返回 0（后续一律不参与判断）。
 
         单纯读数，不点击、不改变任何状态，所以可以安全地在任何时候调用。
         """
         if image is None:
             image = self.device.image
+        broken = set(broken)
         levels = []
-        for rule in self.level_ocr:
+        started_at = time.perf_counter()
+        cached_ocr = getattr(self, '_ocr_cached', None)
+        use_cached_ocr = callable(cached_ocr) and image is getattr(self.device, 'image', None)
+        for index, normal_rule in enumerate(self.level_ocr, start=1):
+            rule = self.broken_level_ocr[index - 1] if index in broken else normal_rule
             try:
-                value = rule.ocr(image)
+                if use_cached_ocr:
+                    value = cached_ocr(rule)
+                else:
+                    value = rule.ocr(image)
                 value = int(value) if value else 0
             except Exception:  # noqa: BLE001
                 value = 0
@@ -1126,6 +2467,12 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
                 logger.warning(f'{rule.name} 读到不合理的等级 {value}，按未识别处理')
                 value = 0
             levels.append(value)
+        logger.info(
+            'REALM_RAID_BOARD_TIMING phase=level_ocr '
+            f'durationMs={(time.perf_counter() - started_at) * 1000:.1f} '
+            f'calls={len(self.level_ocr)} brokenFallbacks={len(broken)} '
+            f'valid={sum(1 for value in levels if value)}'
+        )
         return levels
 
     def log_levels(self, image=None) -> list:
@@ -1276,6 +2623,109 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
             return True
         return False
 
+    def _dismiss_battle_result_continue(
+        self,
+        timeout: float = 5.0,
+        max_clicks: int = 3,
+        allow_task_reward: bool = True,
+    ) -> bool:
+        """Consume the normal battle result before checking board rewards.
+
+        A red board-exit marker can remain visible behind a normal result
+        overlay.  Treating that combination as a milestone reward caused the
+        generic result prompt to be skipped and the board waiter to click the
+        same result page repeatedly.  The board waiter owns 3/6/9 rewards
+        after this method returns.
+        """
+        # A preparation page can also contain the reward artwork at the fixed
+        # ROI.  Leave it to ``battle_before`` so the prepare button is clicked
+        # before any result/reward handling is attempted.
+        prepare_check = getattr(self, 'is_in_prepare', None)
+        if callable(prepare_check) and prepare_check(False):
+            logger.info('RealmRaid result detector skipped on battle prepare page')
+            return False
+
+        # The generic result prompt can render the same reward artwork behind
+        # it. Let GeneralBattle consume that prompt first; the board waiter
+        # owns the 3/6/9 modal after the result page has actually been left.
+        # A milestone modal is the exception: it is already on the board, so
+        # its own tap-to-continue prompt must not be sent through the generic
+        # bounded result click loop.
+        if allow_task_reward and self._realm_raid_board_reward_context():
+            logger.info(
+                'RealmRaid board reward overlay owns continuation handling'
+            )
+            return self._dismiss_realm_raid_board_reward(timeout)
+
+        try:
+            if super()._dismiss_battle_result_continue(
+                timeout=timeout,
+                max_clicks=max_clicks,
+                allow_task_reward=allow_task_reward,
+            ):
+                return True
+        except GameStuckError:
+            # The board reward modal can appear during the generic result
+            # sequence, after its first screenshot did not expose the board
+            # close anchor. Re-check the task-specific context before
+            # propagating the bounded generic failure.
+            if allow_task_reward and self._realm_raid_board_reward_context():
+                logger.info(
+                    'RealmRaid board reward overlay appeared during '
+                    'generic result handling'
+                )
+                return self._dismiss_realm_raid_board_reward(timeout)
+            raise
+
+        if not allow_task_reward:
+            logger.info(
+                'RealmRaid task reward fallback skipped: '
+                'context=preflight'
+            )
+            return False
+
+        if self._realm_raid_board_reward_context():
+            logger.info(
+                'RealmRaid board reward overlay owns continuation handling'
+            )
+            return self._dismiss_realm_raid_board_reward(timeout)
+        return False
+
+    def _realm_raid_board_reward_context(self) -> bool:
+        """Require board context before consuming a milestone reward modal."""
+        if not self.appear(self.I_BACK_RED, threshold=0.7):
+            logger.info(
+                'RealmRaid task reward fallback skipped: board_exit_not_visible'
+            )
+            return False
+        is_in_real_battle = getattr(self, 'is_in_real_battle', None)
+        if callable(is_in_real_battle) and is_in_real_battle(False):
+            logger.info(
+                'RealmRaid task reward fallback skipped: real_battle'
+            )
+            return False
+        return self.level_reward_overlay_visible()
+
+    def _dismiss_realm_raid_board_reward(self, timeout: float = 5.0) -> bool:
+        """Dismiss one board reward modal and confirm that it cleared."""
+        logger.info(
+            'RealmRaid milestone reward overlay detected; '
+            'dismiss with the RealmRaid reward handler'
+        )
+        self.dismiss_level_reward_overlay()
+        deadline = time.monotonic() + min(float(timeout), 3.0)
+        while time.monotonic() < deadline:
+            time.sleep(0.2)
+            self.screenshot()
+            if not self.level_reward_overlay_visible():
+                logger.info('RealmRaid milestone reward overlay cleared')
+                return True
+        logger.warning(
+            'RealmRaid milestone reward overlay remained visible after '
+            'the bounded dismiss attempt'
+        )
+        return False
+
     def reward_detect_click(self, screenshot: bool=True) -> bool:
         """
         检测是否出现 每三次就有奖励的界面, 有就领取
@@ -1289,13 +2739,24 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
         # 识别突破卷区域，如果识别到了且其中含有文字，即有聊天框遮挡则进入循环，等待三胜奖励出现并点击，循环退出条件为识别到票（即*/*的形式）
         if text != "":
             if re.search(r'[\u4e00-\u9fff]', text):
-                while 1:
+                deadline = time.time() + 15
+                reward_clicked = False
+                reward_click_at = 0.0
+                while time.time() < deadline:
                     self.screenshot()
                     result = self.O_TEXT.ocr(self.device.image)
                     if not re.search(r'[\u4e00-\u9fff]', result) and re.search(r'(\d+)/(\d+)', result):
                         return True
-                    if self.appear_then_click(self.I_SOUL_RAID, interval=1.5):
+                    if self.level_reward_overlay_visible() and (
+                        not reward_clicked or time.time() - reward_click_at >= 1.5
+                    ):
+                        self.dismiss_level_reward_overlay()
+                        reward_clicked = True
+                        reward_click_at = time.time()
                         continue
+                    time.sleep(0.3)
+                logger.warning('RealmRaid reward/chat overlay did not clear within 15s')
+                return False
 
         # if self.appear(self.I_SOUL_RAID):
         #     self.screenshot()
@@ -1345,14 +2806,22 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
         logger.warning('Refresh: 确认弹窗 15s 内没有消失，按已刷新继续')
         return True
 
-    def fire(self, order: int):
+    def fire(self, order: int, timeout: float = 25.0) -> bool:
         """
         挑战
         :param order:  第几个
         :return:
         """
         retry_clean = 0
-        while not self.appear(self.I_RR_PERSON):
+        deadline = time.monotonic() + max(1.0, float(timeout))
+        # I_RR_PERSON is the board's right-side tab in the current client.  It
+        # is not a reliable signal that a target detail card is open.  Only
+        # clear a refresh popup here; target selection is handled below.
+        while self.appear(self.I_FRESH_ENSURE) and time.monotonic() < deadline:
+            if time.monotonic() >= deadline:
+                raise GameStuckError(
+                    f'RealmRaid person page did not appear within {timeout:.1f}s'
+                )
             # 【二开修复 handoff/20】原来这里只打一条 warning 就继续 while，等于永远出不去：
             # 一旦「个人」标题识别不到，就会一直点屏幕顶部并无限重试，日志刷屏却永不结束。
             # 现在超过上限就抛 GameStuckError，交给 OAS 自己的异常处理（保存截图 / 重启流程）。
@@ -1379,10 +2848,11 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
             self.screenshot()
             retry_clean += 1
         
-        click = self.partition[order - 1]
-        
+        click_candidates = self._realm_raid_partition_targets(order)
+        retry_clean = 0
+
         # 进攻循环
-        while 1:
+        while time.monotonic() < deadline:
             self.screenshot()
             
             # 双重保险：如果在进攻阶段又弹出了窗口，也把它关掉
@@ -1392,15 +2862,56 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
                 time.sleep(1.0)
                 continue
 
-            if not self.appear(self.I_RR_PERSON, threshold=0.8):
-                break
-                
-            if self.appear_then_click(self.I_FIRE, interval=1):
-                continue
+            if self._click_realm_raid_fire(interval=1):
+                transition_deadline = min(deadline, time.monotonic() + 4.0)
+                while time.monotonic() < transition_deadline:
+                    self.screenshot()
+                    if not self._realm_raid_fire_visible():
+                        logger.info(f'RealmRaid attack transition confirmed: target={order}')
+                        logger.info(f'Click fire {order} success')
+                        return True
+                    time.sleep(0.2)
+                self.dump_board(f'target_{order}_fire_still_visible')
+                raise GameStuckError(
+                    f'RealmRaid attack target {order} attack button remained visible '
+                    'after click'
+                )
+
+            if retry_clean >= len(click_candidates):
+                logger.error(
+                    'RealmRaid target selection did not expose the attack button: '
+                    f'target={order}, attempts={retry_clean}, '
+                    f'candidates={len(click_candidates)}'
+                )
+                self.dump_board(f'target_{order}_fire_not_found')
+                raise GameStuckError(
+                    f'RealmRaid target {order} did not expose the attack button '
+                    f'after {retry_clean} bounded selection attempts'
+                )
+
+            click = click_candidates[retry_clean]
             if self.click(click, interval=1.8):
+                retry_clean += 1
+                logger.info(
+                    f'RealmRaid target probe: target={order}, '
+                    f'candidate={click.name}, attempt={retry_clean}/'
+                    f'{len(click_candidates)}'
+                )
+                # Each candidate has a distinct name, so BaseTask's per-rule
+                # interval timer cannot enforce a settle delay across the
+                # candidate list.  Give the selected-card overlay time to
+                # reveal the attack button before probing another area.
+                if retry_clean < len(click_candidates):
+                    settle = min(0.7, max(0.0, deadline - time.monotonic()))
+                    if settle > 0:
+                        time.sleep(settle)
                 continue
-                
-        logger.info(f'Click fire {order} success')
+            time.sleep(0.2)
+
+        raise GameStuckError(
+            f'RealmRaid attack target {order} did not expose the attack button '
+            f'within {timeout:.1f}s'
+        )
 
     @cached_property
     def false_roi(self) -> list:

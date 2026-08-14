@@ -15,6 +15,10 @@ class CoreError(RuntimeError):
     pass
 
 
+class CoreConflict(CoreError):
+    pass
+
+
 class OasCoreClient:
     """OAS Core 的 HTTP 客户端。
 
@@ -43,6 +47,8 @@ class OasCoreClient:
             raise CoreUnavailable(f"OAS Core 不可用: {self.base_url}") from exc
         if response.status_code >= 400:
             detail = response.text[:500]
+            if response.status_code == 409:
+                raise CoreConflict(f"OAS Core revision conflict: {detail}")
             raise CoreError(f"OAS Core 返回 {response.status_code}: {detail}")
         if not response.content:
             return None
@@ -130,10 +136,14 @@ class OasCoreClient:
             # 99 天以内放行；三位数无法表达，明确拒绝而非静默截断。（handoff/16 C1）
             if days > 99:
                 raise CoreError(f"{group}.{name}：时间间隔最多支持 99 天（收到 {days} 天）")
+        # DeepSeek-13 2.2 (F-9): send the current config revision so Core can
+        # reject stale single-value writes (428 missing / 409 conflict).
+        revision = await self.config_revision(account_id)
         response = await self._request(
             "PUT",
             f"/{account}/{task}/{group_path}/{name_path}/value",
             params={"types": value_type, "value": normalized},
+            headers={"If-Match": revision},
         )
         # Core 的 script_set_arg 在 pydantic 校验失败（如枚举值不合法、字段不存在）时
         # 返回 false 且 HTTP 200。不检查的话保存会"假成功"：界面提示已保存，
@@ -142,11 +152,64 @@ class OasCoreClient:
             raise CoreError(f"OAS Core 拒绝了 {group}.{name} 的值（返回 false），请检查取值是否在允许范围内")
         return response
 
-    async def start_script(self, account_id: str) -> Any:
-        """Core 的 REST 启动入口，作为 WebSocket 命令的兜底。"""
-        return await self._request("GET", f"/{quote(account_id, safe='')}/start")
+    async def config_revision(self, account_id: str) -> str:
+        result = await self._request(
+            "GET",
+            f"/{quote(account_id, safe='')}/config/revision",
+        )
+        return str((result or {}).get("revision") or "")
 
-    async def stop_script(self, account_id: str) -> Any:
+    async def patch_values(
+        self,
+        account_id: str,
+        task_id: str,
+        fields: list[dict[str, Any]],
+        expected_revision: str,
+    ) -> dict[str, Any]:
+        normalized = []
+        for field in fields:
+            value_type = str(field.get("type") or "string")
+            normalized_value = self.normalize_value(field.get("value"), value_type)
+            if value_type == "time_delta":
+                try:
+                    days = int(normalized_value.split(" ", 1)[0])
+                except (ValueError, IndexError):
+                    days = 0
+                if days > 99:
+                    raise CoreError(
+                        f"{field['group']}.{field['name']}：时间间隔最多支持 99 天（收到 {days} 天）"
+                    )
+            normalized.append({
+                "group": field["group"],
+                "name": field["name"],
+                "value": normalized_value,
+                "type": value_type,
+            })
+        result = await self._request(
+            "PATCH",
+            f"/{quote(account_id, safe='')}/{quote(task_id, safe='')}/values",
+            json={
+                "expected_revision": expected_revision,
+                "fields": normalized,
+            },
+        )
+        if not isinstance(result, dict) or not result.get("saved", False):
+            raise CoreError("OAS Core did not confirm atomic config save")
+        return result
+
+    async def start_script(self, account_id: str, command_id: str | None = None) -> Any:
+        """Core 的 REST 启动入口，作为 WebSocket 命令的兜底。
+
+        DeepSeek-14 B1/A1: carries the SAME command_id as the WS attempt so
+        Core's command ledger can replay instead of executing twice."""
+        params = {"command_id": command_id} if command_id else None
+        return await self._request(
+            "GET", f"/{quote(account_id, safe='')}/start", params=params)
+
+    async def stop_script(self, account_id: str, command_id: str | None = None) -> Any:
+        params = {"command_id": command_id} if command_id else None
+        return await self._request(
+            "GET", f"/{quote(account_id, safe='')}/stop", params=params)
         return await self._request("GET", f"/{quote(account_id, safe='')}/stop")
 
     async def copy_account(self, account_id: str, template: str = "template") -> Any:

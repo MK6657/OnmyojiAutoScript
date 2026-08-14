@@ -21,12 +21,17 @@ class ReplaceShikigami(BaseTask, ReplaceShikigamiAssets):
             self.screenshot()
         return self.appear(self.I_RS_RECORDS_SHIKI, interval=0.5)
 
-    def switch_shikigami_class(self, shikigami_class: ShikigamiClass = ShikigamiClass.N):
+    def switch_shikigami_class(
+            self,
+            shikigami_class: ShikigamiClass = ShikigamiClass.N,
+            fallback_click=None,
+    ):
         """
         要求在式神育成的界面
         切换分类
         :param shikigami_class:
         :param shikigami_order:
+        :param fallback_click: optional fixed-area click for a known skin variant
         :return:
         """
         match_selected = {ShikigamiClass.MATERIAL: self.I_RS_MATERIAL_SELECTED,
@@ -45,6 +50,7 @@ class ReplaceShikigami(BaseTask, ReplaceShikigamiAssets):
                        ShikigamiClass.UR: self.I_RS_UR}
         check_selected = match_selected[shikigami_class]
         check_click = match_click[shikigami_class]
+        fallback_attempts = 0
         # 选择式神的种类
         while 1:
             self.screenshot()
@@ -59,10 +65,27 @@ class ReplaceShikigami(BaseTask, ReplaceShikigamiAssets):
                     break
                 self.click(check_click, interval=2)
                 continue
+            if fallback_click is not None:
+                fallback_attempts += 1
+                if fallback_attempts >= 1:
+                    # The current skin needs two actions: open the category fan, then
+                    # select 素材. Keep both clicks bounded and run them once.
+                    self.wait_animate_stable(rule=self.C_SHIKIGAMI_SWITCH_1, interval=0.8)
+                    self.click(self.C_SHIKIGAMI_CATEGORY_ALL)
+                    time.sleep(0.4)
+                    self.screenshot()
+                    self.click(fallback_click)
+                    logger.warning(
+                        'Shikigami class template not detected; opened category fan and '
+                        'used fallback click for %s',
+                        shikigami_class,
+                    )
+                    return True
             self.wait_animate_stable(rule=self.C_SHIKIGAMI_SWITCH_1, interval=0.8)
             if self.click(self.C_SHIKIGAMI_SWITCH_1, interval=3.5):
                 continue
         logger.info('Select shikigami class: %s' % shikigami_class)
+        return True
 
     def unset_shikigami_max_lv(self):
         """

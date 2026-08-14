@@ -35,7 +35,7 @@ class ScriptTask(GameUi, GeneralBattle, SwitchSoul, DuelAssets, SwitchOnmyoji):
         current_time = datetime.now().time()
         if not (time(12, 00) <= current_time < time(23, 00)):
             self.set_next_run(task='Duel', success=True, finish=False)
-            raise TaskEnd('Duel')
+            raise TaskEnd.completed('Duel')
         self.conf = self.config.duel
         limit_time = self.conf.duel_config.limit_time
         self.limit_time: timedelta = timedelta(hours=limit_time.hour, minutes=limit_time.minute,
@@ -55,7 +55,7 @@ class ScriptTask(GameUi, GeneralBattle, SwitchSoul, DuelAssets, SwitchOnmyoji):
         self.ui_goto_page(page_main)
         # 调起花合战
         self.set_next_run(task='TalismanPass', target=datetime.now())
-        raise TaskEnd('Duel')
+        raise TaskEnd.completed('Duel')
 
     def prepare_duel(self):
         """斗技准备工作(切换御魂or阴阳师...), 最后回到斗技主界面"""

@@ -21,7 +21,9 @@ class ScriptTask(GameUi):
         run_days = sorted({day for day in map(int, re.findall(r'\d+', monitor_config.run_days)) if 1 <= day <= 7})
         if not run_days:
             logger.warning(f"运行日期配置无效: {monitor_config.run_days}，跳过 GuildActivityMonitor")
-            raise TaskEnd('GuildActivityMonitor')
+            # DeepSeek-13 1.5 (F-2): invalid run_days is a configuration failure;
+            # INCREMENT governance prevents the completed->RESET hot loop.
+            raise TaskEnd.failed('GuildActivityMonitor run_days config invalid')
 
         in_run_days = today in run_days
         candidate_days = [day for day in run_days if day != today] if in_run_days else run_days
@@ -36,7 +38,7 @@ class ScriptTask(GameUi):
         logger.info(f"今天是周{today}，{status}配置运行日期({monitor_config.run_days})内，"f"{action}，下次运行时间: {next_target}")
         self.set_next_run(task='GuildActivityMonitor',success=None,finish=False,server=False,target=next_target)
         if not in_run_days:
-            raise TaskEnd('GuildActivityMonitor')
+            raise TaskEnd.completed('GuildActivityMonitor')
 
         # 构建关键字映射
         self.ui_get_current_page()
@@ -75,7 +77,7 @@ class ScriptTask(GameUi):
             while True:
                 if check_timer.reached():
                     logger.info("监控时间到，任务结束")
-                    raise TaskEnd('GuildActivityMonitor')
+                    raise TaskEnd.completed('GuildActivityMonitor')
 
                 if log_timer.reached():
                     remaining = int(check_timer.remain() // 60)
@@ -95,7 +97,7 @@ class ScriptTask(GameUi):
                             self.set_next_run(task=task_name, success=False, finish=False, server=False, target=datetime.now())
                             recheck_interval = monitor_config.recheck_interval
                             self.set_next_run(task='GuildActivityMonitor', success=False, finish=False, server=False, target=datetime.now() + timedelta(minutes=recheck_interval))
-                            raise TaskEnd('GuildActivityMonitor')
+                            raise TaskEnd.completed('GuildActivityMonitor')
 
                 time.sleep(interval)
         finally:

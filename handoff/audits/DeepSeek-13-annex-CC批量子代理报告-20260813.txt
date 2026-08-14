@@ -1,0 +1,32 @@
+# DeepSeek-13 修复轮 CC 批量实施报告（3.2f + 3.3-3.21）——子代理原文
+
+全量 CC 套件 149/149 通过（26.1s）。
+
+## 逐项实施与验证
+- 3.2f uvicorn access log 时间戳：api/app.py 新增 uvicorn_log_config()（default/access formatter 含 %(asctime)s，StreamHandler→stdout，uvicorn/uvicorn.error/uvicorn.access logger，disable_existing_loggers=False），main() 传入 log_config；server.py 的 uvicorn.Config 复用同一 log_config（生产入口必要延伸）。
+- 3.3 F2 bundle import 阻塞：app.py import_project_bundle 整个同步幂等信封包成 await run_in_threadpool(...)；新增 from starlette.concurrency import run_in_threadpool。
+- 3.4 F3 quarantine 配额+GC：maintenance.py 新增 quarantine-gc 子命令（--max-age-days 30 --max-count 1000，需 --confirm）；runtime.py 新增 SessionManager.quarantine_gc()；repository.py 新增 delete_quarantine_item()、reserve_artifact(quarantine_bytes=...) 把 quarantine 字节纳入全局配额；artifacts.py 新增 quarantine_bytes()；runtime 两处 reserve_artifact 调用接入。冒烟：2 个损坏件→GC over_quota 删最旧 1 个、回拨时间→expired 删除，行/文件一致。
+- 3.5 F4 session close 清理失败上报：close_session 返回 list[str] warnings；app.py DELETE /sessions/{id} 有 warnings 时返回 {"closed": true, "warnings": [...]}，200 语义不变。
+- 3.6 F5 幂等查询补 owner：begin_idempotency_operation 查询 WHERE route=? AND owner=? AND idempotency_key=? 与 UNIQUE 对齐。【偏差】仅加 owner 维度会破坏既有契约（新租约下重放同 key 须 409）；故同时去掉 idempotent_envelope 中 owner=lease.owner_id 的覆盖（owner 保持请求作用域 local，租约身份仍在指纹里），兼得 F5 意图与 409 契约。
+- 3.7 F6 acquire 指纹含租约+重放校验：idempotent_envelope 新增 extra_fingerprint（acquire 显式带 owner+ttl）与 replay_validator；acquire_lease 传校验器（assert_lease 失败→IdempotencyConflict）；idempotency.py run() 新增 replay_validator，内存缓存与持久化 completed 两条路径回缓存信封前先校验租约有效性。冒烟：同参数重放 200 同 lease；改 owner/ttl 409；释放后重放 409。
+- 3.8 F7 崩溃残留窗口：begin_idempotency_operation 的 in_progress expires_at 上限 1h（min(ttl,3600)，插入与续期共用），释放过期 in_progress 残留时记日志。
+- 3.9 F8 幂等注册表 LRU：_entries 改 OrderedDict；_prune 只清过期 completed；容量满时淘汰最老条目而非 409；命中/写入 move_to_end。
+- 3.10 F9 Session 序列化无锁：SessionRuntime.as_dict 先快照 annotations/samples/backgrounds 容器再序列化；report() 在 self._session_lock 内取快照构建。
+- 3.11 F10 标注配额计 active：add_annotation 配额改为 sum(1 for item if not item.deleted_at)。
+- 3.12 F11 bundle 像素积上限：bundles.py 新增 MAX_CANVAS_PIXELS=64M，_canvas_spec 与 _validate_background_image 校验像素积；comparison.py _canonical_rgb resize 前校验 64M。
+- 3.13 F12 undoAnnotation 背景过滤：app.js undoAnnotation 改用既有 canvasEligibleAnnotations()（过滤 deleted_at + 限当前背景范围）。
+- 3.14 F13 v1 JSON 导入大小上限：app.js importLegacyWorkspaceBundle 在 JSON.parse 前检查 file.size ≤ 128MB 并提示改用 .ccworkspace。
+- 3.15 F14 addPoint 死代码：app.js 删除无引用 addPoint，留注释（未来用 displayedFrameContext 重写）。
+- 3.16 F15 blink 残留：app.js clearScreenshotFrame 首行调 stopCompareBlink()。
+- 3.17 F17 capabilities DPI fail-closed：app.py mouse_capture 由 _mouse_capture_available() 判定（复用 runtime arm 时同一 gate：manager.windows.dpi_awareness().per_monitor），非恒等于 windows_available。
+- 3.18 F18 token ACL：app.py 新增 _restrict_token_file_acl()（subprocess icacls /inheritance:r /grant:r <当前用户>:(R,W)），token 创建/已存在时 best-effort，失败仅告警。
+- 3.19 F19 结构化错误：operation() 映射补 sqlite3.Error→500 internal_error 与 OSError→500 internal_error（含日志）；runtime.py 三处 read_bytes（import_background_from_canvas/compare_backgrounds/background_thumbnail）改 KeyError（404）；persisted_frame_response read_bytes 加 OSError→404 保护。
+- 3.20 文档漂移：protocol.md 错误信封改实际 detail:{code,message}（去 fields）、错误码列表删 lease_required 并补 5 个新码、心跳 15s→1s；architecture.md start.ps1 描述与真实流程对齐。
+- 3.21 测试：test_full_remediation.py 新增 3 个测试（damaged-ready 修复→delete_pending+quarantine+后续工件继续处理；同 owner acquire 原样返回既有租约；heartbeat TTL 60）。全量套件 python -m unittest discover -s tests -v：Ran 149 tests, OK（26.117s）；另 compileall、node --check app.js、test_web_math.js、test_web_state.js 全部通过。
+
+## 偏差/说明
+1. F5（3.6）：报告字面只要求加 owner 维度，但单独如此会破坏既有 API 契约（新租约重放同 key 期望 409）。实现保留 owner 维度查询，同时把幂等 owner 固定为请求作用域（租约身份仍在指纹），二者兼得。
+2. F2（3.3）：因 idempotent_envelope 为同步函数，整个信封移入线程池（非仅 import 调用）。
+3. 3.2f：除 app.main() 外，把 log_config 同时接入了 server.py（start.ps1 实际入口），否则线上仍无时间戳。
+4. F3：quarantine-gc 与 quarantine/restore 一致要求 --confirm。
+5. 未启动/未运行服务；未写 handoff 文件。所有报告中的 file:line 均已按当前代码核对，行号有漂移处以当前代码为准。

@@ -26,6 +26,7 @@ class WQExplore(BaseExploration, HighLight):
         explore_only_boss: bool = True
         _cnt_exploration = 0
         search_fail_cnt = 0
+        unknown_scene_cnt = 0
         search_fail_timer = Timer(3.2)  # 这里设置的时间一定要大于S_SWIPE_BACKGROUND_RIGHT滑动的时间
         while 1:
             self.screenshot()
@@ -36,6 +37,8 @@ class WQExplore(BaseExploration, HighLight):
 
         while 1:
             scene = self.get_current_scene(reuse_screenshot=False)
+            if scene != Scene.UNKNOWN:
+                unknown_scene_cnt = 0
             # 进入探索
             if scene == Scene.ENTRANCE:
                 if _cnt_exploration >= num:
@@ -101,6 +104,7 @@ class WQExplore(BaseExploration, HighLight):
             elif scene == Scene.BATTLE_PREPARE:
                 self.ui_click_until_disappear(self.I_PREPARE_HIGHLIGHT, interval=0.5)
             elif scene == Scene.UNKNOWN:
+                unknown_scene_cnt = self._handle_unknown_scene('wanted_quests', unknown_scene_cnt)
                 continue
 
 

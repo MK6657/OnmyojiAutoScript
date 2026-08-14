@@ -1,0 +1,114 @@
+所有取证完成。证据链闭合，现在输出最终报告。
+
+---
+
+# D:\OSAyys 只读审查报告（2026-08-13）
+**范围**：调度器/script.py/任务模块未提交变更 + 跨任务越权普查 + TaskEnd 热循环普查 + 今日日志证据。**全程只读，未修改任何文件、未运行服务/游戏。**
+
+---
+
+## 一、变更集概况（git HEAD=1724ce44，工作树 195 文件 +13425/-14039）
+
+| 层 | 文件 | 变更量 | 内容 |
+|---|---|---|---|
+| 调度核心 | script.py | +132 | run() 返回 TaskExecutionResult；PresetLookupError 60s 重试；_schedule_failure_retry；failure_action 三态（RESET/PRESERVE/INCREMENT）；空队列干净退出（原 raise RequestHumanTakeover 已删） |
+| 白名单 | module/config/config.py | +131 | `_CROSS_TASK_SCHEDULE_ALLOWLIST` + `_assert_schedule_authorized` + `schedule()` 统一写入口（SCHEDULE_DECISION 审计日志） |
+| 服务端 | script_process.py +316 / script_router.py +462 / main_manager.py +95 | 账号租约（msvcrt 字节锁 AccountRunLease）、stop 保有权、配置 PATCH（If-Match 428/409）、sync_next_run 端点 |
+| 任务基座 | tasks/base_task.py +615 | set_next_run 签名带 success/finish/target + caller 溯源（`_schedule_caller_identity`） |
+| 任务模块 | tasks/ 84 个文件 | 全部迁移为结构化 TaskEnd（`TaskEnd.completed/failed/deferred/stopped/aborted`），114 处 raise 全部工厂式，**无裸 `raise TaskEnd()` / 旧 `success=` 残留** ✅ |
+
+**8-09 审计（SCHED-002 方向）的 A1/E1/T3 均已在工作树落地**；B1 主路径落地但未完全收敛（见②）。
+
+---
+
+## 二、跨任务越权普查（SCHED-AUTH-001 核对）
+
+**机制**：`schedule()`（config.py:217-256）是 next_run 唯一写入口，`_assert_schedule_authorized(task, caller)`（config.py:56-66）做身份归一化（下划线+casefold）后查白名单；base_task.set_next_run → task_delay → schedule，caller 取 `config.model.running_task`（base_task.py:863-898）。
+
+**全量普查**（Python 逐行扫描 tasks/+module/ 非测试 .py，共 254 行含 set_next_run）：跨任务调用点仅 6 处，全部命中白名单 ✅：
+
+| 调用点 file:line | 目标任务 | caller 归一化 | 白名单条目 | 判定 |
+|---|---|---|---|---|
+| ActivityShikigami/script_task.py:173 | SoulsTidy | activity_shikigami | souls_tidy ✅ | 授权 |
+| Duel/script_task.py:57 | TalismanPass | duel | talisman_pass ✅ | 授权 |
+| Exploration/base.py:1153 | RealmRaid | exploration | realm_raid ✅ | 授权（server=False 显式，B2 同函数不一致点已修） |
+| Exploration/base.py:1154 | MemoryScrolls | exploration | memory_scrolls ✅ | 授权 |
+| GuildActivityMonitor/script_task.py:95 | KEYWORD_MAP={道馆→Dokan,狭间→AbyssShadows,宴会→GuildBanquet,退治→DemonRetreat} | guild_activity_monitor | 4 目标全在白名单 ✅ | 授权 |
+| Restart/script_task.py:71 | task.command（任意待延迟任务） | restart | `'*'` ✅ | 授权 |
+| CommonPopup/friend_invitation.py:155 | WantedQuests（任意活跃任务触发） | 任意 | `_SHARED_SCHEDULE_TARGETS` ✅ | 授权（共享目标设计） |
+
+其他合法调用者：script.py 内 `caller='Script.run'`(→`'*'`)、`'Script.scheduler'`(→restart)、`'Script.task_call'`(→restart/souls_tidy，全部调用点仅这两任务)、team_flow/host.py `'TeamFlowHost'`(→orochi/fallen_sun/eternity_sea/evo_zone)、`'ControlCenter.sync_next_run'`(→`'*'`) —— 全部覆盖。MemoryScrolls:127 的跨任务 set_next_run 已注释删除 ✅。
+
+**但 SCHED-AUTH-001 未完全收敛——3 处旁路（不走 schedule()、不触发白名单、无 SCHEDULE_DECISION 审计）**：
+
+| 旁路点 | 行为 | 级别 |
+|---|---|---|
+| 🔴 MemoryScrolls/script_task.py:124-125 | `self.config.exploration.scheduler.enable = False` + `config.save()` —— 8-09 B1 残留（set_next_run 孪生行已注释，此写未删）。用户勾选 auto_close_exploration 时直接改他任务 enable | P2（用户主动开启的行为，但属未收敛的越权写） |
+| 🟡 CollectiveMissions/script_task.py:167 | `self.config.bondling_fairyland.scheduler.next_run = self.start_time` —— 直接模型写，若走 schedule() 会被拒（白名单无 collective_missions） | P2 |
+| 🟡 module/server/script_router.py:384-421 PATCH `/{script}/{task}/values` | 经 apply_json_patch 可写任意合法字段含 scheduler.next_run，旁路 schedule() 与审计。actor=控制中心（本就有 `'*'` 权限），非越权但**审计盲区** | P3 观察项 |
+
+config_model.py:186-197 `__setattr__` 仍**无条件全量自动 save**（"auto save config" 每赋值一次）——8-09 C1 写放大未修复。
+
+---
+
+## 三、TaskEnd 前置 set_next_run 普查（热循环）
+
+**普查口径**：Python 扫描全部 114 处 `raise TaskEnd`，检查同一函数体内该 raise 之前是否存在 set_next_run/custom_next_run 调用；再人工核对 20 个"零命中"点的运行时路径（helper 内调用也算）。
+
+| 异常点清单 | 判定 |
+|---|---|
+| 🔴 **GuildActivityMonitor/script_task.py:24** —— `run_days 配置无效` 时直接 `raise TaskEnd.completed`，无任何 set_next_run；completed→failure RESET。next_run 停留在过去 → 调度器立即重跑 → **无限热循环且失败计数永远为 0**（8-09 A1 点名的同款问题，仍未修） | 真热循环（当前 guild_activity_monitor enable=False 未触发，属潜伏态） |
+| 🟡 GuildBanquet/script_task.py:67 | 假阳性：True 分支 :62 set_next_run；False 分支 check_runtime():125 内部已 set_next_run |
+| 🟡 XiuxingHexun:152 `_stop`（TaskEnd.stopped 无 set_next_run） | **安全**：update_scheduler（config.py:268-272）将 disabled 的 xiuxing_hexun 从调度中剔除，不会重跑 |
+| 其余 18 个"零命中"点 | 全部假阳性：check_time/check_times/check_runtime/next_run()/run_activation 等 helper 在路径上已推进 next_run（DemonEncounter:42、TrueOrochi:31/58/88/170、Hunt（:29 不可达）、Dokan:311、FindJade:46、FrogBoss:67、WantedQuests:58/100、Restart:25、KekkaiActivation:64、MemoryScrolls:25、GotoMain:20/25 等） |
+
+**新语义带来的保护增强**（对照 8-09 A1）：失败路径（GameStuckError 等）→ `_schedule_failure_retry`（success=False 推进 next_run）+ INCREMENT，**三连败退出已生效**——昨晚 22:56:43 实测触发：`Task XiuxingHexun failed 3 or more times` → `Request human takeover` → exit(1)（log/2026-08-12_oas1.txt 尾部）。RealmRaid 自愈路径也改走 TaskEnd.failed/deferred（:290/:665/:845/:983）不再绕过失败治理 ✅。**残余**：`result.next_run` 字段被记录（TASK_END 日志）但调度器 loop 从不消费（script.py 全文件 grep `next_run` 无结果引用）——TaskEnd 载荷的 next_run 目前只是日志装饰。
+
+---
+
+## 四、日志证据汇总
+
+**今日 2026-08-13_oas1.txt**（97,918 行，15.9MB，00:16:38–06:04:35）：
+- 任务运行清单：`Scheduler: Start task \`XiuxingHexun\`` **18 次**、`End task` 13 次（Python 精确字符串计数，非 grep -c 语义含混）；5 次差额 = 4 次崩溃中断 + 06:04 收尾。**今日全天只有 XiuxingHexun 一个任务运行** ✅ 新模块已大量实机运行
+- 结果：XIUXING_HEXUN_BATTLE_RESULT 84 行 = **82 次 victory + 2 次 recovered**；XIUXING_HEXUN_FAILURE 9 次；FINISH 4 次（challenge limit reached）；最终 06:04:27 `reason='no ticket evidence'` completed → next_run 已写 2026-08-14 06:04:27（config/oas1.json 实测一致，enable=True，**明早 06:04 会自动再跑**）
+- 错误清单：ERROR 31 行（全为 XIUXING 战斗/预设失败链）、Traceback 4 次（**全部是 `BrokenPipeError(32, 管道正在被关闭)`**，崩溃点 script.py:676 logger.hr→print，即 Core 侧日志管道断裂、旧 worker 下一次写日志即崩；每次崩溃后数秒内 auto 重启恢复）、RequestHumanTakeover **0**、'Cannot goto page' **0**、green_left3/confirmation **0**（今日无绿标相关活动）
+- log/error/ 9 个快照时间戳（1786551421960→00:17:01 等）与失败时刻逐一对上，失败取证链完整
+- **`{task}` 陷阱实证**：4 行 "Start task `{task}`" 字样经核实是 rich traceback 的源码上下文行（`│ 673 │ logger.info(f'Scheduler: Start task \`{task}\`')`），**不是真实日志行**——引用计数必须排除
+
+**昨日 2026-08-12_oas1.txt**（640 行，22:43–22:56）：XiuxingHexun 5 次启动/4 次结束，4 次 FAILURE，22:56 三连败退出（见③）。**绿标确认两日合计 0 次**（当前树 green_left3 相关逻辑未在实机触发过，与 8-11 绿标轮"门控阳性/真性阴性"背景一致）。
+
+**日志行号 ↔ 当前树一致性抽查**（判定"运行的就是当前树"）：
+- ✅ 逐位吻合：script.py:0673/0686/0693/0533/0502/0558、script_process.py:0151/0199/0233/0404/0406 —— script.py 与 script_process.py 自 8-12 22:56 起未再改动，昨晚+今晨+今晚 20:36 的行为均为当前树产生
+- ⚠️ 漂移证据（当日热修演化）：XiuxingHexun script_task.py 日志行号 :0103（今日 00:34）vs 当前树 151（+48）；:0256（8-12 23:58）→:0261（8-13 00:34）→当前 466（+205）；config.py:0461（06:03）vs 当前 467（+6）。即夜间代码在持续热修，06:04 收尾跑的是中间版本（'no ticket evidence' 字样在当前树已不存在）
+- **2026-08-13_python.txt**：09:46 与 20:01–20:36 两窗口出现"oas1 启动被账号租约阻止"（rest/ws/auto 三源 ×数十次）+ **oas2 auto 启动后 ~15ms 即退（exitcode=0，child_pid 恒 4100）循环**；parent_pid 20:01–20:36 间变更 ~10 次 = **Core 进程反复重启**（租约机制工作正常——oas1 未被双开；但 Core 崩溃循环 + oas2 idle 秒退被 auto 反复拉起，是 E1 idle-vs-crash 启发式与 F1 多实例问题的实机复现）
+- **2026-08-13_server.txt**：138 行无异常，06:03:57 控制中心 sync_next_run（SCHEDULE_DECISION caller='ControlCenter.sync_next_run' ✅ 白名单路径有审计），10:53:14 websocket 断开后停更
+
+---
+
+## 五、新发现（级别/证据/置信度）
+
+| # | 发现 | 级别 | 证据 | 置信度 |
+|---|---|---|---|---|
+| N1 | Worker 因日志管道断裂崩溃（BrokenPipeError），当日 4 次 | 🔴 P1 | 4 个 rich traceback locals `e=BrokenPipeError(32,'管道正在被关闭。')`，崩溃点 script.py:676→logger.py:300 print；对应 Core 侧重启窗口（8-12 server 日志 02:37:48 'log coroutine cancelled' 同型）。根因：Core 重启/退出时未优雅终止旧 worker，旧 worker stdout 管道关闭、下一次 logger.hr print 即崩 | 高（崩溃机制闭环；Core 重启原因本身待查） |
+| N2 | GuildActivityMonitor run_days 无效 → completed 热循环（③表） | 🟡 P2 | :24 无 set_next_run + RESET 语义 | 高 |
+| N3 | 跨任务越权 2 处直接写旁路 + PATCH API 审计盲区（②表） | 🟡 P2×2 + P3 | MemoryScrolls:124、CollectiveMissions:167、script_router.py:384 | 高 |
+| N4 | Core 进程 20:01–20:36 反复重建（~10 个不同 parent_pid）+ oas2 秒退 auto 循环 | 🟡 P2 | python.txt 20:01–20:36 时间戳链 | 中（parent_pid=os.getpid() 语义已核实；重启原因无法从日志判定） |
+| N5 | config_model 每次赋值全量写盘未节流（C1 未修） | 🟡 P3 | config_model.py:186-197 无条件 save() | 高 |
+| N6 | TaskEnd.next_run 载荷未被调度器消费（日志装饰） | 🟢 观察 | script.py 无 result.next_run 引用 | 高 |
+| N7 | GotoMain page_battle 守卫→aborted→INCREMENT：直接调用无害（结果被忽略），若 GotoMain 被排程且反复命中 page_battle 会累计失败——当前 config 无 goto_main 节点，不触发 | 🟢 观察 | GotoMain:20-23 + 今日 4 次 active_unconfirmed（均直接调用） | 高 |
+
+**XiuxingHexun 新模块结论**：已实机运行 ✅（8-12 22:43 起 5 次 + 8-13 18 次启动、82 胜场、9 失败、4 次打满挑战上限），失败路径走 GameStuckError→INCREMENT 治理（注意：每次战斗失败都会重启游戏客户端 +10s 等待，这是有意的 fail-hard 设计）。9 个失败快照 + 日志证据齐全；但**handoff/ 文档仍零记录**（与 8-12 文档体系审查结论一致）。
+
+---
+
+## 六、无法判定项
+
+1. Core 20:01–20:36 反复重启的**触发者**（控制中心 watchdog？用户手动？）——日志只记录结果不记录原因。
+2. 4 次 BrokenPipe 崩溃时**旧 Core 是正常退出还是被强杀**（决定 worker 是否应收到 SIGTERM）——需 Core 侧 stdout/启动器日志佐证。
+3. 84 行 BATTLE_RESULT 中 82 次 victory 对应的**真实战斗场数**（含 recovered 去重后）——部分日志行属"恢复判定"重复计数，精确场数需逐条比对 count= 序号。
+4. `scheduler.enable` 类字段的跨任务写**是否还有经 pydantic 别名/深路径的间接写点**（本次普查覆盖 `X.scheduler.{enable,next_run,priority} =` 直写 + set_next_run/task_delay 全量调用点，未覆盖反射/JSON patch 全字段枚举）。
+5. 离线测试套件未运行（只读约束），TaskEnd 语义仅见 module/server/tests/test_task_end_semantics.py（3 用例静态确认）——套件全量通过性未验证。
+
+---
+
+**工作总结**：只读审查完成，未创建/修改任何文件。产出：① 跨任务越权普查表（7 调用点全授权 + 3 处旁路）；② 114 处 TaskEnd 前置普查（1 处真热循环、19 处假阳性逐一定性）；③ 今日日志全景（18 次启动/13 次结束、82 胜、4 次 BrokenPipe 崩溃、三连败保护与租约拦截均实测生效）；④ 7 项新发现（P1×1、P2×4、P3×1、观察×1）；⑤ 5 项无法判定。核心结论：**SCHED-AUTH-001 主路径已修但 2 处直接写旁路未收敛；A1 热循环修复在 GuildActivityMonitor 一处漏网；当日最大实机风险是 BrokenPipe 崩溃循环（已自愈但每次中断任务）**。

@@ -48,6 +48,32 @@ def is_handle_valid(num: int) -> bool:
     return IsWindow(num)
 
 
+def resolve_root_handle(value) -> tuple[str, int, str]:
+    """Resolve a configured HWND or exact window title without guessing."""
+    if value is None or value == '':
+        return '', 0, 'empty'
+
+    if isinstance(value, int):
+        if is_handle_valid(value):
+            return handle_num2title(value) or '', value, 'hwnd'
+        return '', 0, 'unresolved'
+
+    configured = str(value)
+    try:
+        numeric = int(configured)
+    except ValueError:
+        numeric = None
+
+    if numeric is not None and is_handle_valid(numeric):
+        return handle_num2title(numeric) or '', numeric, 'hwnd'
+
+    # Numeric titles such as a MuMu instance named "2301" are valid titles.
+    hwnd = handle_title2num(configured)
+    if hwnd:
+        return configured, hwnd, 'title'
+    return '', 0, 'unresolved'
+
+
 def handle_num2pid(num: int) -> int:
     """
     通过句柄号获取句柄进程id，如果句柄号非法则返回0
@@ -182,18 +208,14 @@ class Handle:
             window_list = Handle.all_windows()
             self.root_handle_title = self.auto_handle_title(window_list)
             self.root_handle_num = handle_title2num(self.root_handle_title)
-        if isinstance(self.root_handle, str):
-            try:
-                self.root_handle_num = int(self.root_handle)
-                logger.info('Handle is a number, using it as root handle num')
-                if is_handle_valid(self.root_handle_num):
-                    logger.info(f'Handle number {self.root_handle_num} is valid')
-                    self.root_handle_title = handle_num2title(self.root_handle_num)
-            except ValueError:
-                logger.info('Handle is a string, looking up window by title')
-                if handle_title2num(self.root_handle) != 0:
-                    self.root_handle_num = handle_title2num(self.root_handle)
-                    self.root_handle_title = self.root_handle
+            resolution_source = 'auto'
+        else:
+            self.root_handle_title, self.root_handle_num, resolution_source = resolve_root_handle(
+                self.root_handle
+            )
+        logger.info(
+            f'Handle resolution source={resolution_source}, configured={self.root_handle!r}'
+        )
         logger.info(f'The root handle title is {self.root_handle_title} and num is {self.root_handle_num}')
 
         # 获取句柄树（加重试，等待子窗口渲染就绪）

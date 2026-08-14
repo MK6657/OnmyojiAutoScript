@@ -1,7 +1,10 @@
 import asyncio
+import concurrent.futures
 import ctypes
 import os
+import queue
 import sys
+import threading
 from functools import partial, wraps
 from pathlib import Path
 
@@ -160,6 +163,9 @@ def retry(func):
         """
         init = None
         for _ in range(RETRY_TRIES):
+            logger.debug(
+                f'NEMU_RETRY stage={func.__name__} attempt={_ + 1}/{RETRY_TRIES}'
+            )
             try:
                 if callable(init):
                     retry_sleep(_)
@@ -174,24 +180,33 @@ def retry(func):
                 break
             # Function call timeout
             except asyncio.TimeoutError:
-                logger.warning(f'Func {func.__name__}() call timeout, retrying: {_}')
+                logger.warning(
+                    f'NEMU_RETRY_TIMEOUT stage={func.__name__} '
+                    f'attempt={_ + 1}/{RETRY_TRIES}'
+                )
 
                 def init():
                     self.reconnect()
             # NemuIpcError
             except NemuIpcError as e:
-                logger.error(e)
+                logger.error(
+                    f'NEMU_RETRY_ERROR stage={func.__name__} '
+                    f'attempt={_ + 1}/{RETRY_TRIES}: {e}'
+                )
 
                 def init():
                     self.reconnect()
             # Unknown, probably a trucked image
             except Exception as e:
-                logger.exception(e)
+                logger.exception(
+                    f'NEMU_RETRY_UNEXPECTED stage={func.__name__} '
+                    f'attempt={_ + 1}/{RETRY_TRIES}: {e}'
+                )
 
                 def init():
                     pass
 
-        logger.critical(f'Retry {func.__name__}() failed')
+        logger.critical(f'NEMU_RETRY_FAILED stage={func.__name__}')
         raise RequestHumanTakeover
 
     return retry_wrapper
@@ -245,6 +260,7 @@ class NemuIpcImpl:
         self.connect_id: int = 0
         self.width = 0
         self.height = 0
+        self._resolution_valid = False
 
     def connect(self):
         if self.connect_id > 0:
@@ -260,7 +276,8 @@ class NemuIpcImpl:
             )
 
         self.connect_id = connect_id
-        # logger.info(f'NemuIpc connected: {self.connect_id}')
+        self.invalidate_resolution('connected')
+        logger.debug(f'NEMU_CONNECTION state=connected connect_id={self.connect_id}')
 
     def disconnect(self):
         if self.connect_id == 0:
@@ -271,10 +288,12 @@ class NemuIpcImpl:
             self.connect_id
         )
 
-        # logger.info(f'NemuIpc disconnected: {self.connect_id}')
+        logger.debug(f'NEMU_CONNECTION state=disconnected connect_id={self.connect_id}')
         self.connect_id = 0
+        self.invalidate_resolution('disconnected')
 
     def reconnect(self):
+        logger.info('NEMU_CONNECTION state=reconnecting')
         self.disconnect()
         self.connect()
 
@@ -289,6 +308,35 @@ class NemuIpcImpl:
     def _ev(self):
         return asyncio.new_event_loop()
 
+    @cached_property
+    def _call_queue(self):
+        # DeepSeek-13 2.7 (DS-10 #13): run_in_executor leaks one thread per
+        # timed-out call because the cancelled future's thread keeps running
+        # and is never joined. A single dedicated worker serializes sync calls:
+        # the instance never accumulates threads; a timed-out call finishes in
+        # the background and the next call queues behind it.
+        q: queue.Queue = queue.Queue()
+
+        def worker():
+            while True:
+                item = q.get()
+                if item is None:
+                    return
+                fut, fn = item
+                if fut.set_running_or_notify_cancel():
+                    try:
+                        fut.set_result(fn())
+                    except BaseException as error:  # noqa: BLE001
+                        fut.set_exception(error)
+
+        thread = threading.Thread(
+            target=worker,
+            daemon=True,
+            name=f'nemu-ipc-{getattr(self, "instance_id", 0)}',
+        )
+        thread.start()
+        return q
+
     async def ev_run_async(self, func, *args, **kwargs):
         """
         Args:
@@ -300,9 +348,26 @@ class NemuIpcImpl:
             asyncio.TimeoutError: If function call timeout
         """
         func_wrapped = partial(func, *args, **kwargs)
-        # Increased timeout for slow PCs
-        # Default screenshot interval is 0.2s, so a 0.15s timeout would have a fast retry without extra time costs
-        result = await asyncio.wait_for(self._ev.run_in_executor(None, func_wrapped), timeout=0.15)
+        timeout = 0.15
+        started_at = asyncio.get_running_loop().time()
+        fut = concurrent.futures.Future()
+        self._call_queue.put((fut, func_wrapped))
+        try:
+            result = await asyncio.wait_for(
+                asyncio.wrap_future(fut),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            elapsed_ms = (asyncio.get_running_loop().time() - started_at) * 1000
+            logger.warning(
+                f'NEMU_IPC_TIMEOUT function={func.__name__} '
+                f'durationMs={elapsed_ms:.1f} timeoutMs={timeout * 1000:.0f}'
+            )
+            raise
+        elapsed_ms = (asyncio.get_running_loop().time() - started_at) * 1000
+        logger.debug(
+            f'NEMU_IPC_CALL function={func.__name__} durationMs={elapsed_ms:.1f}'
+        )
         return result
 
     def ev_run_sync(self, func, *args, **kwargs):
@@ -334,13 +399,27 @@ class NemuIpcImpl:
 
         return result
 
-    def get_resolution(self):
+    def invalidate_resolution(self, reason='manual'):
+        self.width = 0
+        self.height = 0
+        self._resolution_valid = False
+        logger.debug(f'NEMU_RESOLUTION_INVALIDATE reason={reason}')
+
+    def get_resolution(self, force=False):
         """
         Get emulator resolution, `self.width` and `self.height` will be set
         """
+        if (
+            not force
+            and getattr(self, '_resolution_valid', False)
+            and self.width > 0
+            and self.height > 0
+        ):
+            return self.width, self.height
         if self.connect_id == 0:
             self.connect()
 
+        previous = (self.width, self.height)
         width_ptr = ctypes.pointer(ctypes.c_int(0))
         height_ptr = ctypes.pointer(ctypes.c_int(0))
         nullptr = ctypes.POINTER(ctypes.c_int)()
@@ -353,6 +432,12 @@ class NemuIpcImpl:
             raise NemuIpcError('nemu_capture_display failed during get_resolution()')
         self.width = width_ptr.contents.value
         self.height = height_ptr.contents.value
+        self._resolution_valid = self.width > 0 and self.height > 0
+        logger.info(
+            f'NEMU_RESOLUTION width={self.width} height={self.height} '
+            f'cached={self._resolution_valid} changed={previous != (self.width, self.height)}'
+        )
+        return self.width, self.height
 
     @retry
     def screenshot(self):
@@ -503,12 +588,19 @@ class NemuIpc():
         if has_cached_property(self, 'nemu_ipc'):
             self.nemu_ipc.disconnect()
         del_cached_property(self, 'nemu_ipc')
+        invalidate = getattr(self, 'invalidate_recognition_cache', None)
+        if callable(invalidate):
+            invalidate('nemu_release')
         logger.info('nemu_ipc released')
 
     def screenshot_nemu_ipc(self):
         image = self.nemu_ipc.screenshot()
 
-        image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+        # MuMu IPC returns RGBA pixels.  The raw sentinel is identical to
+        # ADB's RGB ordering after the alpha channel is removed. Treating it
+        # as BGRA swaps red and blue and makes the whole frame orange/red,
+        # which can invalidate otherwise correct templates and OCR.
+        image = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
         cv2.flip(image, 0, dst=image)
         return image
 

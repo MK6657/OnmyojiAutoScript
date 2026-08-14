@@ -15,7 +15,6 @@
 
   可选参数:
     -SkipCore    你已经用别的方式启动了 OAS（如原 QML 界面），跳过 Core 层
-    -Prod        使用生产前端(control-center\frontend, :5173)而不是 UI-claude(:4175)
     -NoBrowser   就绪后不自动打开浏览器
     -CoreUrl     Core 不在默认地址时指定，如 -CoreUrl http://127.0.0.1:22270
 
@@ -23,10 +22,10 @@
 #>
 param(
   [switch]$SkipCore,
-  [switch]$Prod,
   [switch]$NoBrowser,
   [switch]$RestartCore,
   [switch]$RestartAll,
+  [switch]$HiddenWindows,
   [switch]$Menu,
   [string]$CoreUrl = 'http://127.0.0.1:22267'
 )
@@ -76,6 +75,9 @@ try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
 $cc   = $PSScriptRoot                     # ...\control-center
 $root = Split-Path -Parent $cc            # 项目根 D:\OSAyys
+$frontendStateFile = Join-Path $root 'output\control-center\frontend.json'
+$wiringHelpers = Join-Path $cc 'launcher\wiring.ps1'
+. $wiringHelpers
 
 # ------------------------------------------------------------ 工具函数
 
@@ -87,8 +89,10 @@ function Get-PortOwner([int]$Port) {
   if (-not $conn) { return $null }
   $proc = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
   $name = 'unknown'
+  $startedAt = ''
   if ($proc) { $name = $proc.ProcessName }
-  return [pscustomobject]@{ Port = $Port; ProcessId = $conn.OwningProcess; Name = $name }
+  if ($proc) { try { $startedAt = $proc.StartTime.ToUniversalTime().ToString('o') } catch { } }
+  return [pscustomobject]@{ Port = $Port; ProcessId = $conn.OwningProcess; Name = $name; StartedAt = $startedAt }
 }
 
 function Test-Json([string]$Url) {
@@ -100,6 +104,37 @@ function Test-HttpOk([string]$Url) {
     $resp = Invoke-WebRequest -Uri $Url -TimeoutSec 3 -UseBasicParsing
     return ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 400)
   } catch { return $false }
+}
+
+function Test-ControlCenterUi([string]$Url) {
+  try {
+    $response = Invoke-WebRequest -Uri $Url -TimeoutSec 3 -UseBasicParsing
+    return $response.StatusCode -ge 200 -and $response.StatusCode -lt 400 -and
+           $response.Content -match '<title>OAS\s+[^<]+</title>' -and
+           $response.Content -match '<div\s+id=["'']root["'']></div>'
+  } catch { return $false }
+}
+
+function Get-FrontendState {
+  if (-not (Test-Path -LiteralPath $frontendStateFile)) { return $null }
+  try { return Get-Content -Encoding UTF8 -Raw -LiteralPath $frontendStateFile | ConvertFrom-Json } catch { return $null }
+}
+
+function Clear-FrontendState {
+  Remove-Item -LiteralPath $frontendStateFile -Force -ErrorAction SilentlyContinue
+}
+
+function Save-FrontendState([int]$Port, [int]$ProcessId, [string]$ProcessStartedAt, [string]$BridgeUrl) {
+  $directory = Split-Path -Parent $frontendStateFile
+  New-Item -ItemType Directory -Path $directory -Force | Out-Null
+  [pscustomobject]@{
+    port = $Port
+    process_id = $ProcessId
+    process_started_at = $ProcessStartedAt
+    frontend = (Join-Path $cc 'frontend')
+    bridge_url = (ConvertTo-EndpointKey $BridgeUrl)
+    recorded_at = (Get-Date).ToString('o')
+  } | ConvertTo-Json | Set-Content -Encoding UTF8 -LiteralPath $frontendStateFile
 }
 
 function Test-PortBindable([int]$Port) {
@@ -130,10 +165,11 @@ function Find-FreePort([int]$From, [int]$To) {
 function Start-InNewWindow([string]$Title, [string]$Command) {
   $full  = ("`$Host.UI.RawUI.WindowTitle = '{0}'; {1}" -f $Title, $Command)
   $bytes = [System.Text.Encoding]::Unicode.GetBytes($full)
+  $windowStyle = if ($HiddenWindows) { 'Hidden' } else { 'Normal' }
   Start-Process powershell -ArgumentList @(
     '-NoExit', '-ExecutionPolicy', 'Bypass',
     '-EncodedCommand', [Convert]::ToBase64String($bytes)
-  ) | Out-Null
+  ) -WindowStyle $windowStyle | Out-Null
 }
 
 function Stop-PortOwner([int]$Port, [string]$Label) {
@@ -155,6 +191,43 @@ function Stop-PortOwner([int]$Port, [string]$Label) {
   }
   Write-Host ("      端口 {0} 仍被占用" -f $Port) -ForegroundColor Red
   return $false
+}
+
+function Stop-CoreGraceful([int]$Port, [string]$CoreUrl) {
+  # DeepSeek-13 1.1a: 优先走 Core 自己的优雅关停（/home/kill_server 会逐 account 停止
+  # worker 并回收 IPC 管道），避免 Stop-Process -Force 把 worker 变成孤儿（BrokenPipeError）。
+  $base = ([Uri]$CoreUrl).GetLeftPart([System.UriPartial]::Authority)
+  try {
+    $resp = Invoke-WebRequest -Uri ("{0}/home/kill_server" -f $base) -Method GET -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
+    if ($resp.StatusCode -ne 200) { return $false }
+  } catch {
+    return $false
+  }
+  for ($i = 0; $i -lt 4; $i++) {
+    if (-not (Get-PortOwner $Port)) { return $true }
+    Start-Sleep -Seconds 3
+  }
+  return -not [bool](Get-PortOwner $Port)
+}
+
+function Stop-RegisteredFrontend {
+  $state = Get-FrontendState
+  if (-not $state) {
+    Write-Host '      没有前端运行登记，跳过结束，避免误杀其他程序' -ForegroundColor DarkGray
+    return $true
+  }
+  $port = [int]$state.port
+  $owner = Get-PortOwner $port
+  $sameProcess = $owner -and $owner.ProcessId -eq [int]$state.process_id -and
+                 (!$state.process_started_at -or $owner.StartedAt -eq [string]$state.process_started_at)
+  if (-not $sameProcess) {
+    Write-Host ("      前端登记已失效(:{0})，清理登记但不结束未知进程" -f $port) -ForegroundColor DarkGray
+    Clear-FrontendState
+    return $true
+  }
+  $stopped = Stop-PortOwner $port '控制中心前端'
+  if ($stopped) { Clear-FrontendState }
+  return $stopped
 }
 
 function Wait-Ready([scriptblock]$Probe, [int]$TimeoutSec) {
@@ -218,15 +291,20 @@ try { $corePort = ([Uri]$CoreUrl).Port } catch { }
 # 用途：改了会被 Python import 缓存的模块（module\atom\image.py、tasks\GameUi\assets.py 等）时，
 #       只有重开 Core 进程才会重新加载；找不到那个黑窗口时用这个最省事。
 if ($RestartCore -and -not $SkipCore) {
-  Write-Host '[1/3] Core   按要求重启：先结束旧进程' -ForegroundColor DarkYellow
-  if (-not (Stop-PortOwner $corePort 'Core')) { exit 1 }
+  Write-Host '[1/3] Core   按要求重启：先优雅停旧进程' -ForegroundColor DarkYellow
+  $graceful = Stop-CoreGraceful $corePort $CoreUrl
+  if ($graceful) {
+    Write-Host '[1/3] Core   已优雅停止（worker 随停，无孤儿进程）' -ForegroundColor Green
+  } else {
+    Write-Host '[1/3] Core   优雅停止未生效，回退强制结束（兜底）' -ForegroundColor DarkYellow
+    if (-not (Stop-PortOwner $corePort 'Core')) { exit 1 }
+  }
 }
 if ($RestartAll) {
   # Bridge 与界面也一并结束，后面各层会当作“没在跑”重新拉起
   Write-Host '[*/3] 全部重启：一并结束 Bridge 与界面' -ForegroundColor DarkYellow
   [void](Stop-PortOwner 22367 'Bridge')
-  [void](Stop-PortOwner 5173 '界面(生产)')
-  [void](Stop-PortOwner 4175 '界面(UI-claude)')
+  if (-not (Stop-RegisteredFrontend)) { exit 1 }
 }
 
 if ($SkipCore) {
@@ -260,14 +338,18 @@ if ($SkipCore) {
 
 $bridgePort = 22367
 $health = Test-Json ("http://127.0.0.1:{0}/api/v1/health" -f $bridgePort)
-if ($health -and $health.bridge -eq 'ok') {
+$bridgeMatchesCore = Test-BridgeHealthMatchesCore $health $CoreUrl
+if ($bridgeMatchesCore) {
   Write-Host ("[2/3] Bridge 已在线(:{0} v{1})，复用" -f $bridgePort, $health.version) -ForegroundColor Green
   if ($health.core -ne 'ok') {
     Write-Host ("      提醒：这个 Bridge 连的 Core({0}) 目前不在线；若你刚启动 Core，它会自动恢复" -f $health.core_url) -ForegroundColor DarkYellow
   }
 } else {
   $owner = Get-PortOwner $bridgePort
-  if ($owner) {
+  if ($health -and $health.bridge -eq 'ok') {
+    $bridgePort = Find-FreePort 22368 22390
+    Write-Host ("[2/3] Bridge 22367 指向 {0}，与本次 Core {1} 不一致；保留旧 Bridge，改用端口 {2}" -f $health.core_url, $CoreUrl, $bridgePort) -ForegroundColor DarkYellow
+  } elseif ($owner) {
     $bridgePort = Find-FreePort 22368 22390
     Write-Host ("[2/3] Bridge 22367 被 {0} (PID {1}) 占用，自动改用空闲端口 {2}" -f $owner.Name, $owner.ProcessId, $bridgePort) -ForegroundColor DarkYellow
   }
@@ -276,7 +358,7 @@ if ($health -and $health.bridge -eq 'ok') {
   Start-InNewWindow ("OAS Bridge :{0}" -f $bridgePort) ("& '{0}' -Port {1} -CoreUrl '{2}'" -f $bridgeScript, $bridgePort, $CoreUrl)
   $ok = Wait-Ready {
     $h = Test-Json ("http://127.0.0.1:{0}/api/v1/health" -f $bridgePort)
-    ($h -and $h.bridge -eq 'ok')
+    (Test-BridgeHealthMatchesCore $h $CoreUrl)
   } 40
   if (-not $ok) {
     Write-Host '[2/3] Bridge 40 秒内未就绪。请查看「OAS Bridge」窗口里的报错。' -ForegroundColor Red
@@ -287,11 +369,31 @@ if ($health -and $health.bridge -eq 'ok') {
 
 # ------------------------------------------------------------ [3/3] 界面
 
-if ($Prod) { $frontPort = 5173 } else { $frontPort = 4175 }
+$frontPort = 4175
+$expectedBridgeUrl = ("http://127.0.0.1:{0}" -f $bridgePort)
+$frontendState = Get-FrontendState
+$registeredFrontendTrusted = $false
+if ($frontendState) {
+  $registeredPort = [int]$frontendState.port
+  $registeredOwner = Get-PortOwner $registeredPort
+  $registeredUrl = ("http://127.0.0.1:{0}/" -f $registeredPort)
+  $sameRegisteredProcess = $registeredOwner -and $registeredOwner.ProcessId -eq [int]$frontendState.process_id -and
+                           (!$frontendState.process_started_at -or $registeredOwner.StartedAt -eq [string]$frontendState.process_started_at)
+  $registeredBridgeMatches = $frontendState.bridge_url -and (Test-SameEndpoint $frontendState.bridge_url $expectedBridgeUrl)
+  if ($sameRegisteredProcess -and (Test-ControlCenterUi $registeredUrl) -and $registeredBridgeMatches) {
+    $frontPort = $registeredPort
+    $registeredFrontendTrusted = $true
+  } else {
+    if ($sameRegisteredProcess -and (Test-ControlCenterUi $registeredUrl) -and -not $registeredBridgeMatches) {
+      Write-Host ("[3/3] 界面   已登记前端的 Bridge {0} 与本次 {1} 不一致或无法证明；不静默复用" -f $frontendState.bridge_url, $expectedBridgeUrl) -ForegroundColor DarkYellow
+    }
+    Clear-FrontendState
+  }
+}
 $frontUrl = ("http://127.0.0.1:{0}/" -f $frontPort)
 
-if (Test-HttpOk $frontUrl) {
-  Write-Host ("[3/3] 界面   {0} 已有页面在跑，复用（若那不是控制中心页面，请关掉它后重跑本脚本）" -f $frontUrl) -ForegroundColor Green
+if ($registeredFrontendTrusted -and (Test-ControlCenterUi $frontUrl)) {
+  Write-Host ("[3/3] 界面   {0} 已登记且 Bridge 目标一致，复用" -f $frontUrl) -ForegroundColor Green
 } else {
   $owner = Get-PortOwner $frontPort
   $portUnavailable = -not (Test-PortBindable $frontPort)
@@ -305,20 +407,17 @@ if (Test-HttpOk $frontUrl) {
       Write-Host ("[3/3] 界面   原端口 {0} 被 Windows 保留/拒绝绑定，自动改用 {1}" -f $originalFrontPort, $frontPort) -ForegroundColor DarkYellow
     }
   }
-  if ($Prod) {
-    $frontScript = Join-Path $cc 'launcher\start-frontend.ps1'
-    $cmd = ("`$env:OAS_BRIDGE_URL='http://127.0.0.1:{0}'; & '{1}' -Port {2}" -f $bridgePort, $frontScript, $frontPort)
-  } else {
-    $frontScript = Join-Path $cc 'desktop\release\UI-claude\start-ui-claude.ps1'
-    $cmd = ("& '{0}' -Port {1} -BridgeUrl 'http://127.0.0.1:{2}'" -f $frontScript, $frontPort, $bridgePort)
-  }
+  $frontScript = Join-Path $cc 'launcher\start-frontend.ps1'
+  $cmd = ("& '{0}' -Port {1} -BridgeUrl '{2}'" -f $frontScript, $frontPort, $expectedBridgeUrl)
   Write-Host ("[3/3] 界面   启动中(:{0})。首次运行要安装依赖，可能需要几分钟" -f $frontPort)
   Start-InNewWindow ("OAS 界面 :{0}" -f $frontPort) $cmd
-  $ok = Wait-Ready { Test-HttpOk $frontUrl } 120
+  $ok = Wait-Ready { Test-ControlCenterUi $frontUrl } 120
   if (-not $ok) {
     Write-Host '[3/3] 界面   还没就绪（首次多半在安装依赖，属正常）。' -ForegroundColor DarkYellow
     Write-Host ("      请稍等「OAS 界面」窗口装完，然后手动打开 {0}" -f $frontUrl)
   } else {
+    $frontOwner = Get-PortOwner $frontPort
+    if ($frontOwner) { Save-FrontendState $frontPort $frontOwner.ProcessId $frontOwner.StartedAt $expectedBridgeUrl }
     Write-Host '[3/3] 界面   已就绪' -ForegroundColor Green
   }
 }
@@ -336,5 +435,5 @@ Write-Host '  · 三层连通性排查：control-center\check-wiring.ps1'
 Write-Host '============================================'
 
 if (-not $NoBrowser) {
-  if (Test-HttpOk $frontUrl) { Start-Process $frontUrl | Out-Null }
+  if (Test-ControlCenterUi $frontUrl) { Start-Process $frontUrl | Out-Null }
 }

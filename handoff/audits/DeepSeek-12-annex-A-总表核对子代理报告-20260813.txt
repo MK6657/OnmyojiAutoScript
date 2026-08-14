@@ -1,0 +1,79 @@
+# 「记录体系审查」任务一：Codex-待做事项总表逐条核对报告（DeepSeek-12 annex-A）
+
+审查范围：D:\OSAyys\handoff\ 记录体系；聚焦 Codex-待做事项总表.md（234 行，mtime 2026-08-11 10:40:02）。全程只读：未改/建任何文件、未 git 写操作、未启停服务、未运行测试（含未跑任何 pytest/单测）。
+置信度约定：已证实=本人 file:line/进程/端口/像素/链接实测；高概率=引用 DeepSeek-09/10/11 轮（08-13，父代理独立复验）且本人复核一致；待查=受约束无法复跑。
+
+## 一、逐条核对表（按严重度分组）
+
+### 高：会误导后续工作或违反结案规范
+
+| # | 条目 | 总表声称（行） | 现实 | 判定 | 证据 | 置信度 |
+|---|---|---|---|---|---|---|
+| H1 | SCHED-AUTH-001 | "已完成（离线）…现有业务关系…有显式授权；越权保存前失败"（行 121）；SCHED-002"跨任务授权名单均已实现"（行 96） | 2 处跨任务旁路仍在：MemoryScrolls 直接 config.exploration.scheduler.enable=False+save()（tasks/MemoryScrolls/script_task.py:124-125，走非白名单反向关系）；CollectiveMissions 直接写 config.bondling_fairyland.scheduler.next_run（tasks/CollectiveMissions/script_task.py:167）。不走 schedule()、无白名单、无审计 | ❌ 证伪"越权保存前失败" | 本人 grep+亲读两处 :124-125/:167；与 D10 F-4 一致 | 已证实 |
+| H2 | RY-GUILD-001 | 状态="当前排序协议已结案，跨游戏日二次通过"（行 54） | handoff/records/closure/ 空目录，全仓无任何 Codex-结案-* 文件；04-测试与结案规范.md 明示"结案记录…是（唯一代表结案）"、总表 §7.4 要求"只有验收标准全部满足后才新建结案记录" | ❌ 违反本仓结案规范（口头结案） | 实测 records/closure 存在但 0 文件；handoff/04-测试与结案规范.md 表格 | 已证实 |
+| H3 | 全表 | 定位为"当前项目唯一的开放事项总表"（行 9），§1 要求"必须以当前源码、最新实测和本表为准" | 08-12/13 全部事件零记录：XiuxingHexun 新模块通宵实机（log/2026-08-13_oas1.txt 97,918 行，Start task 22 次、VICTORY 84、GameStuck 9——本人实测）、DeepSeek-09/10/11 三份审查全部发现（含 2 个阻断级）、租约乒乓、oas2 澄清。总表 grep "xiuxing/hexun/oas2"=0 命中 | ❌ 与"唯一权威"定位严重不符，按表做下一步将漏掉 CC F1 与 OAS F-1 两个阻断缺陷 | 本人 grep 0 命中；audits/DeepSeek-09/10/11-*.md（08-13 落盘）；日志统计 | 已证实 |
+| H4 | §9 运行状态 | "当前 Core、Bridge、前端和 coordinate-calibrator 均运行；oas1 已停止"（行 234） | 实测：Core PID 5936 运行（监 127.0.0.1:22267）；CC PID 25064 运行（22880）；Bridge(22367)/前端(4175) 进程不存在；oas1 任务 06:04:35 正常收工（"TASK_END outcome=returned success=True"、nemu_ipc released），但 config/oas1.json:993-996 xiuxing_hexun.scheduler.enable=true、next_run=2026-08-14 06:04:27（明早自动再跑）——"已停止"表述误导 | ❌ 整句过期 | Get-CimInstance/Get-NetTCPConnection 实测；oas1.json:993-996；日志尾部 06:04:35.976 | 已证实 |
+| H5 | CONFIG-CONCURRENCY-001 | "代码已修，待正式并发实测"；验收"PATCH 缺 revision 返回 428，陈旧 revision 返回 409并保留草稿"（行 113） | PATCH 门禁真实（module/server/script_router.py:394-396 缺 revision→428、409 已实现），但 PUT 单值路由无 revision 门禁：@script_app.put('/{script_name}/{task}/{group}/{argument}/value')（:435）非 xiuxing_hexun 分支直接 script_set_arg（:450-456），与 PATCH 不对称，丢更新窗口仍存在 | ⚠️ 部分证伪（并发丢失更新未完全闭合） | 本人亲读 :394-396/:435-456；与 D10 F-9 一致 | 已证实 |
+| H6 | CORE-LIFE-001 | "代码已修，待正式服务压力实测"（行 111） | 强杀失败处理已实现（D10 未否认），但 D11 R-1 证实强杀工具链仍造成孤儿 worker：start.ps1:184 Stop-Process -Force 重启 Core 5 次 → 旧 worker 成孤儿 → 写日志管道 BrokenPipeError 崩溃 4 次（03:43/03:53/05:45/05:56），与本条目"强杀失败"治理同族未闭环 | ⚠️ 相关缺陷未入表 | D11 R-1（父代理亲验 start.ps1:171-200、script_process.py:117-137/404） | 高概率 |
+
+### 中：过时状态与计数
+
+| # | 条目 | 总表声称（行） | 现实 | 判定 | 证据 | 置信度 |
+|---|---|---|---|---|---|---|
+| M1 | §8.5 测试口径 | "OAS 当前 15 个定向与回归套件合计 444/444，Bridge 27/27 + 3/3，隔离 Core/Bridge 集成 16/16"（行 231） | 静态清点 def test_=456（本人实测：tasks 245+Component 171+module 72−XiuxingHexun 32=456，与 D10"官方 15 套件 456"完全一致）；含 XiuxingHexun=488（D10 称 520，口径差待查）；D10 实跑 Bridge 29/29+3/3；隔离 16/16 本轮无法复跑 | ❌ 计数过期（444/27 均为 08-11 时点） | 本人 Select-String 全量清点；D10 §3 实跑记录 | 已证实（456/29）；待查（16/16） |
+| M2 | CC-COORD-001 | "…回归已纳入 126 项测试"（行 214） | CC 全仓（md/py/toml，排除备份/venv）grep "126" 0 命中；README.md:106、docs/test-plan.md:12/137 均为 146，D9 实跑 146/146 | ⚠️ "126"无出处，高概率过期 | 本人全仓 grep=0；D9 §0 实跑 | 高概率 |
+| M3 | CC-DATA-001 | "正式数据 9 session、47 标注、8 背景、8 截图哈希迁移前后不变"（行 220） | 现库（D9 只读实测）：17 sessions / 81 标注 / 16 背景 / 17 帧 / 17 artifacts——9/47/8/8 为迁移时点数字，已过期 | ⚠️ 数字过期（迁移声明本身仍成立） | D9 §0 实况基线（只读 sqlite） | 已证实 |
+| M4 | handoff/README.md | 基线"OAS 444/444、Bridge 27/27+3/3、隔离 16/16"（行 20）；"最新只读审计是 2026-08-10 P0/P1 复核审计"（行 13） | 同 M1 过期；且未收录 08-13 的 DeepSeek-09/10/11 三份审查（D11 N-7） | ❌ 入口文档过期 | 本人亲读 README.md 行 13/20；audits/ 目录 08-13 18 个文件 | 已证实 |
+| M5 | 00-当前状态.md | 快照（mtime 08-11 10:46）：Core PID 22952、Bridge 20992、前端 6884、CC 21232、工作树 281 项 | 实测当前：Core 5936、CC 25064、Bridge/前端已停、工作树 287 项 | ⚠️ 2.5 天未刷新（快照性质可辩，但作为"当前状态"入口已误导） | 实测 vs 文件内容 | 已证实 |
+| M6 | tasks/RY-GUILD-001.md | "事项状态为'安全逻辑已修，待坐标与实测'，不是结案"（08-10） | 总表已标"排序协议已结案、跨游戏日二次通过"（08-11，证据 DAY2）——任务文件与总表状态自相矛盾 | ⚠️ 状态句过期（D10 观察3） | 本人亲读 tasks/RY-GUILD-001.md:5 vs 总表:54 | 已证实 |
+| M7 | GREEN-MARK-001 | "左三快速采样实机 2/2，生产诊断模式"（行 129） | 状态表述准确（D10：生产 detect_only），但黑底模板缺陷仍在树中未入表：本人 System.Drawing 实测 tasks/Component/GeneralBattle/gb/ 下 gb_green_marker.png 黑像素 45%、_bottom 28.8%、_left_top 44.3%（D10 的 42.0/28.5/36.4 同向），TM_CCOEFF_NORMED 天花板≈0.90、阈值 0.8 不可达（D10 F-5） | ⚠️ 状态对但缺陷未记录 | 本人像素实测（2 步采样）；D10 F-5 | 已证实 |
+| M8 | CC-CAPTURE-002 / RR-CHECKPOINT-002 / EXP-LEVEL-001 / EXP-MAP-001 | "代码已修，待实机矩阵/真实恢复演练/3/10 场通过"（行 115/116/124/128） | 与现状一致：CC samples 表 0 行（D9 实查）、checkpoint 未做双进程演练、EXP 未重跑 30 场 | ✅ 未过期（诚实开放项） | D9 §0/D10 待实机清单 | 已证实 |
+
+### 低：格式与一致性小瑕
+
+| # | 条目 | 问题 | 证据 | 置信度 |
+|---|---|---|---|---|
+| L1 | 表头日期 | 行 3"最后更新：2026-08-10" vs 文件 mtime 2026-08-11 10:40:02，自相矛盾（D10 观察1） | 实测 mtime + 亲读行 3 | 已证实 |
+| L2 | 语义模糊 | "最后更新"仅表头一处，各条目无独立时间戳；§8 执行顺序（行 196-202）与 §9 收束（行 228-234）均无日期标注，无法判断哪个时点成立 | 亲读全文 | 已证实 |
+| L3 | 计数表述 | 行 214"126 项测试"与行 210/221/224"146/146"同表并存，口径不一 | 见 M2 | 已证实 |
+| L4 | 链接 | 86/86 个 markdown 链接全部存在，0 缺失（正面结论，无需整改） | 本人正则提取 86 个 + Test-Path 全量实测 | 已证实 |
+
+正面核验（抽查 20+ 条"已修"声称，均成立）：CONTROL-ACK-001（bridge/app/runtime.py:117-147 command_id 请求-回执 + success:false→CommandExecutionError ✅）；TASKEND-001（D10：114 处 raise 全工厂式、0 裸 raise ✅）；LAUNCH-WIRING-001、BINDING-001（D10 逐项 ✅）；CC-ENV-001(0.3.8)、CC-SEC-002、CC-IDEMP-003、CC-BUNDLE-002、CC-TXN-002、CC-ASYNC-002（D9 逐条 file:line ✅）；CC 0.3.8/146/146/schema 6（D9 实跑 + pyproject.toml version="0.3.8" 实测 ✅）；X-INTEGRATION-001 契约 v1（contracts/v1/ 三文件实测存在 ✅）。
+
+## 二、缺失清单（总表应有而全无，共 22 项）
+
+1. XiuxingHexun 新模块全部事项（08-12/13；通宵实机 82 胜/18 启/9 败/4 打满上限、06:04 收工、next_run=08-14 06:04、flow 32/32+config 18/18）——总表 0 提及（grep 实测）。
+2. DeepSeek-09 F1（CC 阻断级）：mark_artifact_damaged 写非法 state 'damaged' 违反 repository.py:570 CHECK → maintenance quarantine 必抛 IntegrityError、文件/DB 分裂。
+3. DeepSeek-09 F2-F19（19 条）：bundle import 阻塞事件循环、quarantine 无界、幂等 DB 缺 owner 维度、lease/acquire 重放死租约、幂等崩溃残留 24h 阻塞、容量 1024 上限、Session 无锁遍历、配额计软删行、bundle 无像素积上限、undoAnnotation 漏背景过滤、v1 导入无大小上限、addPoint 死代码、blink 跨画布残留、租约乒乓（F16）、capabilities 失真、token 无 ACL、OSError 逃逸。
+4. DeepSeek-09 文档漂移 5 条：protocol.md 错误信封示例、lease_required 0 发射、5 个新错误码未列、心跳"15s"实为 ~1s、start.ps1 措辞与实现分层不符。
+5. DeepSeek-10 F-1（OAS 阻断级）：BrokenPipeError 当日 4 次（script_process.py:404←logger.py print），任务中断自愈。
+6. DeepSeek-10 F-2：GuildActivityMonitor 热循环（script_task.py:22-24 无效 run_days 时 raise TaskEnd.completed 无 set_next_run → completed→RESET→立即重跑，潜伏）。
+7. DeepSeek-10 F-4：2 处跨任务旁路（MemoryScrolls:124-125、CollectiveMissions:167，详见 H1）。
+8. DeepSeek-10 F-5：绿标黑底模板确定性缺陷仍在树中（详见 M7）。
+9. DeepSeek-10 F-6/F-7：XiuxingHexun O→0 防护误判耗尽链；max_challenges 默认 0 无上限。
+10. DeepSeek-10 F-9：PUT 单值路由无 revision 门禁（详见 H5）。
+11. DeepSeek-10 F-12 = D11 R-8：测试污染生产日志（module/logger.py:369-370 import 即 set_file_logger()+hr('Start')，全天 00:34→20:39 污染 2026-08-13_python.txt）。
+12. DeepSeek-10 F-15：config_model __setattr__ 写放大未节流（config_model.py:186-197 每次赋值全量 save）。
+13. DeepSeek-11 R-1：孤儿 worker + 强杀工具链（start.ps1:184）——已证实根因，修复优先级最高。
+14. DeepSeek-11 R-3：失败计数存于 worker 进程内存（script.py:59），Core/worker 重启清零致三连败治理失效（05:36/05:46/06:00）。
+15. DeepSeek-11 R-4：'O'/'0' OCR 耗尽判定需辅助证据（script_task.py:299-302）。
+16. DeepSeek-11 N-4：sync_next_run 以 success=True 覆盖失败延时（script_router.py:479-495）→ 任务连续重跑 4 次。
+17. 租约乒乓专项（CC F16/N1-3）：08-10 880 次/08-11 864/08-12 337 次 heartbeat 423，三因耦合自持续循环。
+18. oas2 相关：config/ 无 oas2.json（实测）；D11 R-2 已证伪"oas2 秒退"为测试工件（test_script_process.py:24/50/145 child_pid=4100）——需在总表注明防误读。
+19. 测试口径更新：444/27 → 456(488/520)/29（见 M1）。
+20. RY-GUILD-001 结案记录缺失（见 H2）。
+21. handoff/README.md 审计指针补 09/10/11（见 M4）。
+22. §9 运行状态更新（Core 5936/CC 25064 运行、Bridge/前端已停、oas1 已调度非停止，见 H4）。
+
+## 三、日期与链接问题
+
+- 日期：①表头"最后更新：2026-08-10"与 mtime 08-11 10:40 矛盾（已证实）；②§9 无日期戳，08-09 内容与 08-11 mtime 语义混叠；③00-当前状态.md 快照日期 08-11 10:45，2.5 天未刷新。
+- 链接：86/86 全部存在、0 缺失、0 锚点/外链（已证实，正面——DeepSeek-10 E 子代理结论复验成立）。archive/legacy-root-20260811/ 下被引用文件（Codex-39/40/44/52、DeepSeek-03/07 等）逐一实测在位。
+
+## 四、总评
+
+1. 记录体系在 08-11 后完全停摆（总表/README/00-当前状态/任务文件全部停在 08-11，mtime 实测），而 08-12/13 恰是项目最活跃的 48 小时（XiuxingHexun 通宵实机、两次强杀重启调试、三份审查、Bridge/前端停服）——"唯一开放事项总表"的定位与实际严重不符，按表推进会系统性漏掉 2 个阻断级缺陷（CC F1、OAS F-1）。
+2. 结案规范执行缺位：RY-GUILD-001 口头结案无结案记录，违反 04-测试与结案规范.md 与总表 §7.4 自身规定；tasks/ 任务文件状态与总表互相矛盾。
+3. 代码声称大体诚实：抽查 20+ 条"已修复/已实施"绝大多数经 file:line 证实（09/10 两轮共 40+ 项父代理复验零虚报 + 本人本次复核一致）；但 SCHED-AUTH-001 被 2 处旁路证伪、CONFIG-CONCURRENCY-001 被 PUT 缺口削弱，这两条"已完成"必须降级重开。
+4. 计数全线过期：444/444、27/27+3/3、16/16、126、9/47/8/8 均为 08-09~11 时点数字，与 08-13 现状（456/488(520)、29/29+3/3、146、17/81/16/17）不符；仅 CC 0.3.8/146/146/schema 6 仍准。
+5. 建议（不实施）：①立即按 DeepSeek-11 §6 优先级更新总表（补 XiuxingHexun 事项 + D9/10/11 全部发现 + 修正 H1/H4/H5 + §9 运行状态）；②为 RY-GUILD-001 补建结案记录或降级状态；③建立"总表 mtime 与事件链同步"的更新纪律；④修正表头日期与全部计数，标注"126/9-47-8-8"为历史口径；⑤为 CC F16 租约乒乓、oas2 澄清、测试污染（F-12）各立一条可追溯记录，防止后续轮次重复误判（D10 E 子代理的误判教训即源于无记录）。

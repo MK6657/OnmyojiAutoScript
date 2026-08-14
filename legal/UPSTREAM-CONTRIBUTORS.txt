@@ -1,0 +1,79 @@
+Git history contributor display names
+Generated: 2026-08-03
+Scope: git log --all
+Note: aliases are intentionally not merged; this is provenance, not a copyright determination.
+
+AARONkjLee
+Asriel Xu
+Azur
+Azure
+AzurTian
+ChengRanORZ
+Chino dentist Ko
+chubbycat
+CiderCue
+david
+endlesswxk
+Finn
+FLAG12321
+Gan1Ser
+GanSer
+ghg11
+HamzaLiu
+HanChao Zhan
+HITGoose
+huangrunheng
+Hurry2
+Hyhang
+Isak
+jack
+Jacky Wei
+jackyhwei
+jhhwhyqa
+leovefy
+LHY
+lhye
+linghuchong
+liu
+Liu Huayi
+liuhuayi
+liujiang
+liujx54704
+Liu-yixi
+lizhenxi
+ljxun
+lyyyyyyy
+Megumi
+Merlin
+Migs
+migsmiku
+minjie
+MK6657
+moon
+Neptine
+ohspecial
+paofan
+PPdog-1120
+qiyonghan
+Rain1231244
+runhey
+ryland
+SageWizWang
+shr
+stigma
+tataqioko
+TripleEarth
+unknown
+wanniwa
+weirj2016-ai
+yEs1do
+YLXJ
+Your Name
+ytipocmk631
+Yuulong
+yuyuyuyuyu
+zhaiyujia
+zyh
+淅沥沥丶下雨
+徐旭光
+

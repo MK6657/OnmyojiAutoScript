@@ -578,6 +578,9 @@ class Connection(ConnectionAttr):
         return True
 
     def adb_disconnect(self, serial):
+        invalidate = getattr(self, 'invalidate_recognition_cache', None)
+        if callable(invalidate):
+            invalidate('adb_disconnect')
         msg = self.adb_client.disconnect(serial)
         if msg:
             logger.info(msg)
@@ -603,6 +606,9 @@ class Connection(ConnectionAttr):
         """
            Reboot adb client if no device found, otherwise try reconnecting device.
         """
+        invalidate = getattr(self, 'invalidate_recognition_cache', None)
+        if callable(invalidate):
+            invalidate('adb_reconnect')
         # if self.config.Emulator_AdbRestart and len(self.list_device()) == 0:
         if self.config.script.device.adb_restart and len(self.list_device()) == 0:
             # Restart Adb
@@ -709,7 +715,15 @@ class Connection(ConnectionAttr):
             o = 0
             logger.warning('Unable to get device orientation, assume it is normal')
 
+        previous = getattr(self, 'orientation', None)
         self.orientation = o
+        if previous != o:
+            invalidate = getattr(self, 'invalidate_recognition_cache', None)
+            if callable(invalidate):
+                invalidate('orientation_changed')
+            ipc = getattr(self, '__dict__', {}).get('nemu_ipc')
+            if ipc is not None and hasattr(ipc, 'invalidate_resolution'):
+                ipc.invalidate_resolution('orientation_changed')
         logger.attr('Device Orientation', f'{o} ({Connection._orientation_description.get(o, "Unknown")})')
         return o
 

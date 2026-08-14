@@ -1,30 +1,23 @@
 param(
   [switch]$SkipNpmInstall,
-  [switch]$SkipBridge,
-  # 选择打进桌面版的前端：UI-claude = 新界面（默认）；frontend = 旧生产前端，仅在对照/回退时显式指定。
-  [ValidateSet('UI-claude', 'frontend')]
-  [string]$Ui = 'UI-claude'
+  [switch]$SkipBridge
 )
 
 $ErrorActionPreference = 'Stop'
 $desktop = $PSScriptRoot
 $root = Join-Path $desktop '..\..'
-if ($Ui -eq 'UI-claude') {
-  $frontend = Join-Path $desktop 'release\UI-claude'
-} else {
-  $frontend = Join-Path $root 'control-center\frontend'
-}
+$frontend = Join-Path $root 'control-center\frontend'
 $bridge = Join-Path $root 'control-center\bridge'
 $ui = Join-Path $desktop 'ui'
 $bridgeDist = Join-Path $desktop 'bridge-dist'
 $pyWork = Join-Path $desktop 'build\pyinstaller'
 $dataSeed = Join-Path $desktop 'data-seed'
 
-Write-Host ("[build] 前端来源：{0}  (-Ui {1})" -f $frontend, $Ui) -ForegroundColor Cyan
+Write-Host ("[build] 唯一前端来源：{0}" -f $frontend) -ForegroundColor Cyan
 
 Set-Location $root
 $env:VITE_BRIDGE_URL = 'http://127.0.0.1:22367'
-# 新界面(UI-claude)第一次打包时它自己的 node_modules 可能还没装，这里按需补一次（可用 -SkipNpmInstall 跳过）。
+# 第一次打包时按需安装前端依赖（可用 -SkipNpmInstall 跳过）。
 if (-not $SkipNpmInstall -and -not (Test-Path (Join-Path $frontend 'node_modules'))) {
   Write-Host ("[build] 安装前端依赖：{0}" -f $frontend) -ForegroundColor Cyan
   npm --prefix $frontend install

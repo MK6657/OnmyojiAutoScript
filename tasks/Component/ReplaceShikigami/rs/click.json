@@ -6,6 +6,18 @@
     "description": "description"
   },
   {
+    "itemName": "shikigami_category_all",
+    "roiFront": "31,612,66,20",
+    "roiBack": "31,612,66,20",
+    "description": "open candidate category fan"
+  },
+  {
+    "itemName": "shikigami_class_material",
+    "roiFront": "38,286,54,52",
+    "roiBack": "38,286,54,52",
+    "description": "material category fallback"
+  },
+  {
     "itemName": "shikigami_left_1",
     "roiFront": "163,487,100,179",
     "roiBack": "163,487,100,179",

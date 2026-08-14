@@ -26,10 +26,10 @@ class ScriptTask(GameUi, GeneralBattle, GeneralRoom, GeneralInvite, NianAssets):
             logger.warning(f'Nian in CD {cd}')
             if cd is False:
                 self.set_next_run(task='Nian', success=False, finish=True)
-                raise TaskEnd('Nian')
+                raise TaskEnd.completed('Nian')
             next_run = datetime.now() + cd
             self.set_next_run(task='Nian', success=False, finish=False, target=next_run)
-            raise TaskEnd('Nian')
+            raise TaskEnd.completed('Nian')
 
         self.ui_get_current_page()
         self.ui_goto(page_team)
@@ -120,7 +120,7 @@ class ScriptTask(GameUi, GeneralBattle, GeneralRoom, GeneralInvite, NianAssets):
 
         # 退出结束
         self.set_next_run(task='Nian', success=True, finish=False)
-        raise TaskEnd('Nian')
+        raise TaskEnd.completed('Nian')
 
     def check_cd(self) -> False or timedelta:
         """

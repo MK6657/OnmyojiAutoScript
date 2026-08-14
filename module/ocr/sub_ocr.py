@@ -258,4 +258,3 @@ class Quantity(BaseCor):
 if __name__ == '__main__':
     import cv2
     image = cv2.imread(r'E:\Project\OnmyojiAutoScript-assets\jade.png')
-

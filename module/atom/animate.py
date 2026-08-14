@@ -1,6 +1,9 @@
 from pathlib import Path
 from module.logger import logger
 
+import cv2
+import numpy as np
+
 from module.atom.image import RuleImage
 from module.atom.click import RuleClick
 from module.atom.long_click import RuleLongClick
@@ -54,13 +57,25 @@ class RuleAnimate(RuleImage):
         @param refresh_after_stable:
         @return:
         """
-        if self._last_image is None:
-            self._last_image = image
+        current = self.corp(image, self.roi_front)
+        if current.size == 0:
+            self._last_image = None
             return False
 
-        self._image = self._last_image
-        matched = self.match(image)
-        self._last_image = self.corp(image, self.roi_front)
+        if self._last_image is None:
+            self._last_image = current.copy()
+            return False
+
+        previous = self._last_image
+        matched = False
+        if previous.shape == current.shape:
+            score = cv2.matchTemplate(current, previous, cv2.TM_CCOEFF_NORMED)[0, 0]
+            if np.isnan(score):
+                score = 1.0 if np.array_equal(previous, current) else 0.0
+            mean_difference = float(np.mean(cv2.absdiff(previous, current)))
+            difference_limit = 255.0 * (1.0 - self.threshold)
+            matched = score > self.threshold and mean_difference <= difference_limit
+        self._last_image = current.copy()
 
         if matched:
             if refresh_after_stable:
@@ -85,4 +100,3 @@ if __name__ == '__main__':
     print(ttt.stable(imga))
     print(ttt.stable(imgb))
     print(ttt.stable(imgb))
-

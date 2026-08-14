@@ -9,6 +9,15 @@
     "description": "准备"
   },
   {
+    "itemName": "battle_result_continue",
+    "roiFront": "540,670,220,45",
+    "roiBack": "540,670,220,45",
+    "mode": "Single",
+    "method": "Default",
+    "keyword": "点击屏幕继续",
+    "description": "战斗结算页点击屏幕继续"
+  },
+  {
     "itemName": "preset",
     "roiFront": "20,620,60,80",
     "roiBack": "20,620,60,80",

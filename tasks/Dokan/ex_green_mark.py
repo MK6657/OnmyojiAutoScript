@@ -125,7 +125,7 @@ class ExtendGreenMark(GeneralBattle):
         else:
             # 使用式神名称进行绿标
             def detect_name_position_retry():
-                self.device.screenshot()
+                self.screenshot()
                 return self.detect_name_position(self.device.image, self._shikigami_name)
 
             # 多试几次，避免识别失败

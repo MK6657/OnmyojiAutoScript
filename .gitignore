@@ -56,6 +56,15 @@ output/
 control-center/data/*.db
 control-center/data/*.db-*
 control-center/bridge/app/_backup_*/
+/backups/
+/work/
+/tmp/
+/control-center/bridge/.venv/
+/control-center/desktop/release/
+/control-center/desktop/bridge-dist/
+/control-center/desktop/ui/
+/control-center/desktop/data-seed/
+/control-center/desktop/bridge-test-data/
 
 
 # Created by .ignore support plugin (hsz.mobi)

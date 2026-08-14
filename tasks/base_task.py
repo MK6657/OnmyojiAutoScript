@@ -2,10 +2,14 @@
 # @author runhey
 # github https://github.com/runhey
 
-from time import sleep, time
+from time import monotonic, sleep, time
 
+import inspect
 import random
+import threading
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from module.atom.animate import RuleAnimate
 from module.atom.click import RuleClick
 from module.atom.gif import RuleGif
@@ -17,14 +21,31 @@ from module.atom.swipe import RuleSwipe
 from module.base.timer import Timer
 from module.config.config import Config
 from module.device.device import Device
-from module.exception import ScriptError
+from module.exception import GameStuckError, GameTooManyClickError
 from module.logger import logger
 from module.ocr.base_ocr import OcrMode
+from tasks.Component.CommonPopup import (
+    CommonPopupDispatcher,
+    FriendInvitationPopupHandler,
+)
+from tasks.Component.GeneralBuff.idle_prompt import (
+    LongIdleBuffPromptGuard,
+    LongIdleBuffPromptStatus,
+)
 from tasks.Component.Costume.costume_base import CostumeBase
 from tasks.Component.config_base import Time
 from tasks.GlobalGame.assets import GlobalGameAssets
-from tasks.GlobalGame.config_emergency import FriendInvitation
 from typing import Union
+
+
+@dataclass(frozen=True)
+class UiClickFailure:
+    reason: str
+    target: str
+    actions: int
+    timeout: float | None
+    max_actions: int | None
+    detail: str | None = None
 
 
 class BaseTask(GlobalGameAssets, CostumeBase):
@@ -60,70 +81,70 @@ class BaseTask(GlobalGameAssets, CostumeBase):
         # 战斗次数相关
         self.current_count = 0  # 战斗次数
         self._boss_mark_flag = False
+        self._common_popup_dispatcher = None
+        self.long_idle_buff_prompt_guard = LongIdleBuffPromptGuard()
+        self.friend_invitation_popup_handler = FriendInvitationPopupHandler()
+
+    def _get_common_popup_dispatcher(self) -> CommonPopupDispatcher:
+        dispatcher = getattr(self, '_common_popup_dispatcher', None)
+        if dispatcher is None:
+            if not hasattr(self, 'long_idle_buff_prompt_guard'):
+                self.long_idle_buff_prompt_guard = LongIdleBuffPromptGuard()
+            if not hasattr(self, 'friend_invitation_popup_handler'):
+                self.friend_invitation_popup_handler = FriendInvitationPopupHandler()
+            dispatcher = CommonPopupDispatcher((
+                self.long_idle_buff_prompt_guard,
+                self.friend_invitation_popup_handler,
+            ))
+            self._common_popup_dispatcher = dispatcher
+        return dispatcher
 
     def _burst(self) -> bool:
-        """
-        游戏界面突发异常检测
-        :return: 没有出现返回False, 其他True
-        """
-        image = self.device.image
-        appear_invitation = self.appear(self.I_G_ACCEPT)
-        if not appear_invitation:
-            return False
-        logger.info('Invitation appearing')
-        invite_type = self.config.global_game.emergency.friend_invitation
-        detect_record = self.device.detect_record
-        match invite_type:
-            case FriendInvitation.ACCEPT:
-                logger.info(f"Accept friend invitation")
-                click_button = self.I_G_ACCEPT
-            case FriendInvitation.REJECT:
-                logger.info(f"Reject friend invitation")
-                click_button = self.I_G_REJECT
-            case FriendInvitation.ONLY_JADE:
-                # 勾协
-                logger.info(f"Only accept jade invitation")
-                if self.appear(self.I_G_JADE):
-                    click_button = self.I_G_ACCEPT
-                else:
-                    click_button = self.I_G_IGNORE
-            case FriendInvitation.JADE_AND_FOOD:
-                # 如果是接受勾协和粮协
-                logger.info(f"Accept jade and food invitation")
-                if self.appear(self.I_G_JADE) or self.appear(self.I_G_CAT_FOOD) or self.appear(self.I_G_DOG_FOOD):
-                    click_button = self.I_G_ACCEPT
-                else:
-                    click_button = self.I_G_IGNORE
-            case FriendInvitation.IGNORE:
-                # 如果是忽略
-                logger.info(f"Ignore friend invitation")
-                click_button = self.I_G_IGNORE
-            case _:
-                raise ScriptError(f'Unknown friend invitation type: {invite_type}')
-        if not click_button:
-            raise ScriptError(f'Unknown click button type: {invite_type}')
-        while 1:
-            self.device.screenshot()
-            if not self.appear(target=click_button):
-                logger.info('Deal with invitation done')
-                break
-            if self.appear_then_click(click_button, interval=0.8):
-                continue
-        # 有的时候长战斗 点击后会取消战斗状态
-        self.device.detect_record = detect_record
-        # 如果接受邀请则立即执行悬赏任务
-        if click_button == self.I_G_ACCEPT:
-            self.set_next_run(task='WantedQuests', target=datetime.now().replace(microsecond=0))
-        return True
+        """Compatibility wrapper for the former invitation-only guard."""
+        handler = getattr(self, 'friend_invitation_popup_handler', None)
+        if handler is None:
+            handler = FriendInvitationPopupHandler()
+            self.friend_invitation_popup_handler = handler
+        dispatcher = CommonPopupDispatcher(
+            (handler,),
+            evidence_enabled=False,
+        )
+        report = dispatcher.stabilize(self)
+        return report.actions > 0
 
     def screenshot(self):
         """
         截图 引入中间函数的目的是 为了解决如协作的这类突发的事件
         :return:
         """
-        self.device.screenshot()
-        # 判断勾协
-        self._burst()
+        return BaseTask.protected_screenshot(self)
+
+    def protected_screenshot(
+        self,
+        *,
+        capture=None,
+        capture_deadline_capable: bool | None = None,
+    ):
+        """Capture one frame through the global popup dispatcher."""
+        if capture_deadline_capable is None:
+            device_config = getattr(
+                getattr(getattr(self.config, 'script', None), 'device', None),
+                'screenshot_method',
+                '',
+            )
+            method = getattr(device_config, 'value', device_config)
+            # Nemu IPC has its own bounded 150 ms native call. Other existing
+            # capture backends are still usable for detection, but cannot
+            # authorize an automatic popup click.
+            capture_deadline_capable = str(method).lower() == 'nemu_ipc'
+        if capture is None:
+            capture = getattr(self.device, 'screenshot')
+        report = self._get_common_popup_dispatcher().capture_and_stabilize(
+            self,
+            capture=capture,
+            capture_deadline_capable=bool(capture_deadline_capable),
+        )
+        self._last_popup_dispatch_report = report
 
         # # 判断网络异常
         # if self.appear(self.I_NETWORK_ABNORMAL):
@@ -136,6 +157,66 @@ class BaseTask(GlobalGameAssets, CostumeBase):
         #     raise GameStuckError
 
         return self.device.image
+
+    def _capture_common_popup_frame(self, *, deadline: float, capture=None):
+        if monotonic() >= deadline:
+            raise GameStuckError('Common popup budget exhausted before capture')
+        if capture is None:
+            raise GameStuckError('Common popup capture callback is missing')
+        result = capture()
+        if monotonic() >= deadline:
+            raise GameStuckError('Common popup budget exhausted during capture')
+        return result
+
+    def _common_popup_ocr_text(self, rule, image, *, deadline: float | None):
+        """Run popup OCR behind a deadline without permitting a late click."""
+        remaining = None if deadline is None else deadline - monotonic()
+        if remaining is not None and remaining <= 0:
+            raise GameStuckError('Common popup budget exhausted before OCR')
+
+        result = {}
+        completed = threading.Event()
+
+        def worker():
+            try:
+                result['value'] = rule.detect_text(image)
+            except BaseException as exc:
+                result['error'] = exc
+            finally:
+                completed.set()
+
+        thread = threading.Thread(
+            target=worker,
+            name='common-popup-ocr',
+            daemon=True,
+        )
+        thread.start()
+        if not completed.wait(timeout=remaining):
+            raise GameStuckError('Common popup OCR exceeded dispatcher deadline')
+        if 'error' in result:
+            raise result['error']
+        return result.get('value', '')
+
+    def _handle_long_idle_buff_prompt(self):
+        """Resolve the global idle-buff modal before callers inspect the frame."""
+        result = self.long_idle_buff_prompt_guard.handle(self)
+        self._last_long_idle_buff_prompt_result = result
+        if result.status is LongIdleBuffPromptStatus.CONFIRMED:
+            logger.info(
+                'LONG_IDLE_BUFF_PROMPT status=resolved '
+                f'action={result.choice.value if result.choice else "unknown"} '
+                f'attempts={result.attempts} click={result.click_point} '
+                f'frame_sha256={result.frame_sha256 or "unavailable"}'
+            )
+        elif result.status is LongIdleBuffPromptStatus.FAILED:
+            logger.error(
+                'LONG_IDLE_BUFF_PROMPT status=failed '
+                f'attempts={result.attempts} reason={result.reason}'
+            )
+            raise GameStuckError(
+                'Long-idle buff prompt remained visible after bounded action'
+            )
+        return result
 
     def maybe_screenshot(self, soft_skip: bool = False):
         """
@@ -153,6 +234,134 @@ class BaseTask(GlobalGameAssets, CostumeBase):
         :return: 有返回True，没有返回False
         """
         return hasattr(self.device, 'image') and self.device.image is not None
+
+    @staticmethod
+    def _recognition_value(value):
+        """Make mutable rule settings safe to use in a cache key."""
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple)):
+            return tuple(BaseTask._recognition_value(item) for item in value)
+        if isinstance(value, dict):
+            return tuple(sorted(
+                (key, BaseTask._recognition_value(item))
+                for key, item in value.items()
+            ))
+        return str(value)
+
+    @staticmethod
+    def _recognition_operation_identity(target, operation):
+        """Unify equivalent OCR entry points for SINGLE rules."""
+        if operation not in ('ocr', 'ocr_single'):
+            return operation
+        mode = getattr(target, 'mode', None)
+        mode_name = getattr(mode, 'name', str(mode)).upper()
+        if mode_name == 'SINGLE' or mode_name.endswith('.SINGLE'):
+            return 'ocr_single'
+        return operation
+
+    def _recognition_cache_key(
+        self,
+        target,
+        operation='ocr',
+        keyword=None,
+        score=None,
+        preprocess_mode=None,
+    ):
+        """Build a rule-specific, frame-specific recognition cache key."""
+        device = self.device
+        image = getattr(device, 'image', None)
+        preprocess = getattr(type(target), 'pre_process', None)
+        preprocess_identity = preprocess_mode or (
+            getattr(preprocess, '__module__', ''),
+            getattr(preprocess, '__qualname__', repr(preprocess)),
+        )
+        return (
+            getattr(device, 'frame_id', id(image)),
+            self._recognition_operation_identity(target, operation),
+            id(target),
+            getattr(target, 'name', ''),
+            self._recognition_value(getattr(target, 'roi', None)),
+            self._recognition_value(getattr(target, 'mode', None)),
+            self._recognition_value(getattr(target, 'method', None)),
+            self._recognition_value(
+                getattr(target, 'keyword', '') if keyword is None else keyword
+            ),
+            self._recognition_value(score),
+            self._recognition_value(preprocess_identity),
+        )
+
+    def _ocr_cached(
+        self,
+        target: RuleOcr,
+        operation='ocr',
+        keyword=None,
+        score=None,
+        preprocess_mode=None,
+    ):
+        """Run one OCR operation per compatible frame and rule contract."""
+        device = self.device
+        cache_get = getattr(device, 'recognition_cache_get', None)
+        cache_set = getattr(device, 'recognition_cache_set', None)
+        key = self._recognition_cache_key(
+            target,
+            operation=operation,
+            keyword=keyword,
+            score=score,
+            preprocess_mode=preprocess_mode,
+        )
+        if callable(cache_get):
+            hit, value = cache_get(key)
+            if hit:
+                logger.debug(
+                    f'OCR_CACHE_HIT frame_id={getattr(device, "frame_id", 0)} '
+                    f'rule={getattr(target, "name", target)} operation={operation}'
+                )
+                return value
+
+        image = getattr(device, 'image', None)
+        if operation == 'ocr_single':
+            value = target.ocr_single(image)
+        elif keyword is None:
+            value = target.ocr(image)
+        else:
+            value = target.ocr(image, keyword=keyword)
+
+        if callable(cache_set):
+            cache_set(key, value)
+            logger.debug(
+                f'OCR_CACHE_STORE frame_id={getattr(device, "frame_id", 0)} '
+                f'rule={getattr(target, "name", target)} operation={operation}'
+            )
+        return value
+
+    def _detect_cached(self, target: RuleOcr, log_display=True):
+        """Cache one full/vertical OCR pass for the current frame."""
+        device = self.device
+        cache_get = getattr(device, 'recognition_cache_get', None)
+        cache_set = getattr(device, 'recognition_cache_set', None)
+        key = self._recognition_cache_key(
+            target,
+            operation='detect_and_ocr',
+            score=None,
+            preprocess_mode=('detect_and_ocr', bool(log_display)),
+        )
+        if callable(cache_get):
+            hit, value = cache_get(key)
+            if hit:
+                logger.debug(
+                    f'OCR_CACHE_HIT frame_id={getattr(device, "frame_id", 0)} '
+                    f'rule={getattr(target, "name", target)} operation=detect_and_ocr'
+                )
+                return value
+        value = target.detect_and_ocr(device.image, logDisplay=log_display)
+        if callable(cache_set):
+            cache_set(key, value)
+            logger.debug(
+                f'OCR_CACHE_STORE frame_id={getattr(device, "frame_id", 0)} '
+                f'rule={getattr(target, "name", target)} operation=detect_and_ocr'
+            )
+        return value
 
     def appear(self,
                target: RuleImage | RuleGif | RuleOcr,
@@ -449,15 +658,15 @@ class BaseTask(GlobalGameAssets, CostumeBase):
                 logger.info(f'Wait_animate_stable({rule}) timeout')
                 break
 
-    def swipe(self, swipe: RuleSwipe, interval: float = None) -> None:
+    def swipe(self, swipe: RuleSwipe, interval: float = None) -> bool:
         """
 
         :param interval:
         :param swipe:
-        :return:
+        :return: True only when the device swipe was executed.
         """
         if not isinstance(swipe, RuleSwipe):
-            return
+            return False
 
         if interval:
             if swipe.name in self.interval_timer:
@@ -469,15 +678,23 @@ class BaseTask(GlobalGameAssets, CostumeBase):
                 self.interval_timer[swipe.name] = Timer(interval)
             # 如果时间还没到达，则不执行
             if not self.interval_timer[swipe.name].reached():
-                return
+                return False
 
         x1, y1, x2, y2 = swipe.coord()
-        self.device.swipe(p1=(x1, y1), p2=(x2, y2), control_name=swipe.name)
+        executed = self.device.swipe(
+            p1=(x1, y1), p2=(x2, y2), control_name=swipe.name
+        )
+
+        # Control.swipe returns False for a rejected/invalid gesture. Treat
+        # legacy device adapters returning None as successful for compatibility.
+        if executed is False:
+            return False
 
         # 执行后，如果有限制时间，则重置限制时间
         if interval:
             # logger.info(f'Swipe {swipe.name}')
             self.interval_timer[swipe.name].reset()
+        return True
 
     def click(self, click: Union[RuleClick, RuleLongClick, RuleImage, RuleOcr] = None, interval: float = None) -> bool:
         """
@@ -536,7 +753,7 @@ class BaseTask(GlobalGameAssets, CostumeBase):
             if not self.interval_timer[target.name].reached():
                 return None
 
-        result = target.ocr(self.device.image)
+        result = self._ocr_cached(target, operation='ocr', score=None)
         appear = False
 
         if not target.keyword or target.keyword == '':
@@ -643,6 +860,26 @@ class BaseTask(GlobalGameAssets, CostumeBase):
             return True
         return False
 
+    def _schedule_caller_identity(self) -> str:
+        running_task = getattr(getattr(self.config, 'model', None), 'running_task', '')
+        if running_task:
+            return running_task
+
+        module_parts = type(self).__module__.split('.')
+        if len(module_parts) > 1 and module_parts[0] == 'tasks':
+            return module_parts[1]
+
+        try:
+            task_root = Path(__file__).resolve().parent
+            class_file = Path(inspect.getfile(type(self))).resolve()
+            relative = class_file.relative_to(task_root)
+            if len(relative.parts) > 1:
+                return relative.parts[0]
+        except (OSError, TypeError, ValueError):
+            pass
+
+        return type(self).__name__
+
     def set_next_run(self, task: str, finish: bool = False,
                      success: bool = None, server: bool = True, target: datetime = None) -> None:
         """
@@ -658,7 +895,20 @@ class BaseTask(GlobalGameAssets, CostumeBase):
             start_time = datetime.now().replace(microsecond=0)
         else:
             start_time = self.start_time
-        self.config.task_delay(task, start_time=start_time, success=success, server=server, target=target)
+        caller = self._schedule_caller_identity()
+        reason = (
+            f'set_next_run success={success!r} finish={finish!r} '
+            f'server={server!r} target={target!r}'
+        )
+        return self.config.task_delay(
+            task,
+            start_time=start_time,
+            success=success,
+            server=server,
+            target=target,
+            reason=reason,
+            caller=caller,
+        )
 
     def custom_next_run(self, task: str, custom_time: Time = None, time_delta: float = 1) -> None:
         """
@@ -685,49 +935,101 @@ class BaseTask(GlobalGameAssets, CostumeBase):
             self.screenshot()
         return self.appear_then_click(self.I_UI_REWARD, action=self.C_UI_REWARD, interval=0.4, threshold=0.6)
 
-    def ui_get_reward(self, click_image: RuleImage or RuleOcr or RuleClick, click_interval: float = 1):
-        """
-        传进来一个点击图片 或是 一个ocr， 会点击这个图片，然后等待‘获得奖励’，
-        最后当获得奖励消失后 退出
-        :param click_interval:
-        :param click_image:
-        :return:
-        """
-        _timer = Timer(10)
-        _timer.start()
+    def ui_get_reward(
+        self,
+        click_image: RuleImage or RuleOcr or RuleClick,
+        click_interval: float = 1,
+        timeout: float = 10.0,
+        max_actions: int = 8,
+    ):
+        """Click through one reward flow with a total deadline and action cap."""
+        timer = Timer(timeout).start()
+        actions = 0
+        reward_seen = False
+        self._last_ui_click_failure = None
         while 1:
             self.screenshot()
-
-            if self.ui_reward_appear_click():
-                sleep(0.5)
-                while 1:
-                    self.screenshot()
-                    # 等待动画结束
-                    if not self.appear(self.I_UI_REWARD, threshold=0.6):
-                        logger.info('Get reward success')
-                        break
-
-                    # 一直点击
-                    if self.ui_reward_appear_click():
-                        continue
-                break
-            if _timer.reached():
-                logger.warning('Get reward timeout')
-                break
-
-            if isinstance(click_image, RuleImage):
-                if self.appear_then_click(click_image, interval=click_interval):
+            if reward_seen and not self.appear(self.I_UI_REWARD, threshold=0.6):
+                logger.info('Get reward success')
+                return True
+            if timer.reached():
+                BaseTask._set_ui_click_failure(
+                    self,
+                    reason='page_transition_timeout',
+                    target=click_image,
+                    actions=actions,
+                    timeout=timeout,
+                    max_actions=max_actions,
+                )
+                return False
+            if actions >= max_actions:
+                BaseTask._set_ui_click_failure(
+                    self,
+                    reason='action_budget_exhausted',
+                    target=click_image,
+                    actions=actions,
+                    timeout=timeout,
+                    max_actions=max_actions,
+                )
+                return False
+            try:
+                if self.ui_reward_appear_click():
+                    reward_seen = True
+                    actions += 1
                     continue
-            elif isinstance(click_image, RuleOcr):
-                if self.ocr_appear_click(click_image, interval=click_interval):
-                    continue
-            elif isinstance(click_image, RuleClick):
-                if self.click(click_image, interval=click_interval):
-                    continue
+                operated = False
+                if isinstance(click_image, RuleImage):
+                    operated = self.appear_then_click(
+                        click_image,
+                        interval=click_interval,
+                    )
+                elif isinstance(click_image, RuleOcr):
+                    operated = self.ocr_appear_click(
+                        click_image,
+                        interval=click_interval,
+                    )
+                elif isinstance(click_image, RuleClick):
+                    operated = self.click(click_image, interval=click_interval)
+            except GameTooManyClickError as error:
+                BaseTask._set_ui_click_failure(
+                    self,
+                    reason='control_rejected',
+                    target=click_image,
+                    actions=actions,
+                    timeout=timeout,
+                    max_actions=max_actions,
+                    detail=str(error),
+                )
+                return False
+            if operated:
+                actions += 1
 
-        return True
+    @staticmethod
+    def _set_ui_click_failure(
+        owner,
+        *,
+        reason: str,
+        target,
+        actions: int,
+        timeout: float | None,
+        max_actions: int | None,
+        detail: str | None = None,
+    ) -> None:
+        owner._last_ui_click_failure = UiClickFailure(
+            reason=reason,
+            target=getattr(target, 'name', type(target).__name__),
+            actions=actions,
+            timeout=timeout,
+            max_actions=max_actions,
+            detail=detail,
+        )
+        logger.warning(
+            'UI click workflow failed '
+            f'reason={reason} target={owner._last_ui_click_failure.target} '
+            f'actions={actions} timeout={timeout!r} max_actions={max_actions!r}'
+        )
 
-    def ui_click(self, click, stop, interval=1, timeout=None):
+    def ui_click(self, click, stop, interval=1, timeout=None, max_actions=None):
         """
         循环的一个操作，直到出现stop
         :param click:
@@ -736,20 +1038,54 @@ class BaseTask(GlobalGameAssets, CostumeBase):
         :param timeout: 超时时间（秒），None表示不超时
         :return:
         """
-        timer = Timer(timeout).start() if timeout else None
+        timer = Timer(timeout).start() if timeout is not None else None
+        actions = 0
+        self._last_ui_click_failure = None
         while 1:
             self.screenshot()
             if self.appear(stop):
                 return True
             if timer and timer.reached():
-                logger.warning(f'ui_click timeout after {timeout}s')
+                BaseTask._set_ui_click_failure(
+                    self,
+                    reason='page_transition_timeout',
+                    target=click,
+                    actions=actions,
+                    timeout=timeout,
+                    max_actions=max_actions,
+                )
                 return False
-            if isinstance(click, RuleImage) and self.appear_then_click(click, interval=interval):
-                continue
-            if isinstance(click, RuleClick) and self.click(click, interval=interval):
-                continue
-            elif isinstance(click, RuleOcr) and self.ocr_appear_click(click, interval=interval):
-                continue
+            if max_actions is not None and actions >= max_actions:
+                BaseTask._set_ui_click_failure(
+                    self,
+                    reason='action_budget_exhausted',
+                    target=click,
+                    actions=actions,
+                    timeout=timeout,
+                    max_actions=max_actions,
+                )
+                return False
+            try:
+                operated = False
+                if isinstance(click, RuleImage):
+                    operated = self.appear_then_click(click, interval=interval)
+                elif isinstance(click, RuleClick):
+                    operated = self.click(click, interval=interval)
+                elif isinstance(click, RuleOcr):
+                    operated = self.ocr_appear_click(click, interval=interval)
+            except GameTooManyClickError as error:
+                BaseTask._set_ui_click_failure(
+                    self,
+                    reason='control_rejected',
+                    target=click,
+                    actions=actions,
+                    timeout=timeout,
+                    max_actions=max_actions,
+                    detail=str(error),
+                )
+                return False
+            if operated:
+                actions += 1
 
     def ui_clicks(self, clicks: list[RuleImage | RuleOcr | RuleClick], stop: RuleImage, interval=1):
         while 1:
@@ -764,19 +1100,60 @@ class BaseTask(GlobalGameAssets, CostumeBase):
                 elif isinstance(click, RuleOcr) and self.ocr_appear_click(click, interval=interval):
                     continue
 
-    def ui_click_until_disappear(self, click, interval: float = 1):
+    def ui_click_until_disappear(
+        self,
+        click,
+        interval: float = 1,
+        timeout: float = None,
+        max_actions: int = None,
+    ):
         """
         点击一个按钮直到消失
         :param interval:
         :param click:
         :return:
         """
+        timer = Timer(timeout).start() if timeout is not None else None
+        actions = 0
+        self._last_ui_click_failure = None
         while 1:
             self.screenshot()
             if not self.appear(click):
-                break
-            elif self.appear_then_click(click, interval=interval):
-                continue
+                return True
+            if timer and timer.reached():
+                BaseTask._set_ui_click_failure(
+                    self,
+                    reason='button_not_disappeared',
+                    target=click,
+                    actions=actions,
+                    timeout=timeout,
+                    max_actions=max_actions,
+                )
+                return False
+            if max_actions is not None and actions >= max_actions:
+                BaseTask._set_ui_click_failure(
+                    self,
+                    reason='action_budget_exhausted',
+                    target=click,
+                    actions=actions,
+                    timeout=timeout,
+                    max_actions=max_actions,
+                )
+                return False
+            try:
+                if self.appear_then_click(click, interval=interval):
+                    actions += 1
+            except GameTooManyClickError as error:
+                BaseTask._set_ui_click_failure(
+                    self,
+                    reason='control_rejected',
+                    target=click,
+                    actions=actions,
+                    timeout=timeout,
+                    max_actions=max_actions,
+                    detail=str(error),
+                )
+                return False
 
     def ui_click_until_smt_disappear(self, click, stop, interval: float = 1):
         """

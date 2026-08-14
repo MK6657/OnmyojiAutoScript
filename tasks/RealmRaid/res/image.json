@@ -74,8 +74,8 @@
   {
     "itemName": "unlock",
     "imageName": "res_unlock.png",
-    "roiFront": "818,579,38,42",
-    "roiBack": "818,579,38,42",
+    "roiFront": "814,578,38,42",
+    "roiBack": "808,572,54,54",
     "method": "Template matching",
     "threshold": 0.8,
     "description": "没有锁的状态图标"
@@ -83,8 +83,8 @@
   {
     "itemName": "lock",
     "imageName": "res_lock.png",
-    "roiFront": "818,579,36,41",
-    "roiBack": "818,579,36,41",
+    "roiFront": "814,578,36,41",
+    "roiBack": "808,572,54,54",
     "method": "Template matching",
     "threshold": 0.8,
     "description": "以锁的状态图片"

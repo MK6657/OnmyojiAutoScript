@@ -11,5 +11,15 @@ class FastDevice(BaseTask):
     def fast_screenshot(self):
         if self.config.model.script.device.screenshot_method != ScreenshotMethod.WINDOW_BACKGROUND:
             raise
-        self.device.image = self.device.screenshot_window_background()
-        return self.device.image
+
+        def capture_fast_frame():
+            self.device.image = self.device.screenshot_window_background()
+            publish_frame = getattr(self.device, 'publish_frame', None)
+            if callable(publish_frame):
+                publish_frame()
+            return self.device.image
+
+        return self.protected_screenshot(
+            capture=capture_fast_frame,
+            capture_deadline_capable=False,
+        )

@@ -1,0 +1,55 @@
+# 任务二：Worker BrokenPipeError 崩溃链根因（2026-08-13，4 次）
+
+## 结论摘要
+
+4 次崩溃全部是【孤儿 worker】崩溃：Core 每 ~10–55 分钟被强杀重启一次（03:42:22 / 03:52:52 / 05:42:35 / 05:56:11，无任何优雅关闭痕迹），旧 Core 的 worker 进程存活成孤儿，其日志管道读端（log_pipe_out 句柄在旧 Core 进程内）随 Core 进程死亡被 OS 关闭；孤儿 worker 的下一次日志写（新 Core 同步 next_run 触发 config 变更 → 调度器选任务 → script.py:676 logger.hr → module/logger.py print → log_pipe_in.send）→ BrokenPipeError(232) → worker 死。根因在 Core 退出路径（start.ps1 用 Stop-Process -Force 强杀），worker 端无管道写防护是症状放大器。
+
+实测 4 次崩溃时刻：03:43:06.380、03:53:14.533、05:45:37.396、05:56:32.627（log/2026-08-13_oas1.txt:35114-15 / 35614-15 / 97278-79 / 97622-23）。任务给定的窗口（05:36/06:00）与实测有偏差——05:36 是孤儿 worker 28220 的 Goto main 结束、06:00 是新 worker 2452 启动，均非崩溃时刻。
+
+## 1. 日志管道机制（已证实）
+
+- Core 在 ScriptProcess.start() 内创建管道：self.log_pipe_out, self.log_pipe_in = multiprocessing.Pipe(False)（module/server/script_process.py:117-120）。读端 log_pipe_out 只在 Core 进程持有。
+- worker 经 multiprocessing.Process(target=func, args=(config, state_queue, log_pipe_in), daemon=True) 继承写端（script_process.py:207-212），func() 中 set_func_logger(log_pipe_in.send)（:385-394）把日志写端接入 logger。
+- worker 日志路径：script.py:676 logger.hr(task, level=0) → module/logger.py:303-316 hr → :297-300 rule → :265-271 print → :268 hdlr.console.file._func(...) = log_pipe_in.send → multiprocessing/connection.py:206/289 WriteFile。写失败即 BrokenPipeError，经 script_process.py:404（script.loop() 顶层）→ :411-414 except → raise → worker 进程死亡。
+- Core 侧 _close_ipc_locked()（:122-137）关闭自己两个管道端 + state_queue，但只在 worker 确认死亡后才调用（:149 reap、:264/299 stop、:216 start 异常路径）。Core 退出时若 worker 还活着，管道读端随 Core 进程消亡——无任何"先终止/接管 worker 再关管道"的路径。
+
+## 2. 四窗口 Core 侧事件（已证实，证据在 server.txt；python.txt 无 Core 生命周期）
+
+log/2026-08-13_server.txt 时间线：Core 重启(LAUNCHER CONFIG) = 03:42:22(:28-31)、03:52:52(:45-48)、04:48:03(:67-70)、05:42:35(:86-89)、05:56:11(:110-113)；worker 启动 = 03:43:03(5056,parent 11216)(:37-38)、03:53:08(11348,parent 10140)(:54-55)、04:48:27(28220,parent 25044)(:78-79)、05:42:57(23968,parent 20608)(:95-96)、06:00:22(2452,parent 5936)(:127)。
+
+逐次对照（孤儿 = 崩溃）：
+- 崩溃1 = 03:42:22 被杀 Core 的旧 worker（03:32 即在跑，traceback locals 显示 failed=1、result=game_stuck，oas1.txt:34911-34947）；
+- 崩溃2 = 03:52:52 被杀 Core-B 的 worker 5056（oas1.txt:35398-35448 与 03:53:12 新 worker 11348 的启动日志交错，两行 Scheduler: Start task 12.522/12.537 证明两 worker 并存）；
+- 崩溃3 = 05:42:35 被杀 Core-D 的 worker 28220（oas1.txt:97058-97062）；
+- 崩溃4 = 05:56:11 被杀 Core-E 的 worker 23968（oas1.txt:97402-97406）。
+
+孤儿存活佐证：03:59:31 server.txt:59-60 "Script start ignored: … child_pid=11348, reason=already_running"——崩溃2 之后 11348 仍被 Core 视为 alive，直到 04:47:23 才被 REST stop（:61）。
+
+python.txt：00:34–06:03 仅有 script_task.py 日志（XiuxingHexun 片段），无 uvicorn/LAUNCHER/ScriptProcess 生命周期——既非 server Core 日志，也非 oas1 worker 日志（oas1.txt 无对应时间戳行）；为某个以 python.exe 直启的进程（pyw_name='python'）所写，身份待查，不影响本根因。
+
+'log coroutine cancelled' 旁证（已证实，遍历 08-01~08-13 全部 server 日志）：每次出现都紧跟优雅 stop（如 08-13 04:47:23 Script stopping → 04:47:24.991 取消，server.txt:61-63；08-05/06/07/09/10/11 同型：stopping → 1–3s → cancelled），语义 = Core 侧 account 转 INACTIVE 后 MainManager.cancel_monitors 撤销广播协程（module/server/main_manager.py:106-114,138-140），是 Core 记账收尾而非 worker 死亡本身。4 次崩溃窗口的 Core 退出均无此日志——证明是非优雅强杀。
+
+## 3. 优雅 vs 强杀（已证实）
+
+- 强杀工具链：control-center/start.ps1:276-279（-RestartCore）→ :175-194 Stop-PortOwner → :184 Stop-Process -Force（直接结束占用 22267 端口的进程，无 SIGTERM/优雅关机）；重启Core.bat 即调 start.ps1 -RestartCore。
+- 优雅路径存在但被绕过：MainManager.signal_kill_server → push_data_handle 逐 account stop(source='shutdown')（main_manager.py:116-133）；server.py:85-91 uvicorn.run 无自定义 signal handler（Python 正常退出时 multiprocessing atexit 会终止 daemon 子进程）。Stop-Process -Force 下二者都不执行 → worker 幸存。
+- 代码层无 Core 级 watchdog/自动重启（grep 无命中）；重启间隔不规则（10.5/55/54/13.6 分钟）+ 同期 XiuxingHexun 连续失败（preset name mismatch、unknown page、GameStuckError，oas1.txt:97058-97336）正在调试 → 判定人工用 重启Core.bat 反复重启以重载缓存代码（高概率）。
+
+## 4. 最终根因判定（完整因果链）
+
+① 操作者运行 重启Core.bat → start.ps1 -RestartCore → Stop-Process -Force 强杀旧 Core（start.ps1:184）。
+② 旧 Core 进程死亡 → OS 关闭其全部句柄（含 log_pipe_out 读端）；multiprocessing daemon 清理（依赖 atexit）不执行 → 旧 worker 存活为孤儿。
+③ 新 Core 启动 → AccountRunLease 字节锁随旧 Core 死亡自动释放（script_process.py:40-44）→ acquire 成功 → _new_ipc_locked 创建全新管道 → 启动新 worker（与孤儿并存、互不可见；start() 只 reap 自己跟踪的 _process，:178）。
+④ 新 Core 经 ControlCenter.sync_next_run 写共享 config（server.txt:102,121）→ 孤儿 worker 的 config_watcher 检测 mtime 变化（oas1.txt:34893/97058/97402）→ 调度器选任务 → script.py:673 logger.info（文件 handler 成功、pipe 写被 rich console 缓冲）→ script.py:676 logger.hr → print 触发缓冲 flush → log_pipe_in.send → WriteFile 到无读端管道 → BrokenPipeError(32,'管道正在被关闭。') → 经 logger.py:268/208 → script_process.py:404 → :411-414 except 内 logger.exception/logger.error 再写管道仍失败 → raise → worker 死亡（新 Core 无感知，孤儿不在其跟踪表）。
+
+根因归属：根因在 Core 退出路径未优雅终止 worker（重启工具强杀 + 管道生命周期绑定 Core 进程 + 无"Core 退出前终止/接管 worker"机制）。worker 端对管道写无 BrokenPipeError 防护（日志写失败直接炸进程）是次级缺陷、症状放大器，非根因。
+
+补充：任务所述"崩溃后 2–4 秒 auto 重启"与实测不完全一致——重启由新 Core 驱动（其 worker 在孤儿崩溃前已启动），与崩溃时间重叠（如崩溃1 03:43:06.380 与 03:43:06.598 新 worker）系 spawn 耗时巧合；崩溃4 的新 worker 06:00:22 在崩溃后 3.6 分钟才启动。
+
+## 5. 待查 / 缺失证据
+
+- python.txt 写入进程身份（00:34–06:03 的 script_task 片段来自某 python.exe 直启进程，可能是旧 QML GUI 路径或第二启动器；无 Core 生命周期故不影响结论）——待查，需要进程启动记录或 shell 历史。
+- 03:42–06:04 重启的具体操作者/命令——判定为人工操作（高概率），但无 shell 历史/操作日志可直接证明。
+- 崩溃2/3 traceback 中 script/log_pipe_in 对象地址疑似跨进程复用，无法用地址区分 worker 身份——身份判定完全依赖 server.txt 的 run_id/child_pid 与时间戳，已闭合。
+
+全程只读：未创建/修改任何文件、未运行任何测试、未启动/停止任何服务。

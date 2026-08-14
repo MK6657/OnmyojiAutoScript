@@ -43,7 +43,7 @@ class ScriptTask(GameUi, FindJadeAssets):
                 logger.error(e)
                 self.next_run("FindJade", success=False)
         self.next_run("FindJade", success=True)
-        raise TaskEnd("FindJade")
+        raise TaskEnd.completed("FindJade")
         pass
 
 

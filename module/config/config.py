@@ -14,16 +14,60 @@ from threading import Lock
 from module.base.filter import Filter
 from module.config.config_updater import ConfigUpdater
 from module.config.config_manual import ConfigManual
+from tasks.XiuxingHexun.availability import xiuxing_hexun_globally_enabled
 from module.config.config_watcher import ConfigWatcher
 from module.config.config_menu import ConfigMenu
 from module.config.config_model import ConfigModel
+from module.config.schedule_contract import ScheduleDecision
 from module.config.config_state import ConfigState
 from module.config.scheduler import TaskScheduler
 from module.config.utils import *
 from module.notify.notify import Notifier
 
-from module.exception import RequestHumanTakeover, ScriptError
+from module.exception import ScriptError
 from module.logger import logger
+
+
+_CROSS_TASK_SCHEDULE_ALLOWLIST = {
+    'activity_shikigami': frozenset({'souls_tidy'}),
+    'duel': frozenset({'talisman_pass'}),
+    'exploration': frozenset({'realm_raid', 'memory_scrolls'}),
+    # DeepSeek-13 1.6 (F-4): explicit authorization for the two cross-task
+    # relationships that used to bypass schedule() entirely.
+    'memory_scrolls': frozenset({'exploration'}),
+    'collective_missions': frozenset({'bondling_fairyland'}),
+    'guild_activity_monitor': frozenset({
+        'dokan', 'abyss_shadows', 'guild_banquet', 'demon_retreat',
+    }),
+    'restart': '*',
+    'script.run': '*',
+    'script.scheduler': frozenset({'restart'}),
+    'script.task_call': frozenset({'restart', 'souls_tidy'}),
+    'controlcenter.sync_next_run': '*',
+    'team_flow_host': frozenset({
+        'orochi', 'fallen_sun', 'eternity_sea', 'evo_zone',
+    }),
+}
+
+# Any active task may accept a time-sensitive cooperative WantedQuests invite.
+_SHARED_SCHEDULE_TARGETS = frozenset({'wanted_quests'})
+
+
+def _schedule_identity(value: str) -> str:
+    return convert_to_underscore(str(value).strip()).casefold()
+
+
+def _assert_schedule_authorized(task: str, caller: str) -> None:
+    target = _schedule_identity(task)
+    source = _schedule_identity(caller)
+    if source == target or target in _SHARED_SCHEDULE_TARGETS:
+        return
+    allowed = _CROSS_TASK_SCHEDULE_ALLOWLIST.get(source, frozenset())
+    if allowed == '*' or target in allowed:
+        return
+    raise ScriptError(
+        f'Schedule caller {caller!r} is not authorized to update task {task!r}'
+    )
 
 
 class Function:
@@ -172,7 +216,74 @@ class Config(ConfigState, ConfigManual, ConfigWatcher, ConfigMenu):
         保存配置文件
         :return:
         """
-        self.model.write_json(self.config_name, self.model.dict())
+        self.model.save()
+
+    def schedule(
+        self,
+        task: str,
+        when: datetime,
+        reason: str,
+        caller: str,
+    ) -> ScheduleDecision:
+        """Commit one checkpoint update with explicit provenance."""
+        if not str(reason).strip():
+            raise ValueError('schedule reason is required')
+        if not str(caller).strip():
+            raise ValueError('schedule caller is required')
+        if not isinstance(when, datetime):
+            raise TypeError('schedule when must be datetime')
+
+        task_name = convert_to_underscore(task)
+        _assert_schedule_authorized(task_name, caller)
+        self.reload()
+        task_object = getattr(self.model, task_name, None)
+        scheduler = getattr(task_object, 'scheduler', None) if task_object else None
+        if scheduler is None:
+            raise ScriptError(f'No scheduler in {task_name}')
+        previous = getattr(scheduler, 'next_run', None)
+        scheduler.next_run = when.replace(microsecond=0)
+        self.save()
+        decision = ScheduleDecision(
+            task=task_name,
+            when=scheduler.next_run,
+            previous=previous,
+            reason=str(reason),
+            caller=str(caller),
+        )
+        self.last_schedule_decision = decision
+        logger.info(
+            'SCHEDULE_DECISION '
+            f'task={decision.task} when={decision.when} '
+            f'previous={decision.previous} caller={decision.caller!r} '
+            f'reason={decision.reason!r}'
+        )
+        return decision
+
+    def set_scheduler_enabled(
+        self,
+        task: str,
+        enabled: bool,
+        caller: str | None = None,
+    ) -> None:
+        """DeepSeek-13 1.6: authorized cross-task scheduler.enable toggle.
+
+        Replaces direct model writes so every cross-task change passes the
+        allowlist and leaves a SCHEDULE_DECISION audit trail.
+        """
+        task_name = convert_to_underscore(task)
+        resolved_caller = caller or getattr(self.model, 'running_task', '') or 'Config'
+        _assert_schedule_authorized(task_name, resolved_caller)
+        self.reload()
+        task_object = getattr(self.model, task_name, None)
+        scheduler = getattr(task_object, 'scheduler', None) if task_object else None
+        if scheduler is None:
+            raise ScriptError(f'No scheduler in {task_name}')
+        scheduler.enable = enabled
+        self.save()
+        logger.info(
+            'SCHEDULE_DECISION task=%s enable=%s caller=%r (authorized)',
+            task_name, enabled, str(resolved_caller),
+        )
 
     def update_scheduler(self) -> None:
         """
@@ -184,6 +295,11 @@ class Config(ConfigState, ConfigManual, ConfigWatcher, ConfigMenu):
         error = []
         self.scheduler_update_dt = datetime.now()
         for key, value in self.model.dict().items():
+            if key == 'xiuxing_hexun' and (
+                not xiuxing_hexun_globally_enabled()
+                or not value.get('activity_enabled', True)
+            ):
+                continue
             func = Function(key, value)
             if not func.enable:
                 continue
@@ -215,7 +331,7 @@ class Config(ConfigState, ConfigManual, ConfigWatcher, ConfigMenu):
         self.pending_task = pending_task
         self.waiting_task = waiting_task
 
-    def get_next(self) -> Function:
+    def get_next(self) -> Function | None:
         """
         获取下一个要执行的任务
         :return:
@@ -237,9 +353,12 @@ class Config(ConfigState, ConfigManual, ConfigWatcher, ConfigMenu):
             logger.attr("Task", task)
             return task
         else:
-            logger.critical("No task waiting or pending")
-            logger.critical("Please enable at least one task")
-            raise RequestHumanTakeover
+            # An account with no enabled tasks is a valid stopped/idle state.
+            # Clear the previous task so the control center cannot display a
+            # stale running item while the worker exits cleanly.
+            self.task = None
+            logger.info("Scheduler idle: no enabled tasks")
+            return None
 
     def get_schedule_data(self) -> dict[str, dict]:
         """
@@ -282,15 +401,20 @@ class Config(ConfigState, ConfigManual, ConfigWatcher, ConfigMenu):
             next_run = datetime.now().replace(
                 microsecond=0
             )
-            self.model.deep_set(self.model, keys=f'{task}.scheduler.next_run', value=next_run)
-            self.save()
+            self.schedule(
+                task=task,
+                when=next_run,
+                reason=f'task_call force_call={force_call}',
+                caller='Script.task_call',
+            )
             return True
         else:
             logger.info(f"Task call: {task} (skipped because disabled by user)")
             return False
 
     def task_delay(self, task: str, start_time: datetime = None,
-                   success: bool = None, server: bool = True, target: datetime = None) -> None:
+                   success: bool = None, server: bool = True, target: datetime = None,
+                   reason: str | None = None, caller: str | None = None) -> ScheduleDecision:
         """
         设置下次运行时间  当然这个也是可以重写的
         :param target: 可以自定义的下次运行时间
@@ -372,15 +496,16 @@ class Config(ConfigState, ConfigManual, ConfigWatcher, ConfigMenu):
         )
         logger.info(f"Delay task `{task}` to {next_run} ({kv})")
 
-        # 保证线程安全的
-        self.lock_config.acquire()
-        try:
-            scheduler.next_run = next_run
-            self.save()
-        finally:
-            self.lock_config.release()
-        # 设置
-        logger.attr(f'{task}.scheduler.next_run', next_run)
+        resolved_caller = caller or getattr(self.model, 'running_task', '') or 'Config.task_delay'
+        resolved_reason = reason or f'task_delay success={success!r} server={server!r}'
+        decision = self.schedule(
+            task=task,
+            when=next_run,
+            reason=resolved_reason,
+            caller=resolved_caller,
+        )
+        logger.attr(f'{task}.scheduler.next_run', decision.when)
+        return decision
 
 
 if __name__ == '__main__':

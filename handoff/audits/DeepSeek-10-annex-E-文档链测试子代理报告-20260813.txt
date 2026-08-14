@@ -1,0 +1,98 @@
+所有证据已收集完毕。整理最终报告。
+
+---
+
+# OSAyys handoff 文档链一致性 + 测试清点审查报告（2026-08-13 20:36，严格只读）
+
+**基线**：git HEAD=`1724ce44`（与快照一致）；工作树 287 项未提交（快照时 281）；当前时刻 `2026-08-13 20:36`；全程未修改任何文件。
+
+## ① 总表滞后期判断
+
+**mtime/证据链时间轴**（`ls -la` 实测）：
+
+| 文件 | mtime | 备注 |
+|---|---|---|
+| handoff/Codex-待做事项总表.md | **8-11 10:40** | 行 3 标称「最后更新：2026-08-10」 |
+| handoff/00-当前状态.md | 8-11 10:46 | 快照自述 8-11 10:45:32 |
+| records/evidence/ 最新文件 | 8-11 08:38（RY-GUILD-DAY2） | 总表已引用 |
+| records/implementation/ 最新文件 | 8-11 10:46（文件整理与归档） | 总表未引用 |
+| handoff/tasks/ 4 文件 | 8-10 01:02~01:39 | 均早于其引用的新证据 |
+| coordinates-to-calibrate-20260809.md | 8-10 04:43 | |
+| decisions/ADR-002 | 8-10 15:12 | |
+| handoff/audits/ | **8-13 20:23** | 今天 DeepSeek-09 CC 审查报告落盘 |
+
+**滞后结论：总表滞后 3 个轮次，≈2 天 10 小时。**
+1. **表头自相矛盾**：行 3 写「最后更新 2026-08-10」，但 mtime 是 8-11 10:40，且 §4 引用 8-11 证据（行 54 `Codex-实测-RY-GUILD-DAY2-20260811-02.md`）——内部滞后 1 天未同步。
+2. **8-11 晚场测试对账轮未吸收**：15 套件全量实跑与 444 口径对账发生在 8-11 晚，总表 §9 只保留 8-10 时点的声称。
+3. **8-12 全天未吸收**：tasks/XiuxingHexun/ 8-12 18:44 新建（script_task.py 8-13 10:17 仍在改，config.py 10:00）；8-12 16:39 二十余个 tasks/ 子目录被批量触碰（GotoMain 8-12 22:44、GameUi 8-12 17:46）；CC 标定 17 会话（DB sessions 17/annotations 81，最新 session 8-12 21:47 +08）；通宵运行 13 个 error 快照。**handoff 全部文档对 XiuxingHexun 零记录**（总表 §4 无其事项 ID）。
+4. **8-13 今日未吸收**：oas2 账号被调度器自动启动（09:46/20:01/20:04，source=auto）、Core 多次重启（parent_pid 28356→28564→696→5132）、XiuxingHexun 失败循环进行到 20:29:38、新审计报告 20:23 落盘。
+
+## ② 引用完整性核对表
+
+| 引用 | 是否存在 | 内容是否匹配 |
+|---|---|---|
+| 总表全部 86 个 markdown 链接（含 `:行号` 与 `#L` 锚点剥离后） | **86/86 存在，0 缺失**（Python 逐个 os.path.exists 实测） | ✅ |
+| records/evidence/ 15 个文件 vs 总表引用 | 10 个被总表引用；另 5 个（GREEN-AUTO-LEFT3、GREEN-ENEMY-SLOTS、GREEN-TARGET-RANGE-02、RR-GREEN-LEFT3-01、RR-LOCK-GREEN-02）由 ADR-002 或实施记录引用 | ✅ 无孤儿 |
+| records/implementation/ 21 个文件 vs 总表 | 13 个被引用；其余 8 个（含 8-11 10:46 归档记录）无引用但不影响状态 | ✅ |
+| archive/legacy-root-20260811/ Codex-NN 旧文档链接 | 105 个文件全存在，0 缺失 | ✅ |
+| decisions/ADR-002、contracts/v1/contracts.schema.json、`/D:/coordinate-calibrator/work/logs/2026-08-11-v0.3.8-*.md`、audits/Codex-OAS…全貌只读审计 | 全部存在 | ✅ |
+| **抽查不存在的引用** | **0 例**（全量扫描非抽查） | — |
+
+## ③ 状态-代码不一致清单
+
+| # | 文档声称（位置） | 当前树/证据 | 判定 |
+|---|---|---|---|
+| 1 | tasks/RY-GUILD-001.md（8-10 01:02）：「安全逻辑已修，待坐标与实测」+「寮卡区域与勋章 OCR ROI 尚未配置」 | 总表行 54「当前排序协议已结案，跨游戏日二次通过」；8-11 实施记录已换「排序按钮两端验证+点首行」协议，OCR 全卡方案已废弃 | ⚠️ 任务文件方案漂移未同步 |
+| 2 | tasks/RR-COMBAT-001.md（8-10 01:02）：「绿标模板/ROI 尚未通过靶场验证」「3/150 命中」 | 总表行 56「绿标快速采样 2/2」；证据 `GREEN-TARGET-RANGE-20260810-02`（8-10 14:32）、`RR-GREEN-FAST-SAMPLE-20260810-04`（8-10 20:29）两次 confirmed（0.823/0.829） | ⚠️ 任务文件状态句过期 |
+| 3 | ADR-002（8-10 15:12）：「RealmRaid 单场通过，3/10 场待验证」 | 总表行 129 GREEN-MARK-001「左三快速采样实机 2/2」+ 行 56「绿标快速采样 2/2」 | ⚠️ ADR 状态句滞后（其「尚需实机确认」清单与总表一致 ✅） |
+| 4 | 总表 §9 行 234：「当前 Core、Bridge、前端和 coordinate-calibrator 均运行；oas1 已停止」 | netstat 实测：22267(Core,PID 5936)✓、22880(CC,PID 25064)✓、**22367(Bridge)✗ 无监听、4175(前端)✗ 无监听**；且 **oas2 今日 09:46/20:01/20:04 被 source=auto 启动** | ❌ 状态过期 |
+| 5 | 00-当前状态.md（8-11 10:45）：工作树 281 项；Bridge PID 20992、前端 PID 6884；CC 数据 9 sessions/47 标注/982 ops | 现 287 项；Bridge/前端已停；CC DB 实测 17/81/394（sqlite mode=ro） | ⚠️ 快照过期（文件自述限定"当时状态"，属预期；但 2 天无新快照本身是滞后） |
+| 6 | RY-GUILD-001 已结案 ↔ 04-测试与结案规范.md「结案记录=唯一代表结案」+ 总表 7.4 节 | records/closure/ **空目录**，无任何 Codex-结案-*.md | ⚠️ 结案记录缺失 |
+| 7 | coordinates-to-calibrate-20260809.md §3「标注全部可见寮卡…勋章 OCR ROI」 | 8-11 已改排序协议（不再需要 OCR ROI） | ⚠️ 方案漂移未同步；§2 绿标五槽/红标（DB samples=0、无 left*_click 标签）与 §5 棋盘仍"未标定"（与总表状态一致 ✅）；DB 新增 64 类标签中 activity_home_*/battle_entry_*/battle_prepare_*/battle_result_*/preset_* 约 30 个 XiuxingHexun 标签**清单完全未收录** |
+| 8 | tasks/EXP-028.md、COMBAT-PREP-001.md ↔ 总表对应行 | 状态逐项一致（EXP 3/3+10/10、30 场未跑；COMBAT-PREP「RyouToppa 落地、通用化待设计」） | ✅ 一致 |
+
+## ④ 测试清点（静态 + 实跑）
+
+**静态 def test_ 计数（当前工作树，16 个业务测试目录）**：
+
+| 目录 | def test_ | 目录 | def test_ |
+|---|---|---|---|
+| module/config | 18 | tasks/Component/CommonPopup | 27 |
+| module/daemon | 3 | tasks/Component/GeneralBattle | 116 |
+| module/device | 12 | tasks/Component/GeneralBuff | 22 |
+| module/server | 39* | tasks/Component/ReplaceShikigami | 1 |
+| **tasks/XiuxingHexun（8-12 新增，`??` 未跟踪）** | **32** | tasks/Component/SwitchSoul | 5 |
+| tasks/Exploration | 58 | tasks/GameUi | 13 |
+| tasks/GotoMain | 2 | tasks/Hyakkiyakou | 3 |
+| tasks/RealmRaid | 104 | tasks/RyouToppa | 33 |
+| control-center/bridge/tests | test_bridge 29（自定义 runner）+ test_runtime_commands 3 | control-center/launcher/tests | 0 |
+
+*server 39 含 8-12 新增 `test_xiuxing_hexun_migration.py`（4），且 **module/server/tests/ 与 tasks/XiuxingHexun/ 整个目录未提交（`??`）**。
+
+**vs 444 声称**：按"官方 15 套件"口径（module 4 + tasks 11，不含 XiuxingHexun）静态合计 **456**，比 8-11 声称的 444 多 12（其中 +4 = 8-12 新增 xiuxing migration；其余 +8 无 git 历史可逐项归因——历史漂移属预期，技能判例「444 基线无法原样复现」）。新增 XiuxingHexun 后为 **488（15 套）+ 32 = 520 个 def test_ 业务测试**。
+
+**实跑结果（`env -u PYTHONPATH .venv/Scripts/python.exe -B`）**：
+- `tasks.XiuxingHexun.tests.test_flow` + `module.server.tests.test_xiuxing_hexun_migration`：**Ran 36 tests OK**（新模块 32+4 全过）
+- `discover -s tasks/Component/GeneralBattle/tests`：**Ran 116 tests OK**（11.4s）
+- `discover -s module/server/tests`：Ran 39，**errors=9** —— 9 个错误全部是 test_script_process 的 `AccountLeaseError: account lease is held by another Core: oas1`（生产 Core 正在运行持有租约，**环境冲突非代码回归**，其余 30 个通过）
+- bridge `tests/test_bridge.py`（自定义 runner）：**29/29 通过**（声称 27/27 → 现 29 全过）；`tests.test_runtime_commands`：**Ran 3 OK**（对应 3/3 声称）
+
+**部署版本=当前树**：今日 20:29 日志 `script_task.py:0469 decision=existing_prepare_page`、`:0386`、`:0536` 与当前 tasks/XiuxingHexun/script_task.py 的 469/387/537 行逐位（±1）吻合 → 运行构建即当前工作树。
+
+## ⑤ 通过项
+
+- 总表 86 链接全量核查 **0 缺失**；archive 105 文件、ADR、契约 schema、跨项目 worklog 链接全部有效
+- EXP-028.md / COMBAT-PREP-001.md 与总表状态完全一致
+- 新模块测试 36/36、GeneralBattle 116/116、Bridge 29/29+3/3 实跑通过
+- 快照版本声称抽查成立：OAS venv py 3.11.15 / numpy 1.24.3 / cv2 4.7.0（`env -u PYTHONPATH` 探测）；HEAD 1724ce44 未变
+- XiuxingHexun 配置自洽：oas1.json `enable=true, next_run=2026-08-14 06:04:27` 与 06:04 TASK_END success 后 +1 天逻辑吻合
+
+## ⑥ 无法判定项
+
+- **隔离 Core/Bridge 集成 16/16**：test_integration.py 为自定义 `t_*` runner（含 `require_isolated_environment`，需子进程 mock core），未复跑，静态无法核对"16"这个数
+- **444 基线的精确构成**：+12 差额中 8 个无法归因（无提交历史、无 8-11 时点逐套快照存档）
+- **oas2 无配置文件**（config/ 下仅 oas1.json/template.json）却被 source=auto 启动——Core 是否按 template 派生默认配置，未读代码判定
+- **oas1 租约在 06:04 脚本退出后、09:46 仍被判定占用**（script_process.py:0199 blocked 警告），结合 parent_pid 频繁变化，是租约残留还是双 Core 实例竞态未定
+- **06:00 之后失败循环不落盘**：log/error/ 与 log/screenshots/ 最新文件均停在 06:00:54，但 20:29 仍在产生 XIUXING_HEXUN_FAILURE——证据保存逻辑疑似失效或设计变更，未读代码判定
+
+**首要衔接项**（供下轮）：XiuxingHexun next_run=2026-08-14 06:04:27 将自动再跑；调度器今天仍在运行（Core PID 5936 监听 22267，20:36 仍写日志），跑 server 套件需注意租约环境冲突。

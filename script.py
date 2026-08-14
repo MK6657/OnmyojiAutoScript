@@ -36,10 +36,12 @@ from module.logger import logger
 from module.exception import *
 from module.server.i18n import I18n
 from module.ocr.rpc import ensure_ocr_server_started
+from tasks.Component.GeneralBattle.preset_name_selector import PresetLookupError
 
 
 
 _log_switch_lock = threading.Lock()#线程锁
+PRESET_RETRY_DELAY_SECONDS = 60
 
 
 class Script:
@@ -54,7 +56,9 @@ class Script:
         self.is_first_task = True
         # Failure count of tasks
         # Key: str, task name, value: int, failure count
-        self.failure_record = {}
+        # DeepSeek-13 1.3: persisted across worker restarts so three-failure
+        # governance survives Core restarts (DS-11 R-3).
+        self.failure_record = self._load_failure_record()
         # 运行loop的线程
         self.loop_thread: Thread = None
 
@@ -301,13 +305,18 @@ class Script:
             if self.config.should_reload():
                 return False
 
-    def get_next_task(self) -> str:
+    def get_next_task(self) -> str | None:
         """
         获取下一个任务的名字, 大驼峰。
         :return:
         """
         while True:
             task = self.config.get_next()
+            if task is None:
+                if self.state_queue:
+                    self.state_queue.put({"schedule": self.config.get_schedule_data()})
+                logger.info('Scheduler idle: no enabled tasks; worker will stop cleanly')
+                return None
             self.config.task = task
             if self.state_queue:
                 self.state_queue.put({"schedule": self.config.get_schedule_data()})
@@ -458,7 +467,121 @@ class Script:
             self.config.task_call('SoulsTidy')
             time.sleep(1)
 
-    def run(self, command: str) -> bool:
+    def _schedule_preset_retry(self, command: str, error: PresetLookupError) -> None:
+        retry_at = datetime.now().replace(microsecond=0) + timedelta(
+            seconds=PRESET_RETRY_DELAY_SECONDS
+        )
+        try:
+            self.config.task_delay(
+                task=command,
+                server=False,
+                target=retry_at,
+            )
+        except Exception:
+            logger.exception(
+                f'Unable to delay preset task `{command}` after preset error: {error}'
+            )
+            return
+        logger.warning(
+            f'Preset task `{command}` delayed for {PRESET_RETRY_DELAY_SECONDS}s: {error}'
+        )
+
+    def _schedule_failure_retry(self, command: str, error) -> bool:
+        """Prevent a recoverable failure from immediately rerunning a due task."""
+        try:
+            self.config.task_delay(
+                task=command,
+                success=False,
+                server=False,
+                reason=f'recoverable failure: {error}',
+                caller='Script.run',
+            )
+        except Exception:
+            logger.exception(
+                f'Unable to delay failed task `{command}` after error: {error}'
+            )
+            return False
+        logger.warning(f'Failed task `{command}` delayed by its failure interval')
+        return True
+
+    def _failure_state_path(self) -> Path:
+        name = getattr(self, 'config_name', 'oas') or 'oas'
+        # DeepSeek-14 B4: tests inject OAS_FAILURE_STATE_DIR so the sidecar
+        # never lands in the production work/ tree.
+        root = os.environ.get('OAS_FAILURE_STATE_DIR')
+        if root:
+            return Path(root) / f'{name}_failure_state.json'
+        return Path('work') / f'{name}_failure_state.json'
+
+    def _load_failure_record(self) -> dict:
+        path = self._failure_state_path()
+        try:
+            if path.exists():
+                data = json.loads(path.read_text(encoding='utf-8'))
+                if isinstance(data, dict):
+                    record = {}
+                    for k, v in data.items():
+                        if isinstance(v, int) and v > 0:
+                            record[str(k)] = {'count': int(v), 'last_failed_at': None}
+                        elif isinstance(v, dict) and v.get('count', 0) > 0:
+                            record[str(k)] = {
+                                'count': int(v['count']),
+                                'last_failed_at': v.get('last_failed_at'),
+                            }
+                    # A count >= 3 means a previous episode already escalated to
+                    # exit(1) + human takeover. Start the new episode fresh instead
+                    # of re-exiting immediately on the next failure.
+                    if any(e['count'] >= 3 for e in record.values()):
+                        logger.info(
+                            'Failure state carries an escalated count, starting fresh episode'
+                        )
+                        return {}
+                    return record
+        except Exception as e:
+            logger.warning(f'Failure state load failed, starting fresh: {e}')
+        return {}
+
+    def _save_failure_record(self) -> None:
+        # Single-writer per account is guaranteed by AccountRunLease; atomic
+        # replace keeps the sidecar consistent even if the process is killed.
+        try:
+            path = self._failure_state_path()
+            path.parent.mkdir(exist_ok=True)
+            tmp = path.with_suffix('.json.tmp')
+            tmp.write_text(
+                json.dumps(self.failure_record, ensure_ascii=False),
+                encoding='utf-8',
+            )
+            os.replace(tmp, path)
+        except Exception as e:
+            logger.warning(
+                f'Failure state save failed (counting continues in memory): {e}'
+            )
+
+    def _record_task_result(
+        self,
+        task: str,
+        result: TaskExecutionResult,
+    ) -> int:
+        result = TaskExecutionResult.coerce(result)
+        previous_entry = self.failure_record.get(task, {'count': 0})
+        previous = (
+            previous_entry.get('count', 0)
+            if isinstance(previous_entry, dict)
+            else previous_entry
+        )
+        current = result.next_failure_count(previous)
+        if result.failure_action is FailureAction.INCREMENT and current > 0:
+            last_failed_at = datetime.now().isoformat(timespec='seconds')
+        elif result.failure_action is FailureAction.PRESERVE and isinstance(previous_entry, dict):
+            last_failed_at = previous_entry.get('last_failed_at')
+        else:
+            last_failed_at = None
+        self.failure_record[task] = {'count': current, 'last_failed_at': last_failed_at}
+        self._save_failure_record()
+        return current
+
+    def run(self, command: str) -> TaskExecutionResult:
         """
         :param command:  大写驼峰命名的任务名字
         :return:
@@ -473,42 +596,60 @@ class Script:
             logger.info(f'module_path: {module_path}, module_name: {module_name}')
             task_module = load_module(module_name, module_path)
             task_module.ScriptTask(config=self.config, device=self.device).run()
-        except TaskEnd:
-            return True
+        except TaskEnd as task_end:
+            result = TaskExecutionResult.from_task_end(task_end)
+            logger.info(
+                'TASK_END '
+                f'outcome={result.outcome} success={result.success} '
+                f'failure_action={result.failure_action.value} '
+                f'reason={task_end.reason!r} statistics={task_end.statistics!r} '
+                f'next_run={task_end.next_run!r}'
+            )
+            return result
+        except PresetLookupError as e:
+            # A preset/configuration problem is recoverable at scheduler level.
+            # Do not restart the game or terminate the account worker here.
+            logger.error(f'Preset task stopped before battle: {e}')
+            self._schedule_preset_retry(command, e)
+            return TaskExecutionResult.failed(str(e), outcome='configuration_failed')
         except GameNotRunningError as e:
             logger.warning(e)
             self.exception_handler(e=e, command=command)
-            self.config.task_call('Restart')
-            return True
+            self._schedule_failure_retry(command, e)
+            self.config.task_call('Restart', force_call=False)
+            return TaskExecutionResult.failed(str(e), outcome='game_not_running')
         except (GameStuckError, GameTooManyClickError) as e:
             logger.error(e)
             self.save_error_log()
             self.exception_handler(e=e, command=command)
+            self._schedule_failure_retry(command, e)
             logger.warning(f'Game stuck, {self.device.package} will be restarted in 10 seconds')
             logger.warning('If you are playing by hand, please stop Alas')
             self.config.notifier.push(title=f'{I18n.trans_zh_cn(command)}{command}', content=f"<{self.config_name}> GameStuckError or GameTooManyClickError")
-            self.config.task_call('Restart')
+            self.config.task_call('Restart', force_call=False)
             self.device.sleep(10)
-            return False
+            return TaskExecutionResult.failed(str(e), outcome='game_stuck')
         except GameBugError as e:
             logger.warning(e)
             self.save_error_log()
             self.exception_handler(e=e, command=command)
+            self._schedule_failure_retry(command, e)
             logger.warning('An error has occurred in Azur Lane game client, Alas is unable to handle')
             logger.warning(f'Restarting {self.device.package} to fix it')
-            self.config.task_call('Restart')
+            self.config.task_call('Restart', force_call=False)
             self.device.sleep(10)
-            return False
+            return TaskExecutionResult.failed(str(e), outcome='game_bug')
         except GamePageUnknownError as e:
             logger.info('Game server may be under maintenance or network may be broken, check server status now')
             # 这个还不重要 留着坑填
             logger.critical('Game page unknown')
             self.save_error_log()
             self.exception_handler(e=e, command=command)
+            self._schedule_failure_retry(command, e)
             self.config.notifier.push(title=f'{I18n.trans_zh_cn(command)}{command}', content=f"<{self.config_name}> GamePageUnknownError")
-            self.config.task_call('Restart')
+            self.config.task_call('Restart', force_call=False)
             self.device.sleep(10)
-            return False
+            return TaskExecutionResult.failed(str(e), outcome='page_unknown')
         except ScriptError as e:
             logger.critical(e)
             self.exception_handler(e=e, command=command)
@@ -528,11 +669,34 @@ class Script:
             self.config.notifier.push(title=f'{I18n.trans_zh_cn(command)}{command}', content=f"<{self.config_name}> Exception occured")
             exit(1)
 
+    def _noop_loop(self) -> None:
+        """DeepSeek-14 A5 (R-1): heartbeat-only worker loop.
+
+        Same process and log-pipe structure as a real worker (ScriptProcess
+        spawn + FlutterHandler -> FlutterLogStream -> log pipe), but never
+        touches config/device/game/OCR. Guarded by OAS_NOOP_WORKER=1 set on
+        the Core that spawns this worker, so Core-restart lifecycle checks
+        can run against a temporary account without a real game.
+        """
+        with _log_switch_lock:
+            logger.set_file_logger(self.config_name, do_cleanup=True)
+        logger.hr(f'No-op worker start: {self.config_name}', level=0)
+        logger.info(f'No-op worker loop started: {self.config_name}')
+        tick = 0
+        while True:
+            tick += 1
+            logger.info(f'No-op heartbeat: {self.config_name} tick={tick}')
+            logger.print(f'No-op print heartbeat: {self.config_name} tick={tick}')
+            time.sleep(2)
+
     def loop(self):
         """
         Main loop of scheduler.
         :return:
         """
+        if os.environ.get('OAS_NOOP_WORKER') == '1':
+            self._noop_loop()
+            return
         with _log_switch_lock:
             logger.set_file_logger(self.config_name, do_cleanup=True)
         start_day = date.today()
@@ -574,10 +738,19 @@ class Script:
 
             # Get task
             task = self.get_next_task()
+            if task is None:
+                logger.info('Scheduler stopped cleanly: no enabled tasks')
+                return
             # Skip first restart
             if self.is_first_task and task == 'Restart':
                 logger.info('Skip task `Restart` at scheduler start')
-                self.config.task_delay(task='Restart', success=True, server=True)
+                self.config.task_delay(
+                    task='Restart',
+                    success=True,
+                    server=True,
+                    reason='skip first restart at scheduler startup',
+                    caller='Script.scheduler',
+                )
                 del_cached_property(self, 'config')
                 continue
 
@@ -593,17 +766,32 @@ class Script:
             self.device.click_record_clear()
             logger.hr(task, level=0)
             self.config.model.running_task = task
-            success = self.run(inflection.camelize(task))
-            self.config.model.running_task = ''
+            try:
+                result = TaskExecutionResult.coerce(
+                    self.run(inflection.camelize(task))
+                )
+            finally:
+                # Keep the control center from displaying a dead task after
+                # an exception path calls exit() or a task aborts unexpectedly.
+                self.config.model.running_task = ''
+            # DeepSeek-13 2.8: consume the TaskEnd next_run payload instead of
+            # only logging it.
+            if getattr(result, 'next_run', None) is not None:
+                try:
+                    self.config.schedule(
+                        task=task,
+                        when=result.next_run,
+                        reason='TaskEnd.next_run payload',
+                        caller='Script.run',
+                    )
+                except Exception as error:
+                    logger.warning(f'Failed to apply TaskEnd.next_run: {error}')
             logger.info(f'Scheduler: End task `{task}`')
             self.is_first_task = False
 
             # Check failures
             # failed = deep_get(self.failure_record, keys=task, default=0)
-            failed = self.failure_record[task] if task in self.failure_record else 0
-            failed = 0 if success else failed + 1
-            # deep_set(self.failure_record, keys=task, value=failed)
-            self.failure_record[task] = failed
+            failed = self._record_task_result(task, result)
             if failed >= 3:
                 logger.critical(f"Task `{task}` failed 3 or more times.")
                 logger.critical("Possible reason #1: You haven't used it correctly. "
@@ -621,7 +809,14 @@ class Script:
                     self.device.emulator_stop()
                 exit(1)
 
-            if success:
+            if result.failure_action is FailureAction.RESET:
+                del_cached_property(self, 'config')
+                continue
+            elif result.failure_action is FailureAction.PRESERVE:
+                logger.info(
+                    f'Task `{task}` ended without changing consecutive failures: '
+                    f'outcome={result.outcome}, reason={result.reason}'
+                )
                 del_cached_property(self, 'config')
                 continue
             elif self.config.script.error.handle_error:

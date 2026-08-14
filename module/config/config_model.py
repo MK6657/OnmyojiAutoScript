@@ -8,9 +8,14 @@ import re
 import inflection
 
 from pathlib import Path
-from pydantic import BaseModel, ValidationError, Field
+from pydantic import BaseModel, ValidationError, Field, PrivateAttr
 
 from module.config.utils import *
+from module.config.config_transaction import (
+    file_revision,
+    merge_changed_json,
+    merge_validated_existing,
+)
 from module.logger import logger
 
 # 导入配置的Python文件
@@ -60,6 +65,7 @@ from tasks.FloatParade.config import FloatParade
 from tasks.Quiz.config import Quiz
 from tasks.KittyShop.config import KittyShop
 from tasks.DyeTrials.config import DyeTrials
+from tasks.XiuxingHexun.config import XiuxingHexun
 # ----------------------------------------------------------------------------------------------------------------------
 
 # 肝帝专属---------------------------------------------------------------------------------------------------------------
@@ -82,6 +88,8 @@ from tasks.Duel.config import Duel
 # ----------------------------------------------------------------------------------------------------------------------
 
 class ConfigModel(ConfigBase):
+    _baseline_data: dict[str, Any] = PrivateAttr(default_factory=dict)
+    _source_revision: str | None = PrivateAttr(default=None)
     config_name: str = "oas"
     running_task: str = ''
     script: Script = Field(default_factory=Script)
@@ -124,6 +132,7 @@ class ConfigModel(ConfigBase):
     quiz: Quiz = Field(default_factory=Quiz)
     kitty_shop: KittyShop = Field(default_factory=KittyShop)
     dye_trials: DyeTrials = Field(default_factory=DyeTrials)
+    xiuxing_hexun: XiuxingHexun = Field(default_factory=XiuxingHexun)
 
     # 这些是肝帝专属
     bondling_fairyland: BondlingFairyland = Field(default_factory=BondlingFairyland)
@@ -151,17 +160,28 @@ class ConfigModel(ConfigBase):
     demon_retreat: DemonRetreat = Field(default_factory=DemonRetreat)
     guild_activity_monitor: GuildActivityMonitor = Field(default_factory=GuildActivityMonitor)
 
-    def __init__(self, config_name: str=None) -> None:
+    def __init__(self, config_name: str=None, **values) -> None:
         """
 
         :param config_name:
         """
-        if not config_name:
-            super().__init__()
-            return
-        data = self.read_json(config_name)
-        data["config_name"] = config_name
+        if values:
+            data = dict(values)
+            if config_name is not None:
+                data["config_name"] = config_name
+        elif not config_name:
+            data = {}
+        else:
+            data = self.read_json(config_name)
+            data["config_name"] = config_name
         super().__init__(**data)
+        object.__setattr__(self, "_baseline_data", self.model_dump())
+        source_path = Path.cwd() / "config" / f"{self.config_name}.json"
+        object.__setattr__(
+            self,
+            "_source_revision",
+            file_revision(source_path) if source_path.exists() else None,
+        )
 
     def __setattr__(self, key, value):
         """
@@ -171,8 +191,25 @@ class ConfigModel(ConfigBase):
         :return:
         """
         super().__setattr__(key, value)
-        logger.info("auto save config")
-        self.save()
+        if key.startswith("_"):
+            return
+        # DeepSeek-13 2.10 (F-15): coalesce assignment bursts into one save.
+        self._schedule_debounced_save()
+
+    def _schedule_debounced_save(self) -> None:
+        timer = getattr(self, "_save_timer", None)
+        if timer is not None and timer.is_alive():
+            return
+        self._save_timer = threading.Timer(0.5, self._run_debounced_save)
+        self._save_timer.daemon = True
+        self._save_timer.start()
+
+    def _run_debounced_save(self) -> None:
+        try:
+            logger.info("auto save config (debounced)")
+            self.save()
+        except Exception as error:
+            logger.warning(f"debounced config save failed: {error}")
 
     @staticmethod
     def read_json(config_name: str) -> dict:
@@ -237,7 +274,29 @@ class ConfigModel(ConfigBase):
 
         :return:
         """
-        self.write_json(self.config_name, self.model_dump())
+        filepath = Path.cwd() / "config" / f"{self.config_name}.json"
+        if not filepath.exists():
+            self.write_json(self.config_name, self.model_dump())
+            object.__setattr__(self, "_baseline_data", self.model_dump())
+            object.__setattr__(self, "_source_revision", file_revision(filepath))
+            return
+
+        def validate(data: dict[str, Any]) -> dict[str, Any]:
+            validated = type(self)(**data).model_dump()
+            return merge_validated_existing(data, validated)
+
+        result = merge_changed_json(
+            filepath,
+            self._baseline_data,
+            self.model_dump(),
+            validator=validate,
+        )
+        object.__setattr__(self, "_baseline_data", result.data)
+        object.__setattr__(self, "_source_revision", result.revision)
+
+    @property
+    def revision(self) -> str | None:
+        return self._source_revision
 
     @staticmethod
     def type(key: str) -> str:
@@ -306,13 +365,19 @@ class ConfigModel(ConfigBase):
             results = {}
             properties = {}
             for key, value in sch["properties"].items():
-                if 'items' in value:
+                if '$ref' in value:
+                    properties[key] = re.search(r"/([^/]+)$", value['$ref']).group(1)
+                elif 'items' in value and '$ref' in value['items']:
                     properties[key] = re.search(r"/([^/]+)$", value['items']['$ref']).group(1)
                 else:
-                    properties[key] = re.search(r"/([^/]+)$", value['$ref']).group(1)
+                    # Scalar task controls are exposed as one-field groups.
+                    properties[key] = key
 
             for key, value in properties.items():
-                results[key] = sch["$defs"][value]
+                results[key] = sch["$defs"].get(value, {
+                    "properties": {key: sch["properties"][key]},
+                    "$defs": sch.get("$defs", {}),
+                })
             return results
 
         def merge_value(groups, jsons, definitions) -> list[dict]:
@@ -320,7 +385,9 @@ class ConfigModel(ConfigBase):
             result = []
             for key, value in groups["properties"].items():
                 # deal with exclude 
-                if key in jsons and jsons[key] == 0xABCDEF:
+                is_mapping = isinstance(jsons, dict)
+                json_value = jsons.get(key) if is_mapping else jsons
+                if json_value == 0xABCDEF:
                     continue
 
                 item = {}
@@ -329,7 +396,11 @@ class ConfigModel(ConfigBase):
                 if "description" in value:
                     item["description"] = value["description"]
                 item["default"] = value["default"]
-                item["value"] = jsons[key] if key in jsons else value["default"]
+                item["value"] = (
+                    json_value
+                    if (not is_mapping or key in jsons)
+                    else value["default"]
+                )
                 item["type"] = value["type"] if "type" in value else "enum"
                 if '$ref' in value:  # list
                     enum_key = re.search(r"/([^/]+)$", value['$ref']).group(1)
@@ -481,4 +552,3 @@ if __name__ == "__main__":
         c = ConfigModel()
 
     print(c.script_task('GuildBanquet'))
-

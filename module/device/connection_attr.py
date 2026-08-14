@@ -95,7 +95,7 @@ class ConnectionAttr:
                     self.config.script.device.control_method = 'uiautomator2'
         if self.is_over_http:
             if self.config.script.device.screenshot_method not in ["ADB", "uiautomator2", "aScreenCap"] \
-                    or self.config.script.device.control_method not in ["ADB", "uiautomator2", "minitouch"]:
+                    or self.config.script.device.control_method not in ["adb", "ADB", "uiautomator2", "minitouch"]:
                 logger.warning(
                     f'When connecting to a device over http: {self.serial} '
                     f'ScreenshotMethod can only use ["ADB", "uiautomator2", "aScreenCap"], '
@@ -234,12 +234,16 @@ class ConnectionAttr:
         #     if os.path.exists(file):
         #         return os.path.abspath(file)
 
-        # Try adb in python environment
-        import sys
-        file = os.path.join(sys.executable, '../Lib/site-packages/adbutils/binaries/adb.exe')
+        # Resolve beside the imported package. sys.executable may be a launcher or
+        # uv-managed interpreter and is not a directory containing site-packages.
+        file = os.path.join(os.path.dirname(adbutils.__file__), 'binaries', 'adb.exe')
         file = os.path.abspath(file).replace('\\', '/')
         if os.path.exists(file):
             return file
+
+        for file in self.adb_binary_list:
+            if os.path.exists(file):
+                return os.path.abspath(file).replace('\\', '/')
 
         # Use adb in system PATH
         file = 'adb'
@@ -282,5 +286,3 @@ class ConnectionAttr:
 
         logger.attr('u2.Device', f'Device(atx_agent_url={device._get_atx_agent_url()})')
         return device
-
-

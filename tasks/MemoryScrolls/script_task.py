@@ -22,7 +22,7 @@ class ScriptTask(GameUi, MemoryScrollsAssets):
         con = self.config.memory_scrolls.memory_scrolls_config
         # 进入绘卷主界面
         self.goto_memoryscrolls_main(con) 
-        raise TaskEnd
+        raise TaskEnd.completed('MemoryScrolls completed')
     
     def goto_memoryscrolls_main(self, con):
         # 循环寻找&点击绘卷入口
@@ -48,7 +48,7 @@ class ScriptTask(GameUi, MemoryScrollsAssets):
         else:
             logger.error('Failed to enter Memory Scrolls main page')
             self.set_next_run(task='MemoryScrolls', success=False)
-            raise TaskEnd
+            raise TaskEnd.completed('MemoryScrolls completed')
         # 如果每天只刷小绘卷50，则先检测小绘卷数量
         if self.config.memory_scrolls.memory_scrolls_finish.auto_finish_exploration:
             while 1:
@@ -64,7 +64,7 @@ class ScriptTask(GameUi, MemoryScrollsAssets):
             else:
                 logger.warning('Small Memory Scrolls fragments not reached 50, task failed')
                 self.set_next_run(task='MemoryScrolls', success=False)
-                raise TaskEnd
+                raise TaskEnd.completed('MemoryScrolls completed')
             self.ui_click_until_smt_disappear(self.I_MS_FRAGMENT_S, stop=self.I_MS_FRAGMENT_S_VERIFICATION, interval=1.5)
         # 进入指定分卷
         self.goto_scroll(con)
@@ -99,7 +99,7 @@ class ScriptTask(GameUi, MemoryScrollsAssets):
                 case _:
                     logger.error(f'Unknown scroll number: {con.scroll_number.name}')
                     self.set_next_run(task='MemoryScrolls', success=False)
-                    raise TaskEnd
+                    raise TaskEnd.completed('MemoryScrolls completed')
         
         # 到达指定进度时进行通知提示
         if con.notification_95 and not self.appear(self.I_MS_COMPLETE_95):
@@ -119,10 +119,11 @@ class ScriptTask(GameUi, MemoryScrollsAssets):
             logger.info(f'Scroll {con.scroll_number.name} is already completed')
             self.set_next_run(task='MemoryScrolls', success=False)
             if con.auto_close_exploration:
-                # 自动关闭探索任务
+                # 自动关闭探索任务（DeepSeek-13 1.6: 走授权入口，不再直写旁路）
                 logger.info('Auto close exploration task after Memory Scrolls completion')
-                self.config.exploration.scheduler.enable = False
-                self.config.save()
+                self.config.set_scheduler_enabled(
+                    task='Exploration', enabled=False, caller='MemoryScrolls'
+                )
                 # next_run=datetime.now() + timedelta(days=1)
                 # self.set_next_run(task='Exploration', success=False, finish=False, target=next_run)
         # 返回绘卷主界面

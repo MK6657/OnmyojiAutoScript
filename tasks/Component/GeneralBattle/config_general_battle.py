@@ -20,9 +20,12 @@ class GeneralBattleConfig(BaseModel):
 
     # 是否启动 预设队伍
     preset_enable: bool = Field(default=False, description='preset_enable_help')
-    # 选哪一个预设组
+    # 当前版本正式路径：按游戏内名称选择。数字字段仅保留给历史配置和旧任务调用。
+    preset_group_name: str = Field(default='', description='preset_group_name_help')
+    preset_team_name: str = Field(default='', description='preset_team_name_help')
+    # 旧版按固定位置选择预设组
     preset_group: int = Field(default=1, description='preset_group_help', ge=1, le=7)
-    # 选哪一个队伍
+    # 旧版按固定位置选择队伍
     preset_team: int = Field(default=1, description='preset_team_help', ge=1, le=5)
     # 是否启动开启buff
     # buff_enable: bool = Field(default=False, description='buff_enable_help')
@@ -46,5 +49,4 @@ class GeneralBattleConfig(BaseModel):
 
     # 是否启动战斗时随机点击或者随机滑动
     random_click_swipt_enable: bool = Field(default=False, description='random_click_swipt_enable_help')
-
 

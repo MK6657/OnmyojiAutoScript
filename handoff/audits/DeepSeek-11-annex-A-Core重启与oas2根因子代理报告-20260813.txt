@@ -1,0 +1,31 @@
+【DeepSeek-11 根因报告 · 任务一】Core"重启循环"+oas2"秒退循环"根因（全程只读，未写任何文件）
+
+结论先行：20:01–20:39 的约 10+ 次 parent_pid 变更不是 Core 重启，而是 module/server/tests 测试套件的 pytest/unittest 实跑；"oas2 秒退（child_pid 恒 4100、exitcode=0、15ms）"是测试里 FakeProcess 假进程的生命周期；真正的 Core（PID 5936）自 05:56:10 起从未重启过。触发者是 DeepSeek-10 审查代理（父+子代理）授权的测试实跑（其报告自述 + 时间戳吻合）。
+
+━━ 1. Core 启动链与 27352→5936 双层结构 ━━
+【已证实】27352→5936 双层 = CPython venv 重定向器，非项目代码、非 watcher：
+• D:\OSAyys\.venv\pyvenv.cfg：home=C:\Users\ggy\AppData\Roaming\uv\python\cpython-3.11-windows-x86_64-none
+• 进程实测（CIM）：27352（.venv\Scripts\python.exe server.py，创建 05:56:10，父=7064）→ 5936（uv 托管 python.exe server.py，创建 05:56:10 同一秒，父=27352）；两进程创建同秒、命令行除解释器路径外完全相同 → venv 启动器以相同命令行拉起 home 下真解释器。
+• 27352 父 7064 = powershell「OAS Core :22267」窗口（Start-InNewWindow 的 EncodedCommand，即 control-center\start.ps1:303-304 的命令）；7064 父 11664（已退出）= 启动.bat/重启Core.bat→start.ps1 链 → 05:56:09-11 有人跑了控制中心启动器，这是当天最后一次真实 Core 启动。
+【可启动 server.py 的路径】① control-center\start.ps1:303-304（唯一自动拉 Core 的脚本）；② 手敲 python server.py；③ start-all.ps1→-SkipCore（不启 Core）；④ start-dev-stack.ps1 起 mock Core(22268) 非 server.py；⑤ deploy/、dev_tools/、tasks/Restart/、module/gui（ProcessManager 只管账号 worker）经全仓 grep 均无 server.py 拉起；⑥ uvicorn 由 server.py:109 uvicorn.run 启动；deploy.yaml Run:null → 生产启动不 auto 拉账号。所有 .ps1 均无循环/看门狗（start.ps1 单次执行：菜单 5s 倒计时、Wait-Ready 单次、-RestartCore 先 Stop-PortOwner 再拉一次）。
+
+━━ 2. 20:01–20:36"约 10 次重启"触发者 ━━
+【已证实（现象+机制）】测试实跑，不是任何脚本/定时/崩溃拉起：
+• python.txt "Script started: account=oas2" 共 11 次，11 个不同 parent_pid：28356(09:46)、28564(20:01:04)、696(20:01:27)、5132(20:04:16)、16840(20:35:04)、21228(20:36:09)、13108(20:36:23)、6980(20:37:46)、24804(20:38:06)、27700(20:38:57)、26472(20:39:03)；另有 15432/9224/13344 三个 partial 簇。每簇伴随 oas1 三源(rest/ws/auto)租约拦截 + oas2 start/exit。
+• 证据 A（决定性）：test_script_process.py:24 FakeProcess.next_pid=4100 → child_pid 恒 4100；:50 patch all_script_files→['oas1','oas2'] → oas2 无配置也存在；:138-147 以 source='auto' 启动 oas2 → 日志 "Script started: account=oas2, source=auto, child_pid=4100"；:62-67 asyncTearDown 置 alive=False/exitcode=0 再 _reap_dead_process() → "Script process exited: account=oas2 ... child_pid=4100, exitcode=0"（15ms=纯内存）。
+• 证据 B：oas1 三源拦截 = 测试 ScriptProcess('oas1').start 被真实 Core 5936 的 oas1 租约挡住（DeepSeek-10 F-16 同证"9 项全部 AccountLeaseError"）。
+• 证据 C：test_command_protocol.py:25 RuntimeError("spawn failed") ↔ "[unknown] command failed: id=cmd-2"（10 次）+ python.txt 尾部 20:39:02 rich traceback（含 FakeScriptProcess/FakeSocket）。
+• 证据 D：test_scheduler_idle.py:46 Script.get_next_task ↔ "Scheduler idle: no enabled tasks; worker will stop cleanly"；test_script_failure_schedule.py:21 _schedule_failure_retry('Exploration') ↔ "Failed task Exploration delayed by its failure interval"；每簇前 ~0.9s 均出现（10/10）→ 同一测试进程。
+• 证据 E：%TEMP%\oas-account-leases 中 20:01-20:39 的 test-<uuid> 账号租约文件（mtime/pid 与日志 parent_pid 逐一对应）来自 AccountRunLeaseTest 的 spawn 子进程。
+• 证据 F：python.txt mtime=20:39:04（最后写入=最后测试簇）；DeepSeek-10 报告自述实跑测试（:5 授权、:90 各套件全跑、F-12"20:29/20:34/20:37 簇=父代理与子代理授权的测试实跑"、F-16），报告 mtime 20:55 / annex 20:56 → 20:35-20:39 的 9 簇=DeepSeek-10 子代理 fix-run 循环（高概率）。
+【归属】20:35-20:39 簇归属 DeepSeek-10 代理=高概率；20:01-20:04 与 09:46 同类簇=更早测试实跑，归属待查。
+【100% 判定还缺】Windows 进程审计/ETW 或 hermes 会话命令历史，把 20:01-20:04、09:46 簇绑定到具体执行者（现象与机制已闭环）。
+
+━━ 3. oas2 秒退循环根因 ━━
+【已证实】oas2 从未有真实配置；"被 auto 拉起"=测试 patch all_script_files(['oas1','oas2'])（test_script_process.py:50），source='auto' 来自测试代码 other.start(source='auto')（:145），与生产 app.py:66 restart_processes（需 --run，deploy.yaml Run:null）无关。exitcode=0 秒退 = FakeProcess（patch multiprocessing.Process）start() 直接置 pid=4100/alive=True，tearDown 置 alive=False/exitcode=0 触发 reaper 日志；child_pid 恒 4100 = FakeProcess.next_pid 类属性初值（每测试进程重置）。生产环境不会发生 oas2 秒退。
+【待查】oas2 租约文件"ppid=26472 account=oas2"与现行代码"0pid=<os.getpid()>..."格式不符（全仓 grep 无 ppid= 写入者；git show HEAD 显示租约机制为未提交新代码）——疑为中间未提交版本或外部写入，不影响结论。
+
+━━ 4. 当前稳定态 vs 动荡态差异 ━━
+【已证实】"稳定态"树 27352→5936→2452 实际建立于 05:56:10/06:00:22（非 20:40）：5936=真实 Core（server.txt 06:00:22 "Script started ... parent_pid=5936, child_pid=2452"；最后记录 10:53:14 websocket disconnect 后静默但存活），2452=oas1 worker（spawn_main(parent_pid=5936)）。20:01-20:39 真实 Core 从未重启；"反复重启"是每条测试进程短命（~1-3s）的假象；20:39:04 测试跑完不再有写入（mtime 定格）→ 观察者看到"稳定"。
+
+【F-12 方法论提示】module.logger 无测试隔离：任何 argv[0]=python.exe 的进程（pytest/unittest/multiprocessing spawn 子进程）都写 log/2026-08-13_python.txt；判断日志归属前必须先绑定写入者身份（本次用 FakeProcess.next_pid=4100、cmd-2、Scheduler idle、Exploration 等测试专属特征完成绑定）。

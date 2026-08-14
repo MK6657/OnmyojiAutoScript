@@ -26,7 +26,7 @@ class ScriptTask(GameUi, SoulsTidyAssets):
             self.back_records()
 
         self.set_next_run(task='SoulsTidy', success=True, finish=False)
-        raise TaskEnd('SoulsTidy')
+        raise TaskEnd.completed('SoulsTidy')
 
     def goto_souls(self):
         """

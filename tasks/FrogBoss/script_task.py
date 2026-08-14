@@ -64,7 +64,7 @@ class ScriptTask(RightActivity, FrogBossAssets, GeneralBattleAssets):
 
         logger.info('FrogBoss end')
         self.next_run()
-        raise TaskEnd('FrogBoss')
+        raise TaskEnd.completed('FrogBoss')
 
     def next_run(self):
         time = self.config.model.frog_boss.frog_boss_config.before_end_frog

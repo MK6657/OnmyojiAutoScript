@@ -1,0 +1,3 @@
+# DeepSeek-13 计划审核报告 B（记录修复线）——子代理原文
+
+[内容：审核 Phase 4。核心结论：方向正确，覆盖 DS-12 H1-H7/H9、M1-M3/M5-M9、L1/L2/L5；6 处未覆盖/半覆盖（L4 evidence 状态字段、M4 存量清理、L3 条目级时间戳、H1 新 ID 清单不全）；4.1/4.2/4.6 落点需具体化。新 ID 缺口 8 项（OAS-GUILD-LOOP-001、OAS-EXHAUST-001/OAS-MAXCHALLENGE-001、OAS-GREEN-TPL-001、OAS-TEST-HERMETIC-001、oas2 澄清、XIUXING-001 系列、CC-DOC-DRIFT-001、OAS-CONTRACT-ENV-001）；OAS-POPUP-002→001、OAS-CRASH-001 关联 CORE-LIFE-001。裁定 CC F2-F19 应进总表（§4.8 先例）并加 §1 范围声明。顺序建议拆 Phase 0.4 前置补记 + Phase 4b 定稿；Phase 0.2 备份必须含 handoff/。RY-GUILD-001 推荐补建结案记录而非降级（四要素+范围限定+双日期+重开条件）；4.7 增「口头结案无效+创建义务/角色」。errata 方式：头部加注不改原文；20:09 注记落点=DS-10 报告 F-5 行:63 与 §4:108；annex-D 端口统计 errata 落点=DS-11 主报告 R-6+复验结论（annex 原文不可改写）。5.4 终检加链接校验与二次对账。]

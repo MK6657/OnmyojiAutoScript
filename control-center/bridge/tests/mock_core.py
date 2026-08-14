@@ -19,7 +19,7 @@
 启动（用户机器，Bridge 的虚拟环境即可）：
     cd D:\\OSAyys\\control-center\\bridge
     .venv\\Scripts\\python.exe -m uvicorn tests.mock_core:app --host 127.0.0.1 --port 22268
-或使用 launcher/start-dev-stack.ps1 一键拉起 mock Core + Bridge + UI-claude。
+或使用 launcher/start-dev-stack.ps1 一键拉起 mock Core + Bridge + 正式前端。
 
 调试辅助接口（真实 Core 没有，仅本模拟器提供）：
     GET  /__mock__/stats            各接口调用计数、WS 连接次数
@@ -192,6 +192,7 @@ class MockCore:
         self.configs: list[str] = ["oas1", "oas2", "oas3"]
         self.store: dict[tuple[str, str], dict[str, list[dict[str, Any]]]] = {}
         self.states: dict[str, int] = {name: STATE_INACTIVE for name in self.configs}
+        self.revisions: dict[str, int] = {name: 1 for name in self.configs}
         self.sockets: dict[str, list[WebSocket]] = {}
         self.log_tasks: dict[str, asyncio.Task] = {}
         self.stats = {"args_calls": 0, "value_calls": 0, "ws_connects": {}, "fault": False}
@@ -318,6 +319,7 @@ async def config_copy(file: str, template: str = "template"):
     if file not in core.configs:
         core.configs.append(file)
         core.states[file] = STATE_INACTIVE
+        core.revisions[file] = 1
     return list(core.configs)
 
 
@@ -329,6 +331,7 @@ async def config_rename(old_name: str = "", new_name: str = ""):
         raise HTTPException(status_code=400, detail="Rename failed")
     core.configs[core.configs.index(old_name)] = new_name
     core.states[new_name] = core.states.pop(old_name, STATE_INACTIVE)
+    core.revisions[new_name] = core.revisions.pop(old_name, 1)
     for key in [key for key in core.store if key[0] == old_name]:
         core.store[(new_name, key[1])] = core.store.pop(key)
     return True
@@ -340,6 +343,7 @@ async def config_delete(name: str = ""):
         raise HTTPException(status_code=400, detail="Delete failed")
     core.configs.remove(name)
     core.states.pop(name, None)
+    core.revisions.pop(name, None)
     for key in [key for key in core.store if key[0] == name]:
         core.store.pop(key)
     return True
@@ -353,14 +357,49 @@ async def script_start(script_name: str):
     await core.broadcast(script_name, {"state": STATE_RUNNING})
     await core.broadcast(script_name, {"schedule": core.schedule_of(script_name)})
     core.ensure_log_task(script_name)
-    return None
+    return {"status": "completed", "success": True, "changed": True, "state": STATE_RUNNING}
 
 
 @app.get("/{script_name}/stop")
 async def script_stop(script_name: str):
     core.states[script_name] = STATE_INACTIVE
     await core.broadcast(script_name, {"state": STATE_INACTIVE})
-    return None
+    return {"status": "completed", "success": True, "changed": True, "state": STATE_INACTIVE}
+
+
+@app.get("/{script_name}/config/revision")
+async def script_config_revision(script_name: str):
+    if script_name not in core.configs:
+        raise HTTPException(status_code=404, detail="Config not found")
+    return {"revision": f"rev-{core.revisions.get(script_name, 1)}"}
+
+
+@app.patch("/{script_name}/{task}/values")
+async def script_set_values(script_name: str, task: str, payload: dict[str, Any]):
+    expected = str(payload.get("expected_revision") or "")
+    current = f"rev-{core.revisions.get(script_name, 1)}"
+    if not expected:
+        raise HTTPException(status_code=428, detail="Config revision is required")
+    if expected != current:
+        raise HTTPException(status_code=409, detail=f"revision conflict: expected={expected}, current={current}")
+    fields = list(payload.get("fields") or [])
+    for field in fields:
+        saved = await script_set_value(
+            script_name,
+            task,
+            str(field.get("group") or ""),
+            str(field.get("name") or ""),
+            str(field.get("type") or "string"),
+            field.get("value"),
+        )
+        if saved is False:
+            raise HTTPException(status_code=400, detail="OAS Core 拒绝了配置字段")
+    core.revisions[script_name] = core.revisions.get(script_name, 1) + 1
+    return {
+        "saved": True,
+        "updated": len(fields),
+        "revision": f"rev-{core.revisions[script_name]}",
+    }
 
 
 @app.get("/{script_name}/{task}/args")
@@ -440,6 +479,51 @@ async def websocket_endpoint(websocket: WebSocket, script_name: str):
         await websocket.send_json({"schedule": core.schedule_of(script_name)})
         while True:
             command = await websocket.receive_text()
+            try:
+                request = json.loads(command)
+            except (TypeError, json.JSONDecodeError):
+                request = None
+            if isinstance(request, dict) and request.get("command_id"):
+                command_id = str(request["command_id"])
+                action = str(request.get("command") or "")
+                await websocket.send_json({
+                    "type": "command_ack",
+                    "command_id": command_id,
+                    "command": action,
+                    "status": "accepted",
+                })
+                if action == "start":
+                    core.states[script_name] = STATE_RUNNING
+                    core.ensure_log_task(script_name)
+                    await core.broadcast(script_name, {"state": STATE_RUNNING})
+                    await core.broadcast(script_name, {"schedule": core.schedule_of(script_name)})
+                elif action == "stop":
+                    core.states[script_name] = STATE_INACTIVE
+                    await core.broadcast(script_name, {"state": STATE_INACTIVE})
+                elif action not in {"get_state", "get_schedule"}:
+                    await websocket.send_json({
+                        "type": "command_result",
+                        "command_id": command_id,
+                        "command": action,
+                        "status": "failed",
+                        "success": False,
+                        "reason": "unsupported_command",
+                    })
+                    continue
+                if action == "get_state":
+                    await core.broadcast(script_name, {"state": core.states.get(script_name, STATE_INACTIVE)})
+                if action == "get_schedule":
+                    await core.broadcast(script_name, {"schedule": core.schedule_of(script_name)})
+                await websocket.send_json({
+                    "type": "command_result",
+                    "command_id": command_id,
+                    "command": action,
+                    "status": "completed",
+                    "success": True,
+                    "changed": action in {"start", "stop"},
+                    "state": core.states.get(script_name, STATE_INACTIVE),
+                })
+                continue
             if command == "get_state":
                 await core.broadcast(script_name, {"state": core.states.get(script_name, 0)})
             elif command == "get_schedule":

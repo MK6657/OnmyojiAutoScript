@@ -67,7 +67,7 @@ class ScriptTask(GameUi, QuizAssets, ActivityShikigamiAssets, Debugger):
 
         self.ui_click(self.I_UI_BACK_YELLOW, self.I_CHECK_MAIN, interval=2)
         self.set_next_run(task='Quiz', success=True, finish=True)
-        raise TaskEnd('Quiz')
+        raise TaskEnd.completed('Quiz')
 
     def enter(self):
         while 1:

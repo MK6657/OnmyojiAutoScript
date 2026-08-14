@@ -1,0 +1,66 @@
+所有证据已收集完毕（含运行时探针与 SQLite 只读勘查）。以下为审查报告。
+
+---
+
+# coordinate-calibrator v0.3.8 API 层与服务器/设置层只读审查报告
+
+**审查范围**：`src/coordinate_calibrator/api/app.py`(1622 行)、`api/runtime.py`(3482 行)、`api/schemas.py`(210)、`api/idempotency.py`(176)、`server.py`(123)、`settings.py`(231)、`instance_lock.py`(72)、`logging_setup.py`(30)、`maintenance.py`(187)，另为取证引用了 storage/repository.py、storage/bundles.py、storage/artifacts.py、adapters/windows/provider.py、domain/geometry.py、domain/transforms.py。全程未修改任何文件；运行探针均用 `env -u PYTHONPATH PYTHONPATH=src .venv/Scripts/python.exe -B`（禁写 pycache）只读执行；SQLite 用 `mode=ro` 打开。
+
+## ① 历史声明核对表
+
+| # | 声明 | 代码现状 | 判定 | 证据 file:line |
+|---|---|---|---|---|
+| 1 | CC-SEC-002：CLI --host 与配置 host 不一致必须启动前失败 | `resolve_bind_host`/`resolve_bind_port` 与 `settings.host`/`port` casefold 比对，不一致抛 ValueError → `parser.error()` 在构造 uvicorn 之前退出；settings 层先验 host 合法性+loopback 门 | **已实施** | server.py:16-35,56-60；settings.py:124-130；实测探针：`resolve_bind_host(SETTINGS,'0.0.0.0')→ValueError`、port 9999→ValueError、127.0.0.1→通过。app.py:1619 的 `main()` 路径无 CLI 参数、只绑 SERVER_HOST，无分歧面 |
+| 2 | CC-MIGRATE-001：普通启动绝不迁移 | app 启动实例化传 `allow_schema_migration=False`；repository 门在旧 schema 且未授权时抛 `RepositorySchemaError("requires explicit migration; run ... migrate --confirm")`；maintenance CLI 仅 `migrate` 且必须 `--confirm` 才传 True，其余命令要求已是当前版本 | **已实施** | app.py:163；repository.py:706-711；maintenance.py:143-144,149-152,162 |
+| 3 | 0.3.7 声称 schema-6 幂等持久化 + audit P2『指纹不含租约身份，600s>300s』 | 指纹=sha256(method:path:canonical(body+lease{session_id,lease_id,fencing_token}))，租约三元组已入指纹并落库（表含 lease_id/fencing_token 列，DB 实测 394 行）；重启重放走 completed→缓存响应，崩溃残留走 resource_ids+recover；TTL 已改 24h 且与 protocol.md 一致 | **已实施**（指纹维度）。残留：① owner 不在指纹中，且 DB 层按 `(route,key)` 查询、与 `UNIQUE(route,owner,key)` 不一致（见 N2）；② lease/acquire 本身无租约上下文，completed 重放不回验租约（见 N3） | app.py:396-414；idempotency.py:86-89,133-150；repository.py:344-439,661-676；实测 DB schema_meta=6、integrity=ok、idempotency_operations=394 |
+| 4 | audit P2『bundle import 在 async 路由同步阻塞』 | `import_project_bundle` 是 `async def`，第 1496 行直接同步调用 `import_bundle`（ZIP 全量解压≤512MB、PIL verify、DB/FS 写，bundles.py:447 纯同步函数），无 `to_thread`；幂等注册表 run/recover 亦在事件循环线程做同步 DB | **未实施**（P2 仍存在） | app.py:1467-1502（尤其 1496）；bundles.py:447-449,52-83 |
+| 5 | audit P2『Session close 先删 DB 所有权、FS 清理失败仍返回成功』 | `_close_session_unlocked` 先 `repository.delete_session`（2284）后 `artifacts.delete_session`（2286），后者异常被 2287-2288 吞掉仅 warning；路由固定回 200 `{"closed": True}` | **未实施**（仍存在）。缓解：启动时 reconcile_artifacts 会标记孤儿文件 | runtime.py:2278-2294；app.py:898-901；runtime.py:282 |
+| 6 | audit P2『token 创建依赖继承 Windows ACL』 | `_load_or_create_token` 仅 write_text+os.replace；全库 grep `icacls/chmod/win32security/SetFileSecurity` 0 命中 | **未实施**（多用户主机风险仍开放） | app.py:109-125 |
+| 7 | audit P2『预期配额/状态错误以非结构化 500 逃逸』 | 大部分已结构化：`operation()` 统一收编 KeyError→404 not_found、RepositoryConflict→409/423(lease_conflict/stale_revision)、FrameCaptureError→503、WindowsAdapterUnavailable→503、RuntimeError/ValueError→409 invalid_state；InvalidShape(ValueError)、CoordinateOutOfBounds(ValueError)、BundleError(ValueError) 均在覆盖内。但 **OSError 不在捕获清单**：缺文件路径（FileNotFoundError）直接 500（如 import_background_from_canvas read_bytes、background_thumbnail read_bytes、compare_backgrounds read_bytes）；sqlite3.Error 亦无收编；无全局 exception_handler | **部分实施** | app.py:476-491；geometry.py:17；transforms.py:8,12；bundles.py:21；逃逸点：runtime.py:2549,2624,2652 / app.py:989,1070,1114 |
+| 8 | 0.3.7 声称『未知/非 Per-Monitor DPI 时禁用屏幕鼠标采样 fail closed』 | 启动调用 setter（app.py:141）；provider 用 `GetProcessDpiAwareness` 实测进程真实模式，ACCESS_DENIED 不再直接判成功（96-99），未知→per_monitor=False；arm 时 `_validate_mouse_arm_unlocked` 强制 per_monitor=True 否则 RuntimeError 拒绝；另强制 WH_MOUSE_LL 拒绝 polling | **已实施**。本机实测：未设感知的进程 query 返回 `mode='unaware', per_monitor=False` → 会被拒（fail closed 生效） | provider.py:38-82,85-109；runtime.py:2967-2973,3018-3021；app.py:141 |
+
+## ② 新发现问题清单
+
+- **N1 🟡 注意｜bundle 导入阻塞事件循环**（app.py:1468-1497 + bundles.py:447）。现象：128MB ZIP 解压+哈希+图像校验+逐画布 DB/FS 写入全部在事件循环线程同步执行，期间 health/WebSocket 全部等待。置信度=已证实（代码事实；阻塞时长未实机测量）。即清单#4，audit P2 未修。
+- **N2 🟡 注意｜幂等 owner 维度 DB 层失效**（repository.py:373-376 vs 675）。begin 查询用 `WHERE route=? AND idempotency_key=?`（不带 owner），而表约束是 `UNIQUE(route, owner, idempotency_key)`，且指纹不含 owner → 跨 owner 同 key 同 body 会命中他人记录并回放其响应（内存注册表按 owner 分键，重启后 DB 层暴露）。置信度=已证实。
+- **N3 🟡 注意｜lease/acquire 幂等重放可返回已失效租约**（idempotency.py:133-139；app.py:840-844）。acquire 无 lease_session_id → 指纹不含租约；同 key 重试在 TTL 内直接返回缓存 envelope（含旧 lease_id），不重新校验该租约是否仍有效；客户端拿到死租约后首个操作 423 自愈。与协议"identical replay returns the committed result"字面一致，但属 P2 同族残留。置信度=已证实（代码路径）。
+- **N4 🟡 注意｜Session 序列化无锁读**（runtime.py:123-161；app.py:879-880,1199）。`as_dict()` 直接迭代 annotations/samples/backgrounds dict，GET 路径不持 `_session_lock`；与写线程并发时理论上可抛 "dictionary changed size during iteration"→500。audit P2 该条仍存在。置信度=已证实（代码事实，触发概率低）。
+- **N5 🟡 注意｜隔离区无配额上限**（runtime.py:541-569,1836-2102；repository.py:2880-2896）。quarantine 写入不经过任何 max_files/max_bytes 统计（quota 只统计 artifacts 表 staging/ready 行），永久删除画布可无限堆积文件。audit P2 该条仍存在。置信度=已证实。
+- **N6 🟢 干净(文档漂移)｜错误信封与协议示例不一致**：实际错误仅 `{"detail":{code,message}}`，无协议示例中的 `request_id`/`fields`（protocol.md:22-30）；404/405 等 Starlette 默认响应为纯文本 detail。422 数组已在协议声明，不算缺陷。置信度=已证实。
+- **N7 🟢 干净(文档漂移)｜稳定错误码表双向漂移**：协议列出 `lease_required`（代码 0 处发出，实际为 lease_conflict/invalid_state）；代码新发出 `invalid_owner`/`bundle_too_large`/`invalid_bundle`/`invalid_content_length`/`cross_workspace_selection` 未列入文档（protocol.md:141 vs app.py 全量 code 枚举）。置信度=已证实。
+- **N8 🟢 干净(文档漂移)｜batch-visibility/batch-restore 无 selection_hash**，与 protocol.md:9『Batch writes carry … selection_hash』不符（audit P3 项仍存在）。app.py:1268-1277。置信度=已证实。
+- **N9 🟢 干净(文档漂移)｜workspace_heartbeat 实际 ~1s，协议称 ~15s**（app.py:1599 `subscriber.get(True, 1.0)`）。置信度=已证实。
+- **N10 🟡 注意｜capabilities 端点轻度高估**：`mouse_capture: windows_available` 恒 True（app.py:572），未反映 DPI fail-closed 实际状态（arm 时才拒绝）；health 端点无鉴权（设计内）。置信度=已证实。
+- **N11 🟡 注意｜幂等内存注册表容量 1024，超容量直接 409**（idempotency.py:93-94），大量唯一 key 突发时合法请求被拒。置信度=已证实。
+- **N12 🟢 干净(观察)｜启动时 reconcile_artifacts 全量读盘**（runtime.py:282,2061-2069 逐文件 read_bytes+sha256），大数据根启动变慢；无进展上报。置信度=已证实。
+- **N13 🟡 注意｜幂等崩溃残留阻塞窗口**：in_progress 且有 resource_ids 且 recover 失败（如资源已被删）→ 该 key 阻塞至 expires_at（24h）才可复用（idempotency.py:140-153；repository.py:399-412）。置信度=已证实（代码路径）。
+- **N14 🟢 干净(已知良性)｜close_session 的 capture-lock『先释放后弹除』竞态**（runtime.py:2274-2276），与会话已删除叠加后无害（get 404）。置信度=已证实。
+- **N15 🟢 干净(卫生)｜TrustedHost 默认注入 `testserver`（settings.py:142），allowed_origins 含重复 `http://127.0.0.1:22880` 两项**（settings.py:146-151；实测输出确认）。置信度=已证实。
+
+## ③ 通过项（安全基线 ✅）
+
+- **无硬编码密钥**：全库 grep `password/secret/api_key` 仅 `import secrets`；token 用 `secrets.token_urlsafe(32)`（app.py:121）。
+- **认证比较恒定时间**：所有 token/摘要比对均 `hmac.compare_digest`（app.py:465,523,1117,1534,1578）。
+- **SQL 全参数化**：唯一 f-string 为内部表名（sqlite_master 来源，repository.py:991）与占位符列表（2175,2213,2243），无用户输入拼接。
+- **无危险调用**：`eval/exec/os.system/shell=True/pickle` 全库 0 命中。
+- **CORS/Host/Origin 与 loopback 一致**：无 CORSMiddleware（loopback 正确姿势）、origin_guard 403 信封（app.py:291-298）、WS 双侧 Origin 校验（1530,1574）、TrustedHostMiddleware（286）；远程模式强制 require_token + allowed_hosts/origins（settings.py:137-140）；实测 require_token=true、allow_remote=false、绑定 127.0.0.1:22880。
+- **路径安全**：ArtifactStore 组件白名单正则+拒绝 `..`+reparse point（symlink/junction）检查（artifacts.py:32-91）；bundle 防穿越（bundles.py:41-49）；下载走 safe_path（app.py:1508）。
+- **解压/图像炸弹防护**：bundle 128MB/1000 文件/512MB 解压/2000 压缩比上限（bundles.py:25-29,52-83）；导入图 20MB/8192/像素上限（runtime.py:2324-2335）；Pillow DecompressionBomb 显式捕获（bundles.py:291）。
+- **租约 fencing 双点校验**：BEGIN IMMEDIATE 与 commit 前各校验一次 session 存在+lease+fencing+过期（repository.py:186-191,216-245）；fencing_token 单调递增（3206）。
+- **迁移安全**：迁移锁（repository.py:81-129）、备份+sha256 先于迁移（511-525）、schema 结构/外键/索引校验（743-986）。
+- **原子写**：fsync+os.replace 全链路（server.py:38-46、artifacts.py:102-106、maintenance.py:114-120）。
+- **跨进程实例锁**：msvcrt.locking 非阻塞（instance_lock.py:18-47）。
+- **请求体上限**：RequestBodyLimitMiddleware 32MB（app.py:237-287）；404 回放逻辑正确处理（275-282）。
+- **导出锁定**：export_project/export_workspace 持 workspace 锁+逐 session 锁+SQLite 单连接 read_snapshot（bundles.py:176-247；repository.py:200-214），audit P2『导出无锁』已修。
+- **导入预校验**：8192 画布/50 背景/300 标注/200 分组/工作区与画布配额全部先于业务行写入（bundles.py:275-276,303,326,383-405）。
+- **运行时实据**：版本 0.3.8、DB schema 6、integrity=ok、WAL、17 sessions/81 annotations/17 frames/6 quarantine/3 migration_history。
+
+## ④ 无法判定项
+
+- 真机 DPI 100/125/150%、真实 ADB、双 MuMu 零串帧、鼠标样本实机验收（audit-20260809 遗留项，静态无法判定）。
+- 测试套件未实跑（只读约束下运行会写 logs/pycache）：静态清点 tests/ 共 **146** 个 `def test_`（10 个文件），与 0.3.8 声称 146/146 数量吻合，但通过与否未验证。
+- bundle 导入阻塞的实际时长影响（需实机压测；阻塞事实本身已由代码证实）。
+- 多用户主机 ACL 的实际暴露面（依赖部署环境）。
+- 前端 app.js 的两个 P2（比较状态/blink 残留、选择全量重建 DOM）不在本次 API/服务器层范围，未判。
+
+**总体结论**：8 条历史声明中 **5 条完全落地**（CC-SEC-002、CC-MIGRATE-001、幂等指纹+持久化、错误信封结构化、DPI fail-closed），**3 条 audit P2 仍存在**（bundle import 阻塞、session close 顺序+吞错、token ACL），1 条部分（500 逃逸路径残留 OSError/sqlite 通道）。协议文档与代码存在 5 处轻度漂移（错误信封字段、错误码表、selection_hash 契约、心跳间隔、导出路径参数命名），无安全阻断级问题；安全基线（参数化 SQL、恒定时间比较、无硬编码密钥、路径防穿越、fencing 租约）整体扎实。未修改任何文件。

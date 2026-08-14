@@ -20,6 +20,7 @@ class Control(Minitouch, Adb, Scrcpy, Window):
     @cached_property
     def click_methods(self):
         return {
+            'adb': self.click_adb,
             'ADB': self.click_adb,
             'uiautomator2': self.click_uiautomator2,
             'minitouch': self.click_minitouch,
@@ -31,6 +32,7 @@ class Control(Minitouch, Adb, Scrcpy, Window):
     @cached_property
     def long_click_methods(self):
         return {
+            'adb': self.long_click_adb,
             'ADB': self.long_click_adb,
             'uiautomator2': self.long_click_uiautomator2,
             'minitouch': self.long_click_minitouch,
@@ -79,6 +81,7 @@ class Control(Minitouch, Adb, Scrcpy, Window):
             self.config.script.device.control_method,
             self.click_adb
         )
+        self.invalidate_recognition_cache('click')
         method(x, y)
 
 
@@ -148,6 +151,7 @@ class Control(Minitouch, Adb, Scrcpy, Window):
         method = self.long_click_methods.get(
             self.config.script.device.control_method,
             self.long_click_adb)
+        self.invalidate_recognition_cache('long_click')
         method(x, y, duration)
 
     def swipe(self, p1, p2, duration=(0.1, 0.2), control_name='SWIPE', distance_check=True):
@@ -182,8 +186,9 @@ class Control(Minitouch, Adb, Scrcpy, Window):
                 # Should swipe a certain distance, otherwise AL will treat it as click.
                 # uiautomator2 should >= 6px, minitouch should >= 5px
                 logger.info('Swipe distance < 10px, dropped')
-                return
+                return False
 
+        self.invalidate_recognition_cache('swipe')
         if method == 'minitouch':
             self.swipe_minitouch(p1, p2)
         elif method == 'window_message':
@@ -196,6 +201,7 @@ class Control(Minitouch, Adb, Scrcpy, Window):
         #     self.swipe_maatouch(p1, p2)
         else:
             self.swipe_adb(p1, p2, duration=duration)
+        return True
 
     def swipe_vector(self, vector, box=(123, 159, 1175, 628), random_range=(0, 0, 0, 0), padding=15,
                      duration=(0.1, 0.2), whitelist_area=None, blacklist_area=None, name='SWIPE', distance_check=True):
@@ -232,7 +238,8 @@ class Control(Minitouch, Adb, Scrcpy, Window):
         logger.info(
             'Drag %s -> %s' % (point2str(*p1), point2str(*p2))
         )
-        method = self.config.script.emulator.control_method
+        method = self.config.script.device.control_method
+        self.invalidate_recognition_cache('drag')
         if method == 'minitouch':
             self.drag_minitouch(p1, p2, point_random=point_random)
         elif method == 'uiautomator2':

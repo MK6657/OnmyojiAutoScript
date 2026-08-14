@@ -1,0 +1,77 @@
+# 任务五报告：OSAyys 全项目变更基线 + 文档链复核（DeepSeek-11，只读）
+
+总体结论：审查后无任何改变根因结论的新变更（无新提交、无新工作树变更、untracked 数量与 10 轮一致）。但日志取证推翻/修正了 10 轮报告的两处现象级结论（F-11 的"Core 反复重建 + oas2 秒退"是测试工件而非生产现象；F-5 的"20:09:31 真实战斗"旁证高概率也是测试），并把 F-12 污染范围从"20:29-20:39"修正为全天 00:34→20:39。
+
+## 1. git 状态复核（任务 1）
+
+| 检查项 | 结果 | 证据 | 置信度 |
+|---|---|---|---|
+| 状态项总数 | 287 项，与 10 轮完全一致（M=137 + D=58 + ??=92 = 287；195 跟踪 + 92 untracked） | git status --short 实测（2026-08-13 21:47） | 已证实 |
+| 新提交 | 无。HEAD=1724ce44（07-31 12:51:52 提交）；reflog 自 07-31 后零条目（无 commit/checkout/stash/reset） | git reflog --date=iso | 已证实 |
+| 20:40 后修改/新增的工作树文件 | 仅 6 个 = 10 轮自身产物：handoff/audits/DeepSeek-10-OSAyys全项目只读审查-20260813.md（20:55:50）+ 5 个 annex（20:56:00，均 20:56 落盘） | LastWriteTime 过滤 20:40 后（排除 .git/.venv/node_modules/__pycache__），全树仅此 6 项 | 已证实 |
+| .git 21:06 mtime | 非提交活动。递归扫描 .git 无任何 >20:00 的文件；.git/index mtime=08-03 07:52（未变）；.git 目录 mtime 变化来自只读 git status 瞬时创建/删除 index.lock | Get-ChildItem .git -Recurse -Force + index mtime；reflog 佐证 | 已证实 |
+| config/ 20:37、log/ 20:39 | 均为 20:40 前活动，10 轮已覆盖；log 目录 mtime 09:42（目录级，非内容） | mtime 实测 | 已证实 |
+
+结论：10 轮报告落盘后项目无任何代码/配置/提交层面的新变化，根因结论不因工作树变化而需要修正。附注：执行了 git status/log/reflog 只读命令（标准读操作，瞬时 index.lock 副作用不可避免，index 内容未变）。
+
+## 2. 文档链复核（任务 2）
+
+10 轮全部文档漂移点逐项仍成立：
+
+| 漂移点 | 现状 | 证据 | 置信度 |
+|---|---|---|---|
+| 总表滞后 + XiuxingHexun 零记录 | 仍成立：总表 mtime 08-11 10:40，234 行，Xiuxing/xiuxing 提及 0 处 | Codex-待做事项总表.md（mtime + grep） | 已证实 |
+| §9 运行状态过期 | 仍成立：总表行 234「当前 Core、Bridge、前端和 coordinate-calibrator 均运行；oas1 已停止」——实测仅 22267(Core PID 5936) 与 22880(CC PID 25064) 在监听，Bridge 22367、前端 4175 均无监听（与 10 轮 §0 一致） | Get-NetTCPConnection 实测 + 总表:234 | 已证实 |
+| RY-GUILD-001 结案记录缺失 | 仍成立：handoff/records/closure/ 空目录（glob 0 文件） | glob | 已证实 |
+| 任务文件状态句过期 | 仍成立：handoff/tasks/RY-GUILD-001.md:5 仍写「安全逻辑已修，待坐标与实测…勋章 OCR ROI 尚未配置」（8-10 方案，与 8-11 排序按钮协议不符）；RR-COMBAT-001.md:5 仍写「绿标模板/ROI 尚未通过靶场验证」「3/150 命中」（总表行 56 已是「绿标快速采样 2/2」） | 亲读两文件 | 已证实 |
+| README 审计指针 | 新增漂移：handoff/README.md:13「最新只读审计是 2026-08-10 P0/P1 复核审计」——未收录 08-13 的 DeepSeek-09/10 | 亲读 | 已证实 |
+| 00-当前状态.md | 仍停在 08-11 10:45:32（Core PID 22952、Bridge PID 20992、281 项等均过期） | 亲读 | 已证实 |
+
+审查谱系（handoff/audits/，14 个文件）：
+- Codex-coordinate-calibrator全貌只读审计-20260808.md（08-08，仅 CC）
+- Codex-OAS与coordinate-calibrator全貌只读审计-20260809.md（mtime 08-11 10:40）
+- Codex-双项目P0P1复核审计-20260810.md（08-10）
+- DeepSeek-09-coordinate-calibrator-v0.3.8只读审查-20260813.md + annex A/B/C/D（08-13 20:23，仅 CC）
+- DeepSeek-10-OSAyys全项目只读审查-20260813.md + annex A/B/C/D/E（08-13 20:55-20:56，OSAyys）
+
+## 3. F-12 现状 + 生产日志基线（任务 3）
+
+F-12 机制已从代码级证实：module/logger.py:129（pyw_name = sys.argv[0] 基名）、:369-370（import 时即调用 logger.set_file_logger() + hr('Start')）——任何导入 module.logger 的 python 进程都按自身 argv[0] 打开当日日志文件并写 START 横幅。server.py→server.txt，worker（script.py:610/628 set_file_logger(self.config_name)）→oas1.txt，其余 python 进程（测试）→python.txt。
+
+| 检查项 | 结果 | 证据 | 置信度 |
+|---|---|---|---|
+| 尾部是否仍为测试写入 | 是：python.txt 末行 20:39:04.166（account lease 簇，parent_pid=26472）；20:39:01.571 的 rich traceback 为 module.server.tests.test_command_protocol.FakeScriptProcess（test_command_protocol.py:25 raise RuntimeError("spawn failed")） | python.txt 尾部直读 | 已证实 |
+| 污染范围 | 全天 00:34→20:39（比 10 轮记录的 20:29-20:39 更广）：00:34、01h-10h、19:57-20:09、20:01-20:04、20:35-20:39 均有测试簇；08-12 的 python.txt 亦有 2 处 FakeScriptProcess（污染是老问题） | 小时直方图 + 簇时间线 + 08-12_python.txt | 已证实 |
+| 当前有无测试进程 | 无。python 进程仅：CC server(7412/25064)、nemu_worker×2(21796/9584)、OAS Core(27352→5936→2452)、hermes(23996)——无 pytest/unittest | Get-CimInstance Win32_Process 命令行 | 已证实 |
+
+生产日志基线：
+- 最后一笔真实生产活动（任务级）：log/2026-08-13_oas1.txt 末行 2026-08-13 06:04:35.976 | nemu_ipc.py:0560 | INFO | nemu_ipc released（前一行 06:04:35.972 TASK_END outcome=returned success=True ... reason='Goto main end'，XiuxingHexun 正常收工）。该文件 0 处 "unknown page"（测试字符串从未进入生产账日志）、506 条 XIUXING_HEXUN、9 条 FAILURE（= 10 轮所述 9 次真实失败）。
+- 最后一笔真实 Core 服务级活动：log/2026-08-13_server.txt（仅 138 行）末行 2026-08-13 10:53:14.909 | script_router.py:0523 | WARNING | [oas1] websocket disconnect；此后 Core 5936（05:56 起，一直存活）静默（scheduler idle，XiuxingHexun next_run=08-14 06:04）。
+- python.txt 末字节 20:39:04.168 = 测试污染（10 轮审查自身测试 + 之前测试）。
+
+## 4. 重大发现：python.txt 测试工件被误读为生产现象（10 轮报告修正）
+
+F-11 现象级结论不成立（已证实）：
+- python.txt 中全部 14 个"Script started/lease"簇（28356@09:46；28564@20:01:04、696@20:01:27、15432@20:02、5132@20:04；16840@20:35、21228@20:36:09、13108@20:36:23、9224@20:36:40、13344@20:36:49、6980@20:37:46、24804@20:38:06、27700@20:38:57、26472@20:39:03）全部 child_pid 恒 = 4100——而 module/server/tests/test_script_process.py:24 明写 class FakeProcess: next_pid = 4100，:69/:144 注入假配置 ['oas1','oas2']，:146 创建 ScriptProcess('oas2')。即：oas2"秒退"、lease 拦截簇、"parent_pid ×10"全部是 test_script_process 测试运行（每次 pytest/unittest 进程一个簇）。
+- 真实 Core（server.txt）中 oas2=0、4100=0、source=auto=0 处——真 Core 从未拉起 oas2、从未出现 child_pid=4100。10 轮 annex E:27-28 与 F-11 均把该测试模式误读为"调度器自动启动 oas2 + Core 反复重建"。
+- 注意：F-16（测试被真实 Core 5936 的租约拦截，9×AccountLeaseError）仍然成立——那是测试打真租约；F-1（oas1.txt 内 BrokenPipeError 生产崩溃）也仍然成立（属生产日志）。
+
+F-5 的"20:09:31 真实战斗"旁证高概率失效（高概率）：
+- 19:57-20:09 的 RealmRaid level_mode + GeneralBattle 战斗内容位于 python.txt（测试文件），且：python.txt 全程无一条 "Script started: account=oas1"（真脚本启动必被 script_process.py:233 记录）；oas1.txt 无任何晚场写入；观测时长 durationMs=0.0-2.6ms（真截图不可能）；紧邻的 lease 簇为 FakeProcess 测试。→ 该"战斗"高概率为测试夹具回放（单步验证 limit=1 正是 HEAD 提交"prepare safe realm raid single-step validation"的测试点）。10 轮 F-5 据此得出的"绿标 unconfirmed 实机旁证"需降级为测试内证据。
+
+这两处修正不改变 F-1/F-2/F-4/F-6 等基于生产日志（oas1.txt/server.txt）的根因结论。
+
+## 5. 任务 4（快速抽查）
+
+- tasks/XiuxingHexun/、tasks/Component/CommonPopup/（10 轮后新增/未覆盖模块）：grep TODO|FIXME|XXX|NotImplemented 0 命中，无显式占位缺陷（与 10 轮"XiuxingHexun 质量显著高于历史"一致）。
+- 其余未覆盖文件（dev_tools/green_mark_passive_capture.py、green_mark_target_range.py 等）未深挖（时间预算用于 1-3，且为只读小工具脚本）。
+
+## 6. 未决 / 缺证据清单
+
+1. python.txt 文件名的确切 argv[0] 机制（为何测试进程落 python.txt 而非 __main__/pytest.txt）——不影响任何结论，纯机理待查。
+2. 09:46 与 20:01-20:04 的 test_script_process 运行者身份（DeepSeek-09 预检？用户手动跑？）——需与用户/前序会话核对，日志无法判定。
+3. 09:42/09:45 的 2026-08-13_-c.txt（712B）与 2026-08-13_-.txt（5696B）（python -c/python - 直跑）运行者与内容——未读（只读可读，但非本任务关键）。
+4. 00:16-03:42 的 Core（PID 25336）服务级日志在 2026-08-12_server.txt（mtime 08-13 02:46:06，末行 02:46:06.991 Script started ... parent_pid=25336）——已定位，未逐行核对其中间段。
+5. 19:57-20:09 内容 100% 定性需比对测试夹具截图/用例名（当前为高概率）。
+
+执行声明：全程只读；未修改/创建任何文件、未跑任何测试、未启停服务、未安装依赖。唯一写副作用为 git status 等只读命令对 .git/index.lock 的瞬时创建（index 内容未变，mtime 仍为 08-03）。

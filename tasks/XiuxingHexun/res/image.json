@@ -1,0 +1,110 @@
+[
+  {
+    "itemName": "courtyard",
+    "imageName": "courtyard_wu_entry_latest.png",
+    "roiFront": "290,339,100,115",
+    "roiBack": "150,250,400,300",
+    "method": "Template matching",
+    "threshold": 0.8,
+    "description": "庭院武入口"
+  },
+  {
+    "itemName": "courtyard_alt",
+    "imageName": "courtyard_wu_entry.png",
+    "roiFront": "425,415,100,115",
+    "roiBack": "350,330,260,260",
+    "method": "Template matching",
+    "threshold": 0.8,
+    "description": "庭院武入口备用镜头"
+  },
+  {
+    "itemName": "activity_hub",
+    "imageName": "courtyard_wudao_title.png",
+    "roiFront": "145,0,180,62",
+    "roiBack": "95,0,360,120",
+    "method": "Template matching",
+    "threshold": 0.8,
+    "description": "武道大会"
+  },
+  {
+    "itemName": "activity_entry",
+    "imageName": "activity_entry.png",
+    "roiFront": "1090,250,100,180",
+    "roiBack": "1000,190,220,320",
+    "method": "Template matching",
+    "threshold": 0.8,
+    "description": "修行合训入口"
+  },
+  {
+    "itemName": "activity_home",
+    "imageName": "activity_home_title.png",
+    "roiFront": "145,0,190,65",
+    "roiBack": "100,0,330,110",
+    "method": "Template matching",
+    "threshold": 0.8,
+    "description": "修行合训主页"
+  },
+  {
+    "itemName": "own_discovered_badge",
+    "imageName": "own_discovered_badge.png",
+    "roiFront": "205,58,83,67",
+    "roiBack": "150,20,180,180",
+    "method": "Template matching",
+    "threshold": 0.8,
+    "description": "左侧第一张卡片的自己发现标记"
+  },
+  {
+    "itemName": "search_available",
+    "imageName": "search_button.png",
+    "roiFront": "1108,582,104,92",
+    "roiBack": "1060,545,180,150",
+    "method": "Template matching",
+    "threshold": 0.8,
+    "description": "可用的搜寻按钮"
+  },
+  {
+    "itemName": "challenge_page",
+    "imageName": "challenge_page_title.png",
+    "roiFront": "535,50,200,75",
+    "roiBack": "430,20,400,180",
+    "method": "Template matching",
+    "threshold": 0.8,
+    "description": "收服御灵挑战页"
+  },
+  {
+    "itemName": "preset_page",
+    "imageName": "preset_group_monthly.png",
+    "roiFront": "548,360,125,75",
+    "roiBack": "520,325,200,150",
+    "method": "Template matching",
+    "threshold": 0.8,
+    "description": "队伍预设页每月活动分组"
+  },
+  {
+    "itemName": "preset_team",
+    "imageName": "preset_team_hexun.png",
+    "roiFront": "700,185,280,80",
+    "roiBack": "650,150,450,150",
+    "method": "Template matching",
+    "threshold": 0.8,
+    "description": "修行合训顶配队伍卡"
+  },
+  {
+    "itemName": "prepare",
+    "imageName": "battle_prepare_button.png",
+    "roiFront": "1110,520,160,160",
+    "roiBack": "1050,450,230,250",
+    "method": "Template matching",
+    "threshold": 0.75,
+    "description": "战斗准备页（兼容不同场景皮肤）"
+  },
+  {
+    "itemName": "battle_result",
+    "imageName": "battle_result_victory_title.png",
+    "roiFront": "660,70,360,220",
+    "roiBack": "550,20,600,330",
+    "method": "Template matching",
+    "threshold": 0.8,
+    "description": "胜利结算页"
+  }
+]

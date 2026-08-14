@@ -1,0 +1,22 @@
+# DeepSeek-11 审查报告复验（任务A：R-1/R-3/N-6 日志取证）——独立复验报告
+
+执行：只读复验子代理（pwsh Get-Content/Select-String UTF-8，未写任何文件、未运行 python、未启停服务）。
+证据文件：D:\OSAyys\log\2026-08-13_oas1.txt（97,918 行）、2026-08-13_server.txt（138 行）。
+逐条判定：5 条声称全部【成立】，部分存在表述级出入（见末尾）。
+
+1) R-1 崩溃（成立，逐位精确）：异常标题行恰在 35114/35614/97278/97622，ERROR 记录行恰在 35115/35615/97279/97623（logger.py:0354 | ERROR | Error: [WinError 232] 管道正在被关闭。）；时间戳精确匹配 03:43:06.380/03:53:14.533/05:45:37.396/05:56:32.627。locals 段 4 次均含 log_pipe_in = <multiprocessing.connection.PipeConnection object at 0x…>（34912/35413/97077/97421 行）；错误对象 e = BrokenPipeError(32,'管道正在被关闭。',None,232,None)。崩溃帧链三帧真实且各 4 次：script.py:676 in loop（34921/35422/97086/97430）→ logger.py:208 in write（35069/35569/97233/97577）→ script_process.py:404 in func（34899/35400/97064/97408）；实际异常点在 multiprocessing/connection.py:289 _send_bytes。全文件 BrokenPipeError 恰 4 个 traceback，无第 5 次。
+
+2) R-1 映射（成立）：server.txt 5 次 <<< LAUNCHER CONFIG >>>（L28 03:42:22.749、L45 03:52:52.547、L67 04:48:03.133、L86 05:42:35.750、L110 05:56:11.192）；5 次 Script started source=rest（L37 03:43:03.475 parent11216/child5056、L54 03:53:08.988 parent10140/child11348、L78 04:48:27.045 parent25044/child28220、L95 05:42:57.000 parent20608/child23968、L127 06:00:22.199 parent5936/child2452）；L59 03:59:31.928 Script start ignored child_pid=11348 reason=already_running 确认。崩溃-强杀时序吻合（崩溃1@03:43:06←03:42:22、崩溃2@03:53:14←03:52:52、崩溃3@05:45:37←05:42:35、崩溃4@05:56:32←05:56:11；04:48:03 为优雅停止后重启，无孤儿崩溃）。附加佐证：L126 06:00:20.153 Script stop ignored reason=not_running。
+
+3) R-1 附加（成立）：server.txt 全 138 行中 Script stopping 仅 L61（04:47:23.877）+ log coroutine cancelled 仅 L62（04:47:24.991）+ state coroutine cancelled L63（04:47:24.994），全文件唯一优雅停止实例；4 个崩溃窗口前后无这些字样；oas1.txt 中 "Script stopping"/"log coroutine" 均 0 次；4 个崩溃前均有 "Run script oas1 error"（34897/35398/97062/97406）紧接 Traceback（34898/35399/97063/97407）。
+
+4) R-3（成立）：三次失败精确匹配——L96927 05:36:37.035、L97329 05:46:03.171、L97732 06:00:54.437，均 XIUXING_HEXUN_FAILURE stage=search；三次 Delay task success=False 到 2026-08-14（L96933/97335/97738，时间戳 05:36:37.611/05:46:03.615/06:00:54.905）；随后 GotoMain→TASK_END returned success=True failure_action=reset reason='Goto main end'（L97000/97399/97802，05:36:55.674/05:46:20.816/06:01:12.173；GotoMain 加载行 L96947/97349/97752）。worker 换进程点 L97007 05:42:59.863（worker B）精确匹配、L97628 06:00:25.103（worker C）匹配；三次失败分属 worker A(28220)/B(23968)/C(2452)，每进程恰 1 次。server.txt 三条 Delay success=True（L100 05:45:34.830、L119 05:56:29.983、L131 06:03:57.368），SCHEDULE_DECISION（L102/121/133）caller='ControlCenter.sync_next_run'，previous 分别=2026-08-14 05:36:37/05:46:03/06:00:54——逐一覆盖失败延时，吻合。
+
+5) N-6（成立）：00:16–02:46 窗口内恰 8 次 Start scheduler loop: oas1——L5 00:16:37.878、L98 00:50:16.743、L150 01:10:59.842、L344 01:30:30.421、L434 02:00:17.877、L1159 02:22:15.703、L3733 02:38:26.232、L6403 02:46:09.951（≥8 成立，=8）；全天共 13 次（另 5 次 03:43:06.601/03:53:12.051/04:48:30.047/05:42:59.863/06:00:25.103）。
+
+与声称不一致（表述级，均不影响结论）：
+① 崩溃点顺序：声称 "script.py:676 → logger.py → script_process.py:404"，traceback 实际自顶向下为 script_process.py:404 → script.py:676 → rich console.py → logger.py:208 → connection.py:206 → 289——三帧真实、顺序相反、省略中间帧；
+② 错误串省略了 (None,232,None) 参数；
+③ PID 顺序：日志为 parent_pid=11216, child_pid=5056，声称写反；
+④ 04:48:03 是优雅停止后重启而非强杀（声称正文已自行区分）；
+⑤ log_pipe_in 只在 script_process.py:404 帧 locals，connection.py 帧同对象名为 self。

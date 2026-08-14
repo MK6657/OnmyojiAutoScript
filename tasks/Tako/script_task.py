@@ -101,7 +101,7 @@ class ScriptTask(GameUi, GeneralBattle, GeneralRoom, GeneralInvite, SwitchSoul):
             self.close_buff()
 
         self.set_next_run(task='Tako', success=True, finish=False)
-        raise TaskEnd('Tako')
+        raise TaskEnd.completed('Tako')
 
     def battle_wait(self, random_click_swipt_enable: bool) -> bool:
         # 重写

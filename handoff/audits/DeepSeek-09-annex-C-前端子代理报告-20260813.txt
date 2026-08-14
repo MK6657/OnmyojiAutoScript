@@ -1,0 +1,139 @@
+# coordinate-calibrator v0.3.8 前端只读审查报告
+
+**审查范围**：`src/coordinate_calibrator/web/`（app.js 4192 行、workspace_state.js 239 行、coordinate_math.js 194 行、index.html 345 行、styles.css 266 行，全部通读）；对照后端 `api/app.py`(1622)、`api/runtime.py`(3482)、`api/schemas.py`(210)、`domain/transforms.py`、`domain/geometry.py`、`domain/models.py`、`storage/repository.py` 与 `docs/protocol.md`。未修改任何文件、未安装依赖、未启动服务。无 git 仓库，行号以当前工作树为准。
+
+---
+
+## ① 历史声明核对表（docs/audit-20260809.md → 当前 app.js）
+
+| 编号 | 判定 | 证据（当前行号，按符号定位） |
+|---|---|---|
+| **CC-CORRECT-001** 显示帧与换算帧一致 | ✅ **已实施** | `workspace_state.js:55-87` `createDisplayedFrameContext` 强制校验：frame 必须 `persisted`、声明宽高 == 解码宽高、`mapping.revision === frame.mapping_revision`、orientation ∈ {0,90,180,270}；`app.js:1638-1647` 载入时构建并锁定；`app.js:1943-1950` `screenshotDimensions()`/`canvasDimensions()` **只读** `state.displayedFrameContext`（旧实现读 `latest_frame` 的代码已不存在）；`app.js:2212` 提交标注带 `frame_id: state.imageFrameId`（来自锁定帧）。后端写路径双重把关：`runtime.py:1784-1829` `_trusted_frame_record_unlocked` 对 frame_id 校验 persisted 标记、mapping_revision、SHA-256（元数据+文件双验）。⚠️ 残留：`app.js:3123-3150` 死代码 `addPoint` 仍读 `state.session.latest_frame` 换算（见新发现②）。 |
+| **CC-CORRECT-002** 背景隐藏标注不可交互 | ⚠️ **部分实施**（1 条路径遗漏） | 已过滤：hit test `app.js:2179-2187` 用 `canvasEligibleAnnotations()`（含背景过滤）；选中维护 `app.js:437-443` `selectedIds()` → `annotationIsEligible`（`workspace_state.js:124` 调 `annotationMatchesBackground`）；delete/visibility/restore/report/export 全部走 `selectedIds()`（`app.js:3698-3700`、`3642-3644`、`3657-3663`、`3222-3225`、`3239-3243`）；列表/键盘选择 `app.js:3481-3507` 用 `filteredAnnotations()`；移动 `app.js:2247` 只能从过滤后的 hit test 起拖。**遗漏**：`app.js:370` `activeAnnotations()` 只过滤 `deleted_at`、不过滤背景，`app.js:2751-2768` `undoAnnotation` 直接 `activeAnnotations().pop()` 软删除 —— 切到背景 B 后仍可"撤销"掉 A-only 标注（软删除可恢复，故为部分实施而非失败）。 |
+| **CC-ASYNC-001** 事件刷新过期状态守卫 | ✅ **已实施** | 事件刷新：`app.js:1094-1107`（`expectedWorkspaceId !== workspaceId()` 前置检查）+ `app.js:1130-1152`（socket 身份 + workspaceId 双守卫）；激活：`app.js:1490-1513`（激活即 `++workspaceRequestSerial`，`loadLibraryData(true, context)` 携带新 serial）；共享刷新提交：`app.js:793-801`（`loadWorkspaceSummaries` 提交前 `isCurrentWorkspaceContext`）、`app.js:815-846`（`librarySerial` + workspace 上下文双守卫）、`app.js:1515-1554`（refreshCanvasList 全链路守卫，1538 行同时校验 workspace 与 canvas 上下文）；租约状态：`app.js:549-565`（heartbeat 失败置空 lease 前 `isCurrentCanvasContext`，559）。守卫覆盖 `{workspace_id, serial}` 与 `{session_id, serial}` 两层。 |
+| **CC-EXPORT-SELECT-001** 跨画布选择不被摘要裁剪 | ✅ **已实施** | `workspace_state.js:151-163` `groupSelections`：仅当 `Array.isArray(canvas.annotations)`（即活动画布被 merge 过的条目）才裁剪，摘要条目（无 annotations 数组）**原样保留**选择 ids（157-159）；`app.js:272-278` `workspaceSelections()` 先 `rememberCanvasSelection()` 再分组；`app.js:245-252`、`1837` 切换前保存。 |
+| **CC-LEASE-001** 恢复当前归档画布重获租约 | ✅ **已实施** | `app.js:1411-1428`：batch-restore 后 `canvasNeedsLeaseAfterRestore`（`workspace_state.js:24-34`，要求 !readOnly && !workspaceArchived && 当前画布 ∈ 恢复集）→ `acquireLeaseFor` + 写回 `lease_id` + `connectSessionEvents` + `applyControlState`（1421-1426）；激活路径 `app.js:1850-1855` 归档画布不取租约、非归档必须取到否则报错；工作区恢复路径 `app.js:1334-1348`；归档/删除失败回滚重获取 `app.js:1401-1407`、`1584-1586`。 |
+
+---
+
+## ② API 契约表（app.js 全部调用点 51 处，逐行核对）
+
+> 结论：**51/51 调用点与后端路由、Pydantic schema 完全匹配，无协议级错配**。方法/路径/请求体字段/响应解包（`body.data` 信封、`detail.message||detail.code`、数组型 422、401→`authenticationLost`，app.js:112-181）全部一致。仅 2 处文档级 drift（见 ③-7）。
+
+**工作区/资料库**
+
+| 前端调用点 | 方法+路径 | 后端路由 | 字段比对 | |
+|---|---|---|---|---|
+| app.js:3945 | GET /health | app.py:540 | `health.version` ✓ | ✅ |
+| app.js:3952 | GET /capabilities | app.py:545 | 读 `capture_sources/capture_source_status.{adb,nemu_ipc}.default_identity/window_discovery/mouse_capture/oas_write` 均存在；`exports` 字段**前端从不读取**（app.py:583） | ✅⚠️ |
+| app.js:736,794 | GET /workspaces?view=summary&include_archived=true | app.py:631 | 摘要字段 workspace_id/name/archived_at/version/canvas_count/active/archived ✓（repository.py:1562-1574） | ✅ |
+| app.js:739,1203 | POST /workspaces {name}+Idempotency-Key | app.py:626 | WorkspaceCreateBody ✓ | ✅ |
+| app.js:1236,1338 | PATCH /workspaces/{id} {version,name\|archived} | app.py:651 | WorkspacePatchBody ✓ | ✅ |
+| app.js:1469 | DELETE /workspaces/{id}?version&confirm=true | app.py:664 | ✓（confirm 缺省 400 confirmation_required 前端必带） | ✅ |
+| app.js:1242 | POST …/groups {resolution_key,name}+Key | app.py:675 | ✓，resolution_key 默认 '1280x720@0' 匹配正则 `^[1-9][0-9]*x[1-9][0-9]*@(0\|90\|180\|270)$` | ✅ |
+| app.js:1248,1326 | PATCH …/groups/{gid} {version,name\|archived} | app.py:684 | ✓ | ✅ |
+| app.js:1462 | DELETE …/groups/{gid}?version&confirm | app.py:701 | ✓ | ✅ |
+| app.js:1217,2956 | POST …/canvases {canvas_width,height,orientation,pixel_format} | app.py:712 | ✓；createSession 空 body `{}` 走 schema 默认 1280×720 ✓ | ✅ |
+| app.js:2515 | POST …/canvases/import {canvas_*,image_base64,filename,source_mapping_snapshot,owner_id,annotations[]} | app.py:721 | ImportedCanvasCreateBody ✓；超时重试复用同一 Idempotency-Key（2517-2522）✓；响应含 lease_id（app.py:738）✓ | ✅ |
+| app.js:803-812 | GET …/canvases?view=summary&archived&sort&offset&limit&q | app.py:745 | 参数 active/all/archived、manual/name/updated 与后端校验集一致（repository.py:1950-1953）；响应 {groups, canvases:{items,total}} ✓（repository.py:2059） | ✅ |
+| app.js:1366 | POST …/canvases/batch-{move,archive,restore,delete} {session_ids,expected_versions,selection_hash,group_id?/confirm?} | app.py:781-835 | CanvasBatchBody ✓；batch-delete 必带 confirm:true（1484）✓ | ✅ |
+
+**会话/采集/帧**
+
+| 前端调用点 | 方法+路径 | 后端路由 | 字段比对 | |
+|---|---|---|---|---|
+| app.js:485 | POST /sessions/{id}/lease/acquire {owner_id,ttl_seconds:30}+Key | app.py:838 | ✓，响应 `lease.lease_id` ✓ | ✅ |
+| app.js:553 | POST …/lease/heartbeat（带 X-Calibration-Lease） | app.py:847 | ✓ | ✅ |
+| app.js:534 | DELETE …/lease（带 X-Calibration-Lease） | app.py:853 | ✓ | ✅ |
+| app.js:1845 等 8 处 | GET /sessions/{id} | app.py:878 | 响应字段 session/annotations/backgrounds/persisted_frame/latest_frame/preview_frame/metadata_version/mapping 全对（runtime.py:123-161）✓ | ✅ |
+| app.js:1223,1253,1579 | PATCH …/metadata {version,title\|archived} | app.py:883 | CanvasMetadataPatchBody ✓ | ✅ |
+| app.js:2935 | GET /targets/windows | app.py:859 | 字段 target_id/canvas_candidates/rect/status/usable ✓ | ✅ |
+| app.js:2983 | POST …/bind {target_id,candidate_id} | app.py:904 | BindBody ✓ | ✅ |
+| app.js:3029 | POST …/capture/source {source,serial,config_name,instance_id} | app.py:918 | CaptureSourceBody ✓；Literal 三值与 index.html:226-230 完全一致；instance_id 0-31 前端校验（3024）与 schema 一致 | ✅ |
+| app.js:3048 / 3002 / 3113 | POST …/capture/{restore,start,stop} | app.py:934,911,941 | ✓ | ✅ |
+| app.js:3090 | POST …/frames/capture +Key | app.py:947 | 响应被忽略、随后整刷 session ✓兼容 | ✅ |
+| app.js:3392 / 1614,1741,2575 | GET …/frames/latest/image / frames/{frame_id}/image（原生 fetch） | app.py:1140,1160 | ✓；帧下载前端自行 SHA-256 复核（1620-1623、2588-2590、1747-1750）✓ | ✅ |
+
+**背景/标注/样本/报表/导出/WS**
+
+| 前端调用点 | 方法+路径 | 后端路由 | 字段比对 | |
+|---|---|---|---|---|
+| app.js:2351 | POST …/backgrounds {image_base64,title,filename,source_mapping_snapshot}+Key | app.py:1000 | ✓ | ✅ |
+| app.js:1258,2383 | PATCH …/backgrounds/{bid} {version,title\|archived} | app.py:1020 | ✓ | ✅ |
+| app.js:1719 | POST …/backgrounds/{bid}/activate {canvas_version:metadata_version}+Key | app.py:1036 | ✓ | ✅ |
+| app.js:2405 | POST …/backgrounds/import-from-canvas {source_session_id,source_background_id,title} | app.py:1049 | ✓ | ✅ |
+| app.js:1808 | POST …/backgrounds/compare {base,compare_background_id,threshold}+Key | app.py:1067 | threshold 前端滑杆 0-255（index.html:108）== schema ge0 le255 ✓；响应 metrics/heatmap_artifact_id ✓ | ✅ |
+| app.js:954,1674 | GET …/backgrounds/{bid}/thumbnail（img src） | app.py:987 | ✓ | ✅ |
+| app.js:2204,2437(克隆),(3141死代码) | POST …/annotations {label,tool,shape_type,shape,frame_id,display_color,(ordinal/label_mode)} | app.py:1166 | ✓；tool Literal 与 index.html 7 个工具按钮一致（select 永不提交） | ✅ |
+| app.js:1190,2287,2451,3461,3525 | PATCH …/annotations/{aid} {version,...} | app.py:1203 | ✓（body version 乐观锁；后端另支持 If-Match，前端未用，协议允许二选一） | ✅ |
+| app.js:3446 | PUT …/annotations/{aid}/background-scope {version,background_ids} | app.py:1231 | ✓；序列化 `background_scope:{mode,background_ids}`（models.py:179-182）与 workspace_state.js:95-101 解包一致 ✓ | ✅ |
+| app.js:2756 | DELETE …/annotations/{aid} {version} | app.py:1246 | ✓ | ✅ |
+| app.js:3698 | POST …/annotations/batch-delete {annotation_ids,confirm:true,selection_hash,expected_versions} | app.py:1258 | **selection_hash 字节一致**：前端 `sha256(JSON.stringify([...new Set(ids)].sort()))`（280-284）== 后端 `sha256(json.dumps(sorted(set(ids)),separators=(",",":")))`（runtime.py:2871-2873）；canvas 批操作哈希亦一致（app.py:776-778）；WebCrypto 缺失时前端直接报错不降级 ✓ | ✅ |
+| app.js:3642 | POST …/annotations/batch-visibility {annotation_ids,visible,expected_versions} | app.py:1268 | ✓（无 selection_hash，见 drift ③-7） | ✅ |
+| app.js:3657 | POST …/annotations/batch-restore {annotation_ids,expected_versions} | app.py:1274 | ✓（同上） | ✅ |
+| app.js:3156 / 3173 | POST …/click-capture/{arm,disarm} | app.py:1280,1286 | ArmBody.annotation_id ✓ | ✅ |
+| app.js:3189 / 3203 | GET …/click-samples / PATCH …/click-samples/{sid} {outcome} | app.py:1292,1298 | outcome 三值 accepted/rejected/unknown 与按钮一致（3195-3197）✓ | ✅ |
+| app.js:3222 | POST …/reports/annotations {annotation_ids,active_annotation_id} | app.py:1310 | ✓ | ✅ |
+| app.js:3239 / 2653 | POST …/exports {format,annotation_ids,active_annotation_id} / {format:'ccproj',annotation_ids:[]} | app.py:1316 | format json/oas_candidate/ccproj ⊆ Literal ✓；semantic 不发送→默认 click ✓ | ✅ |
+| app.js:2633 / 2666 | POST /workspaces/{id}/exports {format:'json',selections} / {format:'ccworkspace',session_ids,include_archived} | app.py:1395 | WorkspaceExportBody ✓ | ✅ |
+| app.js:2720 | POST …/bundles/import（原始 zip + Content-Type:application/zip + Idempotency-Key + **X-Calibration-Owner**） | app.py:1467 | 后端读原始 body + X-Calibration-Owner 头（1488）✓；128MB 前端预检（2719）与后端 MAX_BUNDLE_BYTES 同向 ✓ | ✅ |
+| app.js:2615,1821 | GET /exports/{owner}/{artifact_name} | app.py:1505 | ✓；heatmap_artifact_id 格式 `{session_id}/{name}` 与拆分逻辑一致（1819-1823）✓ | ✅ |
+| app.js:3338 / 1127 | WS /sessions/{id}/events、/workspaces/{id}/events | app.py:1526,1570 | 事件名 frame_published/session_state/capture_error/target_lost/session_closed、workspace_state/workspace_heartbeat 全对 ✓ | ✅ |
+
+**后端有而前端从不调用的路由**（= 缺失 UI 功能或死能力）：
+1. `GET /workspaces/{id}`（兼容全量详情，app.py:646）——前端只用 summary；
+2. `POST /sessions`（app.py:867）——createSession 改走 `/canvases`；
+3. `DELETE /sessions/{id}`（app.py:898）——关闭操作无 UI；
+4. `POST /sessions/{id}/frames/import`（app.py:958）——v1 JSON 导入改走 `/canvases/import`；
+5. `GET /sessions/{id}/backgrounds`（app.py:977）——列表来自 session 全量；
+6. `GET /sessions/{id}/annotations`（app.py:1197）——同上；
+7. `POST /sessions/{id}/reports/geometry`（app.py:1304）——无"采样推荐报告"按钮；
+8. `GET /api/v1/oas/status`（app.py:588）——capabilities 已覆盖 UI 需要；
+9. `/canvases` 的 `view=full` 分支；导出格式 **markdown**（capabilities 宣传、schema 支持，但 UI 无按钮，app.js 只有 exportJson/exportOas）；`frames/latest/image?persisted=true` 参数未使用。
+
+---
+
+## ③ 新发现问题清单
+
+| # | 位置 | 严重度 | 现象 / 证据 | 置信度 |
+|---|---|---|---|---|
+| 1 | app.js:370, 2751-2768 | 🟡 | **CC-CORRECT-002 残留**：`undoAnnotation` 用 `activeAnnotations()`（仅过滤 deleted_at，不过滤背景）取 `.pop()` 软删除——切换背景后 A-only 标注仍可被"撤销"删除。与 `hitTestAnnotation`(2180)、`selectedIds`(437-443) 等已过滤路径形成对比。修复：改为 `canvasEligibleAnnotations()`。 | 高 |
+| 2 | app.js:3123-3150 | 🟡 | **死代码绕过帧锁定**：`addPoint` 用 `state.session.latest_frame` 做 imageToCanvas 换算（无 SHA-256/mapping_revision/persisted 校验），但已不被任何事件绑定（boot 4177 行 `$('frame').onclick` 只弹提示）。当前不可达；若未来重新绑定则直接重开 CC-CORRECT-001 漏洞。建议删除或改写为 displayedFrameContext 路径。 | 高 |
+| 3 | app.js:2680-2709 | 🟡 | **无界 v1 JSON 工程导入（内存 DoS）**：`importLegacyWorkspaceBundle` 对文件 `JSON.parse(await file.text())` **无大小上限**（.ccworkspace 分支有 128MB 检查，2719，此分支没有）；且 `dataUrlToBlob` 先 `atob` 解码大 base64（2693）后才 `validateScreenshotBlob`（2699）——校验在后、内存峰值在前。恶意 JSON 可使浏览器标签冻结。 | 高 |
+| 4 | app.js:681-706, 1754-1758, 1795-1801, 1866 | 🟡 | **比较/blink 状态跨画布残留（audit P2 提及，仍存在）**：`clearScreenshotFrame` 不调用 `stopCompareBlink()`；blink 模式切画布后 `compareBlinkTimer`（500ms setInterval）继续运行、`state.compareEnabled/compareBaseId/compareTargetId` 保留。`renderBackgroundWorkbench`(1697-1702) 会修复 compare 两个 id，但定时器只在再次切换模式/关闭对比时停。低影响（作用在无 src 的 img 上），属资源泄漏+陈旧状态。 | 高 |
+| 5 | app.js:885, 932-1066, 3472-3550, 3589 | 🟡 | **选中触发整库 DOM 重建 + 全量 overlay 重绘（audit P2 残留）**：`toggleCanvasSelection` → `renderCanvasLibrary()` 整树 innerHTML 重建；`setActiveAnnotation` → `renderAnnotations()` 整列表重建 + `renderOverlay()` 全量重绘（无脏矩形）。数百标注/画布时每次点选 O(n) 重建。静态确认，量级未实测。 | 高 |
+| 6 | app.js:2135-2136 vs geometry.py:159-167 | 🟡 | **自由画笔多边形可自交→后端 409**：画笔自由笔画生成 polygon，后端 `validate_shape` 拒绝自交（`_polygon_self_intersects`）与面积 ≤1e-6；前端无任何客户端预检（仅点数≥3）。用户画交叉笔画会收到 409 "polygon must not self-intersect"（错误信息会显示，fail-safe 但体验差）。 | 高 |
+| 7 | protocol.md §9 vs schemas.py:194-203、app.py:1599-1601、app.py:483-486 | 🟢 | **协议文档 drift（P3 残留）**：① 协议称"每个批写带 selection_hash"，但 batch-visibility/batch-restore 前后端一致地没有该字段（audit-20260809.md P3 line 151 已记录，未修）；② 协议称 workspace_heartbeat "approximately 15-second"，实际空轮询 1.0s 即发（app.py:1599-1601）→ 实际 ~1s；③ 协议稳定错误码含 `lease_required`，代码从不发出（repository 的 lease 失败统一走 `lease_conflict` 423）。文档问题，前端行为与后端一致。 | 高 |
+| 8 | app.js:566-568, 2830, 2854-2855, 3193-3197, 3491 | 🟢 | **XSS 纵深不足（用户字符串均已转义）**：`escapeHtml` 不转义单引号（当前所有使用点均为双引号属性，安全）；后端生成值裸插：`statusLabel` 回退原文（2830 `reason`）、`candidate.class_name` 拼进 option label（2855）、`sample.sample_id/outcome`（3193）、`annotation_id` data 属性（3491）。后端为本地受信服务且值域受控，风险低；建议补单引号转义并对后端字符串统一 escape。 | 高 |
+| 9 | app.js:2610-2613 | 🟢 | **工件下载绑定当前 session/workspace**：`downloadArtifact` 要求 `parts[0] ∈ {sessionId(), workspaceId()}`——切换画布/工作区后无法下载之前生成的工件（导出后立即下载的流程不受影响）。 | 中 |
+| 10 | app.js:3 vs 3987 | 🟢 | **`toggleLibraryArchived` 未列入 `MUTATING_CONTROL_IDS`**：applyControlState 不管理其 disabled 视觉态（readOnly/busy 时不灰显）；功能上有 `ensureControl`（readOnly 拦截）+ `runAction`（busy 拦截）兜底。属 skill 记录的"手工控制 ID 白名单"机制的老问题——任何新按钮 ID 漏注册即绕过视觉守卫。 | 中 |
+
+---
+
+## ④ 通过项（验证 OK）
+
+- **API 契约 51/51 ✅**：方法与路径模板、`/api/v1` 前缀、请求体字段、响应 `body.data` 解包、错误 `detail.message/code` 与数组型 422 解包（app.js:145-154）、401 认证失效提示、413/409/423 均有覆盖。
+- **乐观锁**：所有 PATCH/DELETE 携带 body `version`（annotation/background/workspace/group/canvas）、批操作携带 `expected_versions`、背景激活携带 `canvas_version`；**selection_hash 字节级一致**（前端 JS 排序+无空格 JSON == 后端 sorted+separators，且无 crypto 时前端 fail-closed 拒绝执行）。
+- **幂等与租约**：所有 create/import/export 带 `Idempotency-Key`（key 为可见 ASCII 约束内）；`createLayerFromImage` 超时重试复用同一 key（安全重放）；X-Calibration-Lease 由 `api()` 统一附带（含 canvasContext 显式租约，117-124）；X-Calibration-Owner 仅 bundle 导入发送，与后端一致。
+- **坐标数学四向一致（独立推导验证，非自洽核对）**：对 0/90/180/270 逐一推导，`imageToCanvasPoint` 与 Python `screen_to_canvas`、`canvasToImagePoint` 与 `canvas_to_screen` 四组互逆变换全部吻合（90°：x=ny,y=1−nx 及逆 x=1−ny,y=nx；180° 自逆；270° 镜像）。边界语义：JS 输出钳制 `halfOpenMaximum = size − max(1e-9, EPSILON·size·2)`（coordinate_math.js:27-29）**不是死代码**（1e-9 下限保证真实收缩，旧审计的 `width − EPSILON` 死钳制已修）；后端点/多边形严格半开 `<`、rect/circle/ellipse 边含 `>`——前端点/多边形 allowEdge=false、rect 角 allowEdge=true 的选择与后端校验集**完全相容**，旧"右缘点击 409"一类问题不复存在。
+- **帧完整性**：三处帧下载均前端 SHA-256 复核后才显示/导出（1614-1623、2575-2592、1741-1750）；显示帧与映射 revision 强制一致，不一致抛错 fail-closed。
+- **文件导入边界（除 ③-3）**：截图 20MB/8192px/3200 万像素三重校验（629-667）；bundle 128MB；尺寸校验在 createImageBitmap 层。
+- **竞态防护**：workspace/canvas/window 三组 requestSerial + AbortController；取消语义（request_cancelled）在 showError 静默、在 activateCanvas/createLayerFromImage 正确回滚租约与旧状态；beforeunload 关闭 WS/释放本地控制租约（4184-4188）。
+- **styles.css**：无问题；响应式断点、深浅色一致。
+
+---
+
+## ⑤ 无法判定项
+
+1. **多标签控制租约的真实竞态**：本地 localStorage 租约 + 服务端 fencing 的代码路径完整（claimControl/heartbeatControl/takeOverControl 均带会话守卫），但"两个标签快速互抢+服务端租约过期"的时序组合未实测。
+2. **WS 断线重连与 200ms 防抖在事件风暴下的表现**：重连指数退避（500ms·2ⁿ 上限 10s/5s）与 `scheduleWorkspaceRefresh` 200ms 合并逻辑静态正确，真实高频事件下的刷新压力未测量。
+3. **③-5 的性能量级**：DOM 重建为 O(n) 已确认，但 50+ 标注/百级画布下的实际帧耗时需基准测试（audit P2 亦未测）。
+4. **画笔自交 409 的实际触发频率**：取决于用户画法，代码路径确定、频率需实测。
+
+**总体评价**：历史 5 条核心修复中 4 条完整落地（001/ASYNC/EXPORT-SELECT/LEASE），CC-CORRECT-002 仅剩 `undoAnnotation` 一条路径遗漏；协议层是当前最强的一层（51/51 契约匹配、哈希字节一致、四向旋转互逆验证通过）。无 🔴 阻塞级发现；优先修复顺序建议：③-1（undo 背景过滤）→ ③-3（v1 导入大小上限）→ ③-2（死代码 addPoint 清理）→ ③-4/③-5（P2 残留）。
+
+**执行摘要**：
+- 做了什么：只读通读 web 前端 5 文件（共 ~5230 行）+ 对照后端 app.py/runtime.py/schemas/transforms/geometry/models/repository 与 protocol.md，未改任何文件、未装依赖、未起服务。
+- 主要结论：历史 5 条修复声明 4 已实施、1 部分实施（undoAnnotation 未套背景过滤，app.js:2753）；API 契约 51/51 匹配，坐标数学四向互逆一致、边界钳制有效；新发现 10 条（6 🟡 / 4 🟢，无 🔴），重点为 undo 背景过滤残留、v1 工程导入无大小上限、addPoint 死代码、blink 定时器跨画布残留、选中全量 DOM 重建。
+- 文件创建/修改：无。
+- 遇到的问题：search_files 对含反斜杠转义的正则报错（`\.` 被剥成 `/./`），改为无转义的点号通配后正常；其余无阻塞。

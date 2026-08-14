@@ -1,0 +1,62 @@
+[
+  {
+    "itemName": "courtyard_access",
+    "roiFront": "290,339,100,115",
+    "roiBack": "290,339,100,115",
+    "description": "庭院武"
+  },
+  {
+    "itemName": "courtyard_access_alt",
+    "roiFront": "447,418,42,42",
+    "roiBack": "447,418,42,42",
+    "description": "庭院武备用镜头"
+  },
+  {
+    "itemName": "activity_entry",
+    "roiFront": "1095,270,75,170",
+    "roiBack": "1095,270,75,170",
+    "description": "修行合训"
+  },
+  {
+    "itemName": "search",
+    "roiFront": "1110,585,100,85",
+    "roiBack": "1110,585,100,85",
+    "description": "搜寻"
+  },
+  {
+    "itemName": "own_discovered_card",
+    "roiFront": "20,95,245,90",
+    "roiBack": "20,95,245,90",
+    "description": "仅点击带自己发现标记的左侧第一张卡片"
+  },
+  {
+    "itemName": "team_preset",
+    "roiFront": "905,588,48,52",
+    "roiBack": "905,588,48,52",
+    "description": "队伍预设"
+  },
+  {
+    "itemName": "preset_group_monthly",
+    "roiFront": "555,365,115,50",
+    "roiBack": "555,365,115,50",
+    "description": "activity monthly preset group"
+  },
+  {
+    "itemName": "preset_deploy",
+    "roiFront": "800,505,140,75",
+    "roiBack": "800,505,140,75",
+    "description": "出战"
+  },
+  {
+    "itemName": "start_challenge",
+    "roiFront": "1070,520,145,150",
+    "roiBack": "1070,520,145,150",
+    "description": "开启挑战"
+  },
+  {
+    "itemName": "continue",
+    "roiFront": "540,650,230,70",
+    "roiBack": "540,650,230,70",
+    "description": "结算继续"
+  }
+]

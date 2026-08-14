@@ -1,0 +1,38 @@
+[
+  {
+    "itemName": "ticket_count",
+    "roiFront": "970,5,55,42",
+    "roiBack": "970,5,55,42",
+    "mode": "Digit",
+    "method": "Default",
+    "keyword": "",
+    "description": "只读免费票据数量"
+  },
+  {
+    "itemName": "preset_group",
+    "roiFront": "548,360,125,75",
+    "roiBack": "548,360,125,75",
+    "mode": "Single",
+    "method": "Default",
+    "keyword": "每月活动",
+    "description": "预设分组名称"
+  },
+  {
+    "itemName": "preset_team",
+    "roiFront": "680,185,420,80",
+    "roiBack": "680,185,420,80",
+    "mode": "Single",
+    "method": "Default",
+    "keyword": "修行合训",
+    "description": "预设队伍名称"
+  },
+  {
+    "itemName": "result_continue",
+    "roiFront": "540,670,220,45",
+    "roiBack": "540,670,220,45",
+    "mode": "Single",
+    "method": "Default",
+    "keyword": "点击屏幕继续",
+    "description": "结算继续提示"
+  }
+]

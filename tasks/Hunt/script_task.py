@@ -26,7 +26,7 @@ class ScriptTask(GameUi, GeneralBattle, GeneralInvite, SwitchSoul, HuntAssets):
         self.con_time = self.config.hunt.hunt_time
         if not self.check_datetime():
             # 设置下次运行时间 为今天的晚上七点钟
-            raise TaskEnd('Hunt')
+            raise TaskEnd.completed('Hunt')
         con = self.config.hunt.hunt_config
         if con.kirin_group_team != '-1,-1' or con.netherworld_group_team != '-1,-1':
             self.ui_get_current_page()
@@ -48,7 +48,7 @@ class ScriptTask(GameUi, GeneralBattle, GeneralInvite, SwitchSoul, HuntAssets):
         sleep(1)
 
         self.plan_tomorrow_hunt()
-        raise TaskEnd('Hunt')
+        raise TaskEnd.completed('Hunt')
 
     def check_datetime(self) -> bool:
         """
@@ -74,22 +74,22 @@ class ScriptTask(GameUi, GeneralBattle, GeneralInvite, SwitchSoul, HuntAssets):
             logger.info('Today is the Kirin day')
             if now.time() < time(6, 0):
                 self.custom_next_run(task='Hunt', custom_time=self.con_time.kirin_time, time_delta=0)
-                raise TaskEnd('Hunt')
+                raise TaskEnd.completed('Hunt')
             # 如果是麒麟日在23:00-23:59之间则设定时间为明天的自定义时间，返回False
             elif now.time() > time(23, 0):
                 self.plan_tomorrow_hunt()
-                raise TaskEnd('Hunt')
+                raise TaskEnd.completed('Hunt')
             else:
                 return True
         else:
             logger.info('Today is the Netherworld day')
             if now.time() < time(17, 0):
                 self.custom_next_run(task='Hunt', custom_time=self.con_time.netherworld_time, time_delta=0)
-                raise TaskEnd('Hunt')
+                raise TaskEnd.completed('Hunt')
             # 如果是阴界日在23:00-23:59之间则设定时间为明天的自定义时间，返回False
             elif now.time() > time(23, 0):
                 self.plan_tomorrow_hunt()
-                raise TaskEnd('Hunt')
+                raise TaskEnd.completed('Hunt')
             else:
                 return True
 

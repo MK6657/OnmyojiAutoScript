@@ -105,14 +105,18 @@ class RyouToppaAssets:
 	# description 
 	I_TOPPA_RECORD = RuleImage(roi_front=(66,633,64,39), roi_back=(40,606,119,89), threshold=0.8, method="Template matching", file="./tasks/RyouToppa/dev/res_toppa_record.png")
 	# description 
-	I_TOPPA_LOCK_TEAM = RuleImage(roi_front=(203,602,26,32), roi_back=(203,602,26,32), threshold=0.8, method="Template matching", file="./tasks/RyouToppa/dev/dev_toppa_lock_team.png")
+	# The icon can render a few pixels left of the nominal 1280x720 position.
+	# Keep the front ROI as the nominal click target; use a bounded back ROI so
+	# matching can relocate the actual icon before clicking it.
+	I_TOPPA_LOCK_TEAM = RuleImage(roi_front=(203,602,26,32), roi_back=(190,595,48,43), threshold=0.8, method="Template matching", file="./tasks/RyouToppa/dev/dev_toppa_lock_team.png")
 	# description 
-	I_TOPPA_UNLOCK_TEAM = RuleImage(roi_front=(202,603,25,31), roi_back=(202,603,25,31), threshold=0.8, method="Template matching", file="./tasks/RyouToppa/dev/dev_toppa_unlock_team.png")
+	I_TOPPA_UNLOCK_TEAM = RuleImage(roi_front=(202,603,25,31), roi_back=(190,595,48,43), threshold=0.8, method="Template matching", file="./tasks/RyouToppa/dev/dev_toppa_unlock_team.png")
 
 
 	# Click Rule Assets
 	# 选择第一个寮 
 	C_SELECT_FIRST_RYOU = RuleClick(roi_front=(1148,138,21,22), roi_back=(1148,138,21,22), name="select_first_ryou")
+	C_GUILD_ORDERS_REWARDS = RuleClick(roi_front=(1123,31,115,56), roi_back=(1123,31,115,56), name="guild_orders_rewards")
 
 
 	# Image Rule Assets
@@ -139,5 +143,3 @@ class RyouToppaAssets:
 	# Ocr Rule Assets
 	# 寮突破进攻机会数 
 	O_NUMBER = RuleOcr(roi=(271,560,48,31), area=(271,560,48,31), mode="DigitCounter", method="Default", keyword="", name="number")
-
-

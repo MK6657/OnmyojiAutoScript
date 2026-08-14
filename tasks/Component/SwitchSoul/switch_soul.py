@@ -1,6 +1,7 @@
 # This Python file uses the following encoding: utf-8
 # @author runhey
 # github https://github.com/runhey
+import time
 from time import sleep
 from typing import Union
 
@@ -8,33 +9,133 @@ from module.atom.click import RuleClick
 from module.atom.long_click import RuleLongClick
 from module.atom.ocr import RuleOcr
 from module.base.timer import Timer
+from module.exception import GameStuckError
 from tasks.base_task import BaseTask
 from tasks.Component.GeneralInvite.assets import GeneralInviteAssets
 from tasks.Component.GeneralInvite.config_invite import InviteConfig, InviteNumber, FindMode
 from tasks.Component.SwitchSoul.assets import SwitchSoulAssets
+from tasks.Component.GeneralBattle.preset_name_selector import (
+    InvalidPresetConfigError,
+    PresetApplyUnconfirmedError,
+)
 from module.logger import logger
 
 
+SWITCH_SOUL_TIMEOUT = 45.0
+
+# 当前游戏版本的确认按钮可能与旧模板存在色差。保留模板快速路径，
+# 再用 OCR 识别同一确认区域，避免确认框存在时无限点击底层队伍列表。
+O_SOU_SWITCH_CONFIRM = RuleOcr(
+    roi=(660, 390, 220, 100),
+    area=(660, 390, 220, 100),
+    mode="Full",
+    method="Default",
+    keyword="确定",
+    name="sou_switch_confirm",
+)
+
+O_SOU_PRESET_STATUS = RuleOcr(
+    roi=(350, 90, 600, 240),
+    area=(350, 90, 600, 240),
+    mode="Full",
+    method="Default",
+    keyword="",
+    name="sou_preset_status",
+)
+
+
 def switch_parser(switch_str: str) -> tuple:
-    switch_list = switch_str.split(',')
+    if not isinstance(switch_str, str):
+        raise InvalidPresetConfigError('Switch soul config must be a string like group,team')
+    switch_list = [item.strip() for item in switch_str.split(',')]
     if len(switch_list) != 2:
-        raise ValueError('Switch_str must be 2 length')
-    return int(switch_list[0]), int(switch_list[1])
+        raise InvalidPresetConfigError('Switch soul config must contain exactly group,team')
+    try:
+        return int(switch_list[0]), int(switch_list[1])
+    except (TypeError, ValueError) as error:
+        raise InvalidPresetConfigError('Switch soul group and team must be integers') from error
 
 
 class SwitchSoul(BaseTask, SwitchSoulAssets):
+
+    @staticmethod
+    def _validate_switch_pair(group, team) -> tuple[int, int]:
+        try:
+            group = int(group)
+            team = int(team)
+        except (TypeError, ValueError) as error:
+            raise InvalidPresetConfigError(
+                'Switch soul group and team must be integers'
+            ) from error
+        if group == -1 and team == -1:
+            raise InvalidPresetConfigError(
+                'Switch soul is enabled but switch_group_team is still -1,-1'
+            )
+        if group < 1 or group > 7:
+            raise InvalidPresetConfigError('Switch soul group must be in [1-7]')
+        if team < 1 or team > 4:
+            raise InvalidPresetConfigError('Switch soul team must be in [1-4]')
+        return group, team
+
+    @classmethod
+    def validate_switch_config(cls, enabled: bool, target):
+        """Validate an enabled numeric preset before any game navigation."""
+        if not enabled:
+            return None
+        if isinstance(target, str):
+            target = switch_parser(target)
+        if isinstance(target, tuple) and len(target) == 2:
+            return cls._validate_switch_pair(*target)
+        if isinstance(target, list) and target:
+            return [cls._validate_switch_pair(*pair) for pair in target]
+        raise InvalidPresetConfigError('Switch soul config must be a group,team pair')
+
+    @staticmethod
+    def _check_switch_soul_deadline(deadline: float, stage: str) -> None:
+        if time.monotonic() >= deadline:
+            raise GameStuckError(
+                f'Switch soul {stage} timeout after {SWITCH_SOUL_TIMEOUT:.0f}s'
+            )
+
+    def _switch_confirm_visible(self) -> bool:
+        return self.appear(self.I_SOU_SWITCH_SURE) or self.ocr_appear(O_SOU_SWITCH_CONFIRM)
+
+    def _click_switch_confirm(self) -> bool:
+        if self.appear(self.I_SOU_SWITCH_SURE):
+            self.click(self.I_SOU_SWITCH_SURE)
+            return True
+        if self.ocr_appear(O_SOU_SWITCH_CONFIRM):
+            self.click(O_SOU_SWITCH_CONFIRM)
+            return True
+        return False
+
+    def _preset_status_visible(self) -> bool:
+        # Full OCR 的 keyword 过滤允许模糊命中；标题“预设”不能当成
+        # “正在使用预设御魂和阴阳术”的成功提示，必须检查完整文本。
+        results = O_SOU_PRESET_STATUS.detect_and_ocr(self.device.image, logDisplay=False)
+        status = ''.join(str(result.ocr_text or '') for result in results)
+        return '正在使用预设' in status
+
+    def _resolve_switch_confirm(self, deadline: float) -> bool:
+        """点击确认并等待确认框消失；不会无期限点击。"""
+        while time.monotonic() < deadline:
+            self.screenshot()
+            if self.appear_then_click(self.I_CHECK_BLOCK, interval=0.6):
+                continue
+            if not self._switch_confirm_visible():
+                return True
+            if self._click_switch_confirm():
+                sleep(0.3)
+                continue
+            sleep(0.25)
+        return False
 
     def run_switch_soul(self, target: tuple | list[tuple] | str):
         """
         保证在式神录的界面
         :return:
         """
-        if isinstance(target, str):
-            try:
-                target = switch_parser(target)
-            except ValueError:
-                logger.error('Switch soul config error')
-                return
+        target = self.validate_switch_config(True, target)
         self.click_preset()
         self.switch_souls(target)
 
@@ -43,7 +144,8 @@ class SwitchSoul(BaseTask, SwitchSoulAssets):
         点击预设
         :return:
         """
-        while 1:
+        deadline = time.monotonic() + SWITCH_SOUL_TIMEOUT
+        while time.monotonic() < deadline:
             self.screenshot()
             if self.appear(self.I_SOU_SWITCH_1):
                 break
@@ -58,6 +160,8 @@ class SwitchSoul(BaseTask, SwitchSoulAssets):
             if self.appear(self.I_SOUL_PRESET):
                 self.click(self.I_SOUL_PRESET, interval=3)
                 continue
+        else:
+            raise GameStuckError('Switch soul preset page did not appear')
         logger.info('Click preset in switch soul')
 
     def switch_soul_one(self, group: int, team: int) -> None:
@@ -67,6 +171,8 @@ class SwitchSoul(BaseTask, SwitchSoulAssets):
         :param team: 只能是[1-4]
         :return:
         """
+
+        group, team = self._validate_switch_pair(group, team)
 
         def get_group_assets(group: int) -> tuple:
             match = {
@@ -90,8 +196,9 @@ class SwitchSoul(BaseTask, SwitchSoulAssets):
             return match[team]
 
         # 滑动至分组最上层(分組過多, 导致第一个分组显示不全)
+        deadline = time.monotonic() + SWITCH_SOUL_TIMEOUT
         cur_text = ""
-        while 1:
+        while time.monotonic() < deadline:
             self.screenshot()
             compare1 = self.O_SS_GROUP_NAME.detect_and_ocr(self.device.image)
             ocr_text = str([result.ocr_text for result in compare1])
@@ -104,10 +211,8 @@ class SwitchSoul(BaseTask, SwitchSoulAssets):
             # 等待滑动动画
             sleep(0.5)
 
-        if group < 1 or group > 7:
-            raise ValueError('Switch soul_one group must be in [1-7]')
-        if team < 1 or team > 4:
-            raise ValueError('Switch soul_one team must be in [1-4]')
+        self._check_switch_soul_deadline(deadline, 'group list')
+
         # 这一步是选择组
         target_click, target_check = get_group_assets(group)
         # while 1:
@@ -123,21 +228,22 @@ class SwitchSoul(BaseTask, SwitchSoulAssets):
         # 点击队伍
         target_team = get_team_asset(team)
         for i in range(3):
+            self._check_switch_soul_deadline(deadline, 'team apply')
             sleep(0.8)
             self.screenshot()
-            if self.appear(self.I_SOU_SWITCH_SURE):
-                while 1:
-                    self.click(self.I_SOU_SWITCH_SURE, 3)
-                    self.screenshot()
-                    if self.appear_then_click(self.I_CHECK_BLOCK, 3):
-                        continue
-                    if not self.appear(self.I_SOU_SWITCH_SURE):
-                        break
+            if self._switch_confirm_visible():
+                if not self._resolve_switch_confirm(deadline):
+                    raise PresetApplyUnconfirmedError(
+                        'Switch soul confirmation did not disappear'
+                    )
                 continue
             if not self.appear_then_click(target_team, interval=3):
                 logger.warning(f'Click team {team} failed in group {group}')
-        # 兜底若还出现确认按钮则点击
-        self.ui_click_until_disappear(self.I_SOU_SWITCH_SURE)
+        # 兜底处理模板失配但 OCR 能识别的确认按钮。
+        if self._switch_confirm_visible() and not self._resolve_switch_confirm(deadline):
+            raise PresetApplyUnconfirmedError(
+                'Switch soul confirmation did not disappear'
+            )
         logger.info(f'Switch soul_one group {group} team {team}')
 
     def switch_souls(self, target: tuple or list[tuple]) -> None:
@@ -158,12 +264,14 @@ class SwitchSoul(BaseTask, SwitchSoulAssets):
         退出式神录的界面
         :return:
         """
-        while 1:
+        deadline = time.monotonic() + SWITCH_SOUL_TIMEOUT
+        while time.monotonic() < deadline:
             self.screenshot()
             if not self.appear(self.I_SOU_CHECK_IN):
                 break
             if self.appear_then_click(self.I_RECORD_SOUL_BACK, interval=3.5):
                 continue
+        self._check_switch_soul_deadline(deadline, 'exit records')
         logger.info('Exit shikigami records')
 
     def run_switch_soul_by_name(self, groupName, teamName):
@@ -172,18 +280,27 @@ class SwitchSoul(BaseTask, SwitchSoulAssets):
         :return:
         """
         if isinstance(groupName, str) and isinstance(teamName, str):
+            selector = getattr(self, '_switch_preset_soul_by_name', None)
+            if selector is not None:
+                return selector(groupName, teamName)
             self.click_preset()
-            self.switch_soul_by_name(groupName, teamName)
+            return self.switch_soul_by_name(groupName, teamName)
+        return False
 
     def switch_soul_by_name(self, groupName, teamName):
         """
         保证在式神录的界面
         :return:
         """
+        selector = getattr(self, '_switch_preset_soul_by_name', None)
+        if selector is not None:
+            return selector(groupName, teamName)
+
         logger.hr('Switch soul by name')
+        deadline = time.monotonic() + SWITCH_SOUL_TIMEOUT
         # 滑动至分组最上层
         last_group_text = ''
-        while 1:
+        while time.monotonic() < deadline:
             self.screenshot()
             compare1 = self.O_SS_GROUP_NAME.detect_and_ocr(self.device.image)
             now_group_text = str([result.ocr_text for result in compare1])
@@ -192,10 +309,11 @@ class SwitchSoul(BaseTask, SwitchSoulAssets):
             self.swipe(self.S_SS_GROUP_SWIPE_UP, 2)
             sleep(2.5)
             last_group_text = now_group_text
+        self._check_switch_soul_deadline(deadline, 'group list')
         logger.info('Swipe to top of group')
 
         # 判断有无目标分组
-        while 1:
+        while time.monotonic() < deadline:
             self.screenshot()
             # 获取当前分组名
             results = self.O_SS_GROUP_NAME.detect_and_ocr(self.device.image)
@@ -207,19 +325,21 @@ class SwitchSoul(BaseTask, SwitchSoulAssets):
                 break
             self.swipe(self.S_SS_GROUP_SWIPE_DOWN)
             sleep(1.5)
+        self._check_switch_soul_deadline(deadline, f'find group {groupName}')
         logger.info('Swipe down to find target group')
 
         # 选中分组
-        while 1:
+        while time.monotonic() < deadline:
             self.screenshot()
             self.O_SS_GROUP_NAME.keyword = groupName
             if self.ocr_appear_click(self.O_SS_GROUP_NAME):
                 break
+        self._check_switch_soul_deadline(deadline, f'select group {groupName}')
         logger.info(f'Select group {groupName}')
 
         # 滑动至阵容最上层
         last_team_text = ''
-        while 1:
+        while time.monotonic() < deadline:
             self.screenshot()
             compare1 = self.O_SS_TEAM_NAME.detect_and_ocr(self.device.image)
             now_team_text = str([result.ocr_text for result in compare1])
@@ -229,10 +349,11 @@ class SwitchSoul(BaseTask, SwitchSoulAssets):
             self.swipe(self.S_SS_TEAM_SWIPE_DOWN, 1.5)
             sleep(2)
             last_team_text = now_team_text
+        self._check_switch_soul_deadline(deadline, 'team list')
         logger.info('Swipe to top of team')
 
         # 判断当前分组有无目标阵容
-        while 1:
+        while time.monotonic() < deadline:
             self.screenshot()
             # 获取当前阵容名
             results = self.O_SS_TEAM_NAME.detect_and_ocr(self.device.image)
@@ -243,28 +364,44 @@ class SwitchSoul(BaseTask, SwitchSoulAssets):
             if result and len(result) > 0:
                 break
             self.swipe(self.S_SS_TEAM_SWIPE_UP, 0.3)
+        self._check_switch_soul_deadline(deadline, f'find team {teamName}')
         logger.info('Swipe up to find target team')
 
         # 选中分组
-        while 1:
+        while time.monotonic() < deadline:
             self.screenshot()
             self.O_SS_TEAM_NAME.keyword = teamName
             if self.ocr_appear_click(self.O_SS_TEAM_NAME):
                 break
+        self._check_switch_soul_deadline(deadline, f'select team {teamName}')
         logger.info(f'Select team {teamName}')
-        # 切换御魂
-        cnt_click: int = 0
+        # 切换御魂：应用按钮只点击一次，确认框消失即完成。
         self.O_SS_TEAM_NAME.keyword = teamName
-        while 1:
+        clicked = False
+        click_time = None
+        while time.monotonic() < deadline:
             self.screenshot()
-            if cnt_click >= 4:
-                break
-            if self.appear_then_click(self.I_SOU_SWITCH_SURE, interval=0.8):
+            if self._switch_confirm_visible():
+                if not self._resolve_switch_confirm(deadline):
+                    raise PresetApplyUnconfirmedError(
+                        'Switch soul confirmation did not disappear'
+                    )
+                logger.info(f'Switch soul_one group {groupName} team {teamName}')
+                return True
+            if self._preset_status_visible():
+                logger.info(f'Team {teamName} is already using preset soul')
+                return True
+            if not clicked and self.ocr_appear_click_by_rule(
+                    self.O_SS_TEAM_NAME, self.I_SOU_CLICK_PRESENT, interval=1.5):
+                clicked = True
+                click_time = time.monotonic()
                 continue
-            if self.ocr_appear_click_by_rule(self.O_SS_TEAM_NAME, self.I_SOU_CLICK_PRESENT, interval=1.5):
-                cnt_click += 1
-                continue
-        logger.info(f'Switch soul_one group {groupName} team {teamName}')
+            if clicked and time.monotonic() - click_time >= 6:
+                raise PresetApplyUnconfirmedError(
+                    f'Team {teamName} preset click produced no confirmation or status'
+                )
+            sleep(0.25)
+        raise PresetApplyUnconfirmedError(f'Switch soul team {teamName} timeout')
 
     def ocr_appear_click_by_rule(self,
                                  target: RuleOcr,
@@ -284,10 +421,12 @@ class SwitchSoul(BaseTask, SwitchSoulAssets):
         if not appear:
             return False
 
-        x1, y1, w1, h1 = target.area
-        x, y = action.coord()
+        _, y1, _, h1 = target.area
+        x, _ = action.coord()
 
-        self.device.click(x=x, y=y1, control_name=target.name)
+        # OCR 的 area 已在 ocr_appear() 中更新为目标队伍文字框，
+        # 只复用操作按钮的 X 坐标，Y 坐标必须跟随当前队伍行。
+        self.device.click(x=x, y=int(y1 + h1 / 2), control_name=target.name)
         return True
 
 

@@ -15,6 +15,12 @@ class FriendInvitation(str, Enum):
     JADE_AND_FOOD = 'jade_and_food' # 勾协+粮协
     IGNORE = 'ignore'
 
+
+class CommonPopupMode(str, Enum):
+    DISABLED = 'disabled'
+    DETECT_BLOCK = 'detect_block'
+    ENFORCE = 'enforce'
+
 class WhenNetworkAbnormal(str, Enum):
     RESTART = 'restart'
     WAIT_10S = 'wait_10s'
@@ -25,9 +31,12 @@ class WhenNetworkError(str, Enum):
 # 也可以是左边的邀请什么的
 class Emergency(BaseModel):
     friend_invitation: FriendInvitation = Field(default=FriendInvitation.ACCEPT,description='friend_invitation_help')
+    long_idle_buff_prompt_mode: CommonPopupMode = Field(
+        default=CommonPopupMode.ENFORCE,
+        description='long_idle_buff_prompt_mode_help',
+    )
     # invitation_detect_interval: int = Field(default=5, description='invitation_detect_interval_help')
     when_network_abnormal: WhenNetworkAbnormal = Field(default=WhenNetworkAbnormal.WAIT_10S, description='when_network_abnormal_help')
     when_network_error: WhenNetworkError = Field(default=WhenNetworkError.RESTART, description='when_network_error_help')
     home_client_clear: bool = Field(default=True, description='home_client_clear_help')
-
 

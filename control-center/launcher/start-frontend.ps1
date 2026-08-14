@@ -1,9 +1,15 @@
-param([int]$Port = 5173)
+param(
+  [int]$Port = 4175,
+  [string]$BridgeUrl = 'http://127.0.0.1:22367'
+)
 
 $ErrorActionPreference = 'Stop'
-# 注意：这是“旧生产前端”(control-center\frontend, :5173)，不是 UI-claude 新界面。
-# 日常请用 启动.bat / start.ps1（默认 UI-claude :4175）。本脚本仅供对照旧界面或 -Prod 打包预览。
-Write-Host '[!] 正在启动【旧前端 :5173】，这不是 UI-claude 新界面。日常请改用项目根目录的 启动.bat。' -ForegroundColor Yellow
-Set-Location (Join-Path $PSScriptRoot '..\frontend')
-if (-not (Test-Path 'node_modules')) { npm install }
-npm run dev -- --host 127.0.0.1 --port $Port
+$frontend = (Resolve-Path (Join-Path $PSScriptRoot '..\frontend')).Path
+$env:OAS_BRIDGE_URL = $BridgeUrl
+Set-Location -LiteralPath $frontend
+if (-not (Test-Path (Join-Path $frontend 'node_modules'))) {
+  Write-Host '首次运行，正在安装前端依赖（可能需要几分钟）...' -ForegroundColor Yellow
+  npm install
+}
+Write-Host ("OAS 控制中心前端：http://127.0.0.1:{0}/  (Bridge {1})" -f $Port, $BridgeUrl) -ForegroundColor Cyan
+npm run dev -- --host 127.0.0.1 --port $Port --strictPort

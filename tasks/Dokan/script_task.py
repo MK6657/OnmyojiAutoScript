@@ -308,7 +308,7 @@ class ScriptTask(ExtendGreenMark, GameUi, SwitchSoul, DokanSceneDetector):
         self.goto_main()
 
         self.next_run(skip_today=False, is_dokan_activated=is_dokan_activated)
-        raise TaskEnd
+        raise TaskEnd.completed('Dokan completed')
 
     def dokan_battle_1(self, cfg: Dokan, count=None):
         """ 道馆战斗

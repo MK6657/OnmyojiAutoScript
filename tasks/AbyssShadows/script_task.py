@@ -108,7 +108,7 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, AbyssShadowsAssets):
             logger.info(f"Today is not abyss shadows day, exit")
             # 设置下次运行时间为本周五
             self.custom_next_run(task='AbyssShadows', custom_time=cfg.abyss_shadows_time.custom_run_time_friday, time_delta=4-today)
-            raise TaskEnd
+            raise TaskEnd.completed('AbyssShadows completed')
         success = True
         # 进入狭间
         self.goto_abyss_shadows()
@@ -117,7 +117,7 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, AbyssShadowsAssets):
             logger.warning("Failed to enter abyss shadows")
             self.goto_main()
             self.set_next_run(task='AbyssShadows', finish=False, server=True, success=False)
-            raise TaskEnd
+            raise TaskEnd.completed('AbyssShadows completed')
         
         # 等待可进攻时间  
         self.device.stuck_record_add('BATTLE_STATUS_S')
@@ -215,7 +215,7 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, AbyssShadowsAssets):
                 self.custom_next_run(task='AbyssShadows', custom_time=cfg.abyss_shadows_time.custom_run_time_friday, time_delta=5)
         else:
             self.set_next_run(task='AbyssShadows', finish=True, server=True, success=False)
-        raise TaskEnd
+        raise TaskEnd.completed('AbyssShadows completed')
 
 
 

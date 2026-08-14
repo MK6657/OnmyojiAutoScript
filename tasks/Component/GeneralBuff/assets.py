@@ -14,7 +14,8 @@ class GeneralBuffAssets:
 	# 庭院左上角的加成 
 	I_BUFF_1 = RuleImage(roi_front=(363,32,32,46), roi_back=(344,14,128,76), threshold=0.8, method="Template matching", file="./tasks/Component/GeneralBuff/gb/gb_buff_1.png")
 	# description 
-	I_AWAKE = RuleImage(roi_front=(381,130,35,45), roi_back=(360,107,80,447), threshold=0.8, method="Template matching", file="./tasks/Component/GeneralBuff/gb/gb_awake.png")
+	# 庭院/加成弹窗会随皮肤改变色调；当前版本的稳定命中约为 0.757。
+	I_AWAKE = RuleImage(roi_front=(381,130,35,45), roi_back=(360,107,80,447), threshold=0.7, method="Template matching", file="./tasks/Component/GeneralBuff/gb/gb_awake.png")
 	# 御魂加成 
 	I_SOUL = RuleImage(roi_front=(377,203,39,40), roi_back=(361,121,71,388), threshold=0.8, method="Template matching", file="./tasks/Component/GeneralBuff/gb/gb_soul.png")
 	# description 
@@ -30,7 +31,9 @@ class GeneralBuffAssets:
 	# description 
 	I_CLOSE_RED = RuleImage(roi_front=(773,365,12,20), roi_back=(764,134,38,369), threshold=0.6, method="Template matching", file="./tasks/Component/GeneralBuff/gb/gb_close_red.png")
 	# 用来判定是否点击的那个 
-	I_CLOUD = RuleImage(roi_front=(357,505,65,38), roi_back=(313,484,158,75), threshold=0.8, method="Template matching", file="./tasks/Component/GeneralBuff/gb/gb_cloud.png")
+	# 加成弹窗底部云纹是弹窗状态锚点；新庭院皮肤实测命中约为 0.725，
+	# 主界面同区域最高约 0.526，0.65 仍留有安全间隔。
+	I_CLOUD = RuleImage(roi_front=(357,505,65,38), roi_back=(313,484,158,75), threshold=0.65, method="Template matching", file="./tasks/Component/GeneralBuff/gb/gb_cloud.png")
 
 
 	# Ocr Rule Assets
@@ -49,5 +52,4 @@ class GeneralBuffAssets:
 	# Swipe Rule Assets
 	# description 
 	S_BUFF_UP = RuleSwipe(roi_front=(397,124,456,35), roi_back=(447,457,386,37), mode="default", name="buff_up")
-
 

@@ -253,9 +253,11 @@ const fieldLabels = {
   preset: '启用预设队伍',
   preset_enable: '启用预设队伍',
   presetgroup: '预设分组',
-  preset_group: '预设分组',
+  preset_group: '旧版预设分组序号',
+  preset_group_name: '预设分组名称',
   presetteam: '预设队伍',
-  preset_team: '预设队伍',
+  preset_team: '旧版预设队伍序号',
+  preset_team_name: '预设队伍名称',
   green: '启用绿色标记',
   green_enable: '启用绿色标记',
   greenmark: '绿色标记位置',
@@ -398,8 +400,10 @@ const fieldLabels = {
   invite_number: '邀请人数',
   default_invite: '默认邀请',
   lock_team_enable: '锁定队伍',
-  preset_group: '预设分组',
-  preset_team: '预设队伍',
+  preset_group: '旧版预设分组序号',
+  preset_group_name: '预设分组名称',
+  preset_team: '旧版预设队伍序号',
+  preset_team_name: '预设队伍名称',
   green_mark: '绿标位置',
   random_click_swipt_enable: '随机点击滑动',
   auto_switch_soul: '自动切换御魂',
@@ -579,6 +583,11 @@ const fieldLabels = {
 
 const descriptions = {
   enable_help: '将这个任务加入调度器',
+  preset_enable_help: '第一次进入战斗准备界面时，按游戏内分组名称和队伍名称切换预设',
+  preset_group_name_help: '填写右侧“预设分组”的完整名称；程序会滚动查找，不使用固定序号',
+  preset_team_name_help: '填写中间“队伍预设”的完整名称；发现同名队伍会停止并提示先重命名',
+  preset_group_help: '旧版固定位置兼容字段；填写名称后不再使用',
+  preset_team_help: '旧版固定位置兼容字段；填写名称后不再使用',
   target_level_mode_enable_help: '启用按账号配置的目标等级模式；开启后由新状态机接管退四、刷新和失败处理，相关旧选项不参与决策',
   target_level_help: '当前等级高于目标时降级，等于目标时保级，低于目标时升级',
   single_step_test_help: '每次运行最多提交一次投降、挑战或刷新，测试期间建议保持开启',
@@ -880,13 +889,36 @@ export function groupLabel(value) {
   return groupLabels[key] || compactGroupLabels[canonicalKey(key)] || prettyKey(value) || '任务设置'
 }
 
-export function fieldLabel(field) {
+/**
+ * 字段中文名。
+ *
+ * 传入 group 时会做上下文修正：OAS 里很多分组都有同名字段（最典型的是 enable），
+ * 只按字段名翻译会把「御魂切换.enable」也显示成「启用任务」，让人误以为是任务开关。
+ */
+export function fieldLabel(field, group) {
   const key = normalizeKey(field?.name)
   const titleKey = normalizeKey(field?.title)
+  const contextual = contextualFieldLabel(key, group)
+  if (contextual) return contextual
   return fieldLabels[key] || compactFieldLabels[canonicalKey(key)] || fieldLabels[titleKey] || compactFieldLabels[canonicalKey(titleKey)] || prettyKey(field?.name || field?.title) || '配置项'
 }
 
-export function fieldDescription(field) {
+/** 只有在分组不是 scheduler 时，这些通用开关才需要按分组重新命名。 */
+const CONTEXT_KEYS = new Set(['enable', 'enabled'])
+function contextualFieldLabel(key, group) {
+  if (!group || !CONTEXT_KEYS.has(key)) return ''
+  const normalizedGroup = normalizeKey(group)
+  if (normalizedGroup === 'scheduler') return ''
+  const label = groupLabel(group)
+  if (!label || label === '任务设置') return ''
+  return `启用${label}`
+}
+
+export function fieldDescription(field, group) {
+  const key = normalizeKey(field?.name)
+  if (group && CONTEXT_KEYS.has(key) && normalizeKey(group) !== 'scheduler') {
+    return `关闭后本任务会跳过「${groupLabel(group)}」这一段流程`
+  }
   const description = String(field?.description || '').trim()
   if (descriptions[description]) return cleanDescription(descriptions[description])
   if (compactDescriptions[canonicalKey(description)]) return cleanDescription(compactDescriptions[canonicalKey(description)])

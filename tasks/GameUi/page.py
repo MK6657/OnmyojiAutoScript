@@ -7,6 +7,7 @@ from module.atom.click import RuleClick
 from tasks.BondlingFairyland.assets import BondlingFairylandAssets
 from tasks.GlobalGame.assets import GlobalGameAssets as GGA
 from tasks.GameUi.assets import GameUiAssets as G
+from tasks.Exploration.assets import ExplorationAssets as E
 from tasks.KekkaiUtilize.assets import KekkaiUtilizeAssets
 from tasks.Restart.assets import RestartAssets
 from tasks.base_task import BaseTask as BT
@@ -37,6 +38,8 @@ class Page:
         PageRegistry.register(self)
 
     def __eq__(self, other):
+        if not isinstance(other, Page):
+            return False
         return self.name == other.name
 
     def __hash__(self):
@@ -52,16 +55,26 @@ class Page:
 #登录login
 page_login = Page(G.I_CHECK_LOGIN_FORM)
 # Main Home 主页
-page_main = Page(G.I_CHECK_MAIN)
-page_main.additional = [G.I_AD_CLOSE_RED, G.I_BACK_FRIENDS, RestartAssets.I_CANCEL_BATTLE,
+# 庭院皮肤会改变顶部背景，固定的 page_check_main 模板可能降到阈值以下。
+# 探索灯笼只会出现在庭院，作为第二锚点兼容不同皮肤，避免误降级为未知页面。
+page_main = Page([G.I_CHECK_MAIN, G.I_MAIN_GOTO_EXPLORATION])
+page_main.additional = [G.I_MAIN_PROTECTION_BACK, G.I_AD_CLOSE_RED, G.I_BACK_FRIENDS, RestartAssets.I_CANCEL_BATTLE,
                             GGA.I_CHAT_CLOSE_BUTTON, G.I_CLOSE_CHAT_WINDOW,
-                            [G.I_MAIN_GOTO_SHIKIGAMI_RECORDS, RestartAssets.C_LOGIN_SCROLL_CLOSE_AREA, True]]
+                            # Only close the courtyard scroll after its own
+                            # close marker is visible.  The old inverted rule
+                            # clicked this coordinate whenever the Shikigami
+                            # entry was temporarily absent, including during
+                            # the bottom-toolbar loading transition.
+                            [RestartAssets.I_LOGIN_SCROOLL_CLOSE, RestartAssets.C_LOGIN_SCROLL_CLOSE_AREA]]
 # 召唤summon
 page_summon = Page(G.I_CHECK_SUMMON)
 page_summon.link(button=G.I_SUMMON_GOTO_MAIN, destination=page_main)
 page_main.link(button=G.I_MAIN_GOTO_SUMMON, destination=page_summon)
 # 探索exploration
-page_exploration = Page(G.I_CHECK_EXPLORATION)
+# The exploration world has two valid layouts: the chapter panel can be
+# collapsed or expanded. The right-side arrow remains a stable page marker
+# when the skin-specific top marker is temporarily unavailable.
+page_exploration = Page([G.I_CHECK_EXPLORATION, E.I_EXP_ARROW_LEFT, E.I_EXP_ARROW_RIGHT])
 page_exploration.link(button=G.I_BACK_YOLLOW, destination=page_main)
 page_main.link(button=G.I_MAIN_GOTO_EXPLORATION, destination=page_exploration)
 # 町中town
@@ -207,6 +220,18 @@ page_dokan = Page(DokanAssets.I_RYOU_DOKAN_CHECK)
 page_dokan.additional = [GeneralBattleAssets.I_EXIT, DokanAssets.I_RYOU_DOKAN_EXIT_ENSURE, G.I_BACK_BLUE]
 page_dokan.link(button=G.I_BACK_Y, destination=page_main)
 
+# Battle and result pages are registered for startup/recovery page detection.
+# Recognition alone is intentional: no automatic close or blind click is added.
+page_battle = Page([
+    GeneralBattleAssets.I_BATTLE_INFO,
+    GeneralBattleAssets.I_FRIENDS,
+    GeneralBattleAssets.I_WIN,
+    GeneralBattleAssets.I_FALSE,
+    GeneralBattleAssets.I_REWARD,
+    GeneralBattleAssets.O_BATTLE_RESULT_CONTINUE,
+])
+# Recognition is intentionally passive. GeneralBattle, or another explicit
+# battle owner, is the only component allowed to operate battle/result pages.
 
 # ************************************* 战斗部分 *****************************************#
 # 战斗界面

@@ -12,6 +12,12 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import AsyncMock
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "stubs"))
@@ -21,7 +27,7 @@ TEMP = tempfile.mkdtemp(prefix="oas-bridge-test-")
 os.environ["OAS_CONTROL_CENTER_DATA_DIR"] = TEMP
 
 from app import main as bridge_main  # noqa: E402
-from app.core_client import CoreError, OasCoreClient  # noqa: E402
+from app.core_client import CoreConflict, CoreError, OasCoreClient  # noqa: E402
 from app.models import AccountAction, AccountCreate, AccountPatch, ConfigPatch  # noqa: E402
 from app.runtime import parse_log_level, parse_log_timestamp  # noqa: E402
 
@@ -52,6 +58,9 @@ class FakeCore:
         self.started: list[str] = []
         self.stopped: list[str] = []
         self.fail_next_set = False
+        self.fail_start_result = False
+        self.fail_stop_result = False
+        self.revision = 1
 
     def _hit(self, name: str) -> None:
         self.calls[name] = self.calls.get(name, 0) + 1
@@ -95,6 +104,42 @@ class FakeCore:
             bucket.add(task_id) if value else bucket.discard(task_id)
         return True
 
+    async def config_revision(self, account_id):
+        self._hit("config_revision")
+        return f"rev-{self.revision}"
+
+    async def patch_values(self, account_id, task_id, fields, expected_revision):
+        self._hit("patch_values")
+        # Keep the legacy field-application counter for older assertions;
+        # patch_values itself is still one Core request.
+        self.calls["set_value"] = self.calls.get("set_value", 0) + len(fields)
+        if expected_revision != f"rev-{self.revision}":
+            raise CoreConflict("revision conflict")
+        if self.fail_next_set:
+            self.fail_next_set = False
+            raise CoreError("OAS Core returned 400: Argument type error")
+        pending = []
+        for field in fields:
+            pending.append((
+                account_id,
+                task_id,
+                field["group"],
+                field["name"],
+                OasCoreClient.normalize_value(field["value"], field["type"]),
+                field["type"],
+            ))
+        self.values.extend(pending)
+        for _account, _task, group, name, value, _type in pending:
+            if group == "scheduler" and name == "enable":
+                bucket = self.enabled.setdefault(account_id, set())
+                bucket.add(task_id) if value in (True, "true") else bucket.discard(task_id)
+        self.revision += 1
+        return {
+            "saved": True,
+            "updated": len(fields),
+            "revision": f"rev-{self.revision}",
+        }
+
     async def copy_account(self, account_id, template="template"):
         self._hit("copy_account")
         if account_id not in self.accounts_list:
@@ -119,10 +164,16 @@ class FakeCore:
     async def start_script(self, account_id):
         self._hit("start_script")
         self.started.append(account_id)
+        if self.fail_start_result:
+            return {"status": "failed", "success": False, "reason": "spawn failed"}
+        return {"status": "completed", "success": True, "changed": True}
 
     async def stop_script(self, account_id):
         self._hit("stop_script")
         self.stopped.append(account_id)
+        if self.fail_stop_result:
+            return {"status": "failed", "success": False, "reason": "process_still_alive"}
+        return {"status": "completed", "success": True, "changed": True}
 
     def websocket_url(self, account_id):
         return f"ws://fake/ws/{account_id}"
@@ -209,15 +260,63 @@ async def test_toggle_invalidates_cache():
     expect(any(task.id == "Duel" for task in after), "新启用的任务没有出现在列表里")
 
 
+@check("下架任务不能通过启用接口绕过目录门禁")
+async def test_hidden_activity_cannot_be_enabled():
+    core = reset()
+    try:
+        await bridge_main.set_task_enabled("oas1", "XiuxingHexun", True)
+        raise AssertionError("hidden activity should not be enabled")
+    except Exception as error:
+        expect(getattr(error, "status_code", None) == 409, f"unexpected status: {error}")
+    expect(core.calls.get("patch_values", 0) == 0, "hidden activity reached Core patch API")
+
+
+@check("目录刷新后旧调度快照不会复活已下架任务")
+async def test_hidden_activity_is_filtered_from_schedule_snapshot():
+    reset()
+    runtime = bridge_main.bridge.runtimes.get("oas1")
+    runtime.last_schedule = {
+        "running": {},
+        "pending": [{"name": "XiuxingHexun", "next_run": "2026-08-14 09:00:00"}],
+        "waiting": [],
+    }
+
+    tasks = await bridge_main.account_tasks("oas1", refresh=False)
+
+    expect(not any(task.id == "XiuxingHexun" for task in tasks), "hidden activity was revived")
+    await bridge_main.bridge.runtimes.close()
+
+
+@check("停用任务会清掉离线运行时旧快照")
+async def test_disable_clears_stale_runtime_snapshot():
+    core = reset()
+    core.enabled["oas1"].add("RealmRaid")
+    runtime = bridge_main.bridge.runtimes.get("oas1")
+    runtime.last_schedule = {
+        "running": {},
+        "pending": [],
+        "waiting": [{"name": "RealmRaid", "next_run": "2026-07-26 09:00:00"}],
+    }
+    runtime.connected = False
+
+    await bridge_main.set_task_enabled("oas1", "RealmRaid", False)
+    after = await bridge_main.account_tasks("oas1")
+
+    expect(runtime.scheduled_tasks() is None, "停用后仍保留运行时调度快照")
+    expect(not any(task.id == "RealmRaid" for task in after), "停用后任务列表仍被旧快照覆盖")
+    await bridge_main.bridge.runtimes.close()
+
+
 @check("保存配置只对改动字段调用 Core，且不重复拉 schema")
 async def test_patch_only_touches_given_fields():
     core = reset()
-    payload = ConfigPatch(fields=[
+    payload = ConfigPatch(revision="rev-1", fields=[
         {"group": "scheduler", "name": "priority", "value": 3, "type": "integer"},
         {"group": "device", "name": "handle", "value": "132456"},   # 故意不给 type
         {"group": "device", "name": "handle", "value": "132456"},   # 再来一个缺 type 的
     ])
     result = await bridge_main.patch_task_config("oas1", "Orochi", payload)
+    expect(core.calls.get("patch_values") == 1, f"atomic patch count is wrong: {core.calls.get('patch_values')}")
     expect(result["updated"] == 3, f"更新字段数不对：{result}")
     expect(core.calls.get("set_value") == 3, f"set_value 次数不对：{core.calls.get('set_value')}")
     expect(core.calls.get("task_args", 0) == 1, f"schema 应只读一次，实际 {core.calls.get('task_args')} 次")
@@ -247,6 +346,17 @@ async def test_set_value_guards():
     except CoreError as error:
         expect("拒绝" in str(error), f"错误文案不对: {error}")
 
+    try:
+        await ok.patch_values("a", "T", [{
+            "group": "scheduler",
+            "name": "success_interval",
+            "value": "100 00:00:00",
+            "type": "time_delta",
+        }], "rev-1")
+        raise AssertionError("batch PATCH should reject intervals above 99 days")
+    except CoreError as error:
+        expect("99 天" in str(error), f"batch PATCH error is wrong: {error}")
+
 
 @check("时间类型会被补成 Core 能解析的格式")
 async def test_value_normalization():
@@ -267,7 +377,7 @@ async def test_save_error_maps_to_502():
     core = reset()
     core.fail_next_set = True
     try:
-        await bridge_main.patch_task_config("oas1", "Orochi", ConfigPatch(fields=[
+        await bridge_main.patch_task_config("oas1", "Orochi", ConfigPatch(revision="rev-1", fields=[
             {"group": "device", "name": "handle", "value": "999", "type": "string"},
         ]))
         raise AssertionError("应当抛出 HTTPException")
@@ -317,6 +427,32 @@ async def test_action_falls_back_to_rest():
     await bridge_main.bridge.runtimes.close()
 
 
+@check("同一账号的 Bridge 动作按顺序执行，避免 start/stop 与兜底交错")
+async def test_account_actions_are_serialized():
+    core = reset()
+    runtime = bridge_main.bridge.runtimes.get("oas1")
+    events = []
+
+    async def fake_try_command(command):
+        events.append(f"{command}:begin")
+        await asyncio.sleep(0.01)
+        events.append(f"{command}:end")
+        return False
+
+    runtime.try_command = fake_try_command
+    await asyncio.gather(
+        bridge_main.account_action("oas1", AccountAction(action="start")),
+        bridge_main.account_action("oas1", AccountAction(action="stop")),
+    )
+    expect(events in (
+        ["start:begin", "start:end", "stop:begin", "stop:end"],
+        ["stop:begin", "stop:end", "start:begin", "start:end"],
+    ), f"动作没有串行执行：{events}")
+    expect(core.started == ["oas1"], f"start 兜底次数异常：{core.started}")
+    expect(core.stopped == ["oas1"], f"stop 兜底次数异常：{core.stopped}")
+    await bridge_main.bridge.runtimes.drop("oas1")
+
+
 @check("日志级别能从 Core 的文本日志里解析出来")
 async def test_log_level_parsing():
     expect(parse_log_level("2026-07-26 11:44:12.123 | INFO     | tasks.orochi:run:12 - 开始") == "info", "INFO 解析失败")
@@ -354,6 +490,10 @@ async def test_window_serial_mapping():
         bridge_main.infer_window_serial("dnplayer.exe", "", connected) is None,
         "多设备时未知映射必须拒绝",
     )
+    expect(
+        bridge_main.infer_window_serial("dnplayer.exe", "", {"127.0.0.1:16384"}) is None,
+        "单设备也不能替未知模拟器猜测 serial",
+    )
 
 
 @check("模板与任务顺序能在 Bridge 侧持久化")
@@ -388,7 +528,7 @@ async def test_cors_regex():
     import re
     kwargs = next(kw for cls, kw in bridge_main.app.middleware if "allow_origin_regex" in kw)
     pattern = re.compile(kwargs["allow_origin_regex"])
-    for origin in ("http://127.0.0.1:5173", "http://127.0.0.1:4174", "http://localhost:4180", "http://127.0.0.1"):
+    for origin in ("http://127.0.0.1:4175", "http://localhost:4175", "http://127.0.0.1:5173", "http://127.0.0.1"):
         expect(pattern.match(origin) is not None, f"应放行 {origin}")
     for origin in ("http://evil.example.com", "http://127.0.0.1.evil.com"):
         expect(pattern.match(origin) is None, f"不应放行 {origin}")
@@ -405,6 +545,106 @@ async def test_delete_account():
     expect(bridge_main.bridge.task_cache.peek("oas3") is None, "缓存没清")
 
 
+@check("Core execution failure is not reported as accepted")
+async def test_action_rejects_core_execution_failure():
+    core = reset()
+    core.fail_start_result = True
+    try:
+        await bridge_main.account_action("oas1", AccountAction(action="start"))
+        raise AssertionError("Core execution failure should not succeed")
+    except Exception as error:
+        expect(getattr(error, "status_code", None) == 502, f"unexpected status: {error}")
+    await bridge_main.bridge.runtimes.close()
+
+
+@check("Stale config revision returns 409 without partial save")
+async def test_stale_config_revision_returns_409():
+    core = reset()
+    payload = ConfigPatch(
+        revision="rev-0",
+        fields=[{"group": "scheduler", "name": "priority", "value": 9, "type": "integer"}],
+    )
+    before = list(core.values)
+    try:
+        await bridge_main.patch_task_config("oas1", "Orochi", payload)
+        raise AssertionError("stale revision should be rejected")
+    except Exception as error:
+        expect(getattr(error, "status_code", None) == 409, f"unexpected status: {error}")
+    expect(core.values == before, "stale request partially changed config")
+
+
+@check("Missing config revision returns 428 without reading a replacement revision")
+async def test_missing_config_revision_returns_428():
+    core = reset()
+    payload = ConfigPatch(
+        fields=[{"group": "scheduler", "name": "priority", "value": 9, "type": "integer"}],
+    )
+    try:
+        await bridge_main.patch_task_config("oas1", "Orochi", payload)
+        raise AssertionError("missing revision should be rejected")
+    except Exception as error:
+        expect(getattr(error, "status_code", None) == 428, f"unexpected status: {error}")
+    expect(core.calls.get("config_revision", 0) == 0, "Bridge silently replaced the missing revision")
+    expect(core.values == [], "missing revision partially changed config")
+
+
+@check("If-Match can supply the config revision")
+async def test_if_match_supplies_config_revision():
+    core = reset()
+    payload = ConfigPatch(
+        fields=[{"group": "scheduler", "name": "priority", "value": 7, "type": "integer"}],
+    )
+    result = await bridge_main.patch_task_config("oas1", "Orochi", payload, if_match='"rev-1"')
+    expect(result["saved"] is True, f"save failed: {result}")
+    expect(core.values[-1][4] == "7", f"wrong value: {core.values}")
+
+
+@check("Stop failure is not reported as accepted")
+async def test_stop_failure_is_not_reported_as_accepted():
+    core = reset()
+    core.fail_stop_result = True
+    try:
+        await bridge_main.account_action("oas1", AccountAction(action="stop"))
+        raise AssertionError("stop failure should not succeed")
+    except Exception as error:
+        expect(getattr(error, "status_code", None) == 502, f"unexpected status: {error}")
+    await bridge_main.bridge.runtimes.close()
+
+
+@check("Rename stops first and preserves metadata when stop fails")
+async def test_rename_rejects_stop_failure():
+    core = reset()
+    await bridge_main.list_accounts()
+    core.fail_stop_result = True
+    runtime = bridge_main.bridge.runtimes.get("oas2")
+    runtime.try_command = AsyncMock(return_value=None)
+    before = list(core.accounts_list)
+    try:
+        await bridge_main.patch_account("oas2", AccountPatch(name="oas2-renamed"))
+        raise AssertionError("rename should stop after a failed stop")
+    except Exception as error:
+        expect(getattr(error, "status_code", None) == 502, f"unexpected status: {error}")
+    expect(core.accounts_list == before, "Core account was renamed after stop failure")
+    expect(bridge_main.bridge.repository.get("oas2") is not None, "metadata draft was lost")
+
+
+@check("Delete preserves runtime and metadata when stop fails")
+async def test_delete_rejects_stop_failure():
+    core = reset()
+    await bridge_main.list_accounts()
+    core.fail_stop_result = True
+    runtime = bridge_main.bridge.runtimes.get("oas3")
+    runtime.try_command = AsyncMock(return_value=None)
+    try:
+        await bridge_main.delete_account("oas3")
+        raise AssertionError("delete should stop after a failed stop")
+    except Exception as error:
+        expect(getattr(error, "status_code", None) == 502, f"unexpected status: {error}")
+    expect("oas3" in core.accounts_list, "Core account was deleted after stop failure")
+    expect(bridge_main.bridge.runtimes.peek("oas3") is runtime, "runtime ownership was dropped")
+    expect(bridge_main.bridge.repository.get("oas3") is not None, "metadata was deleted")
+
+
 async def main() -> int:
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_") and callable(value)]
     for test in tests:
@@ -414,6 +654,63 @@ async def main() -> int:
     failed = [item for item in results if item[0] == "FAIL"]
     print(f"\n{len(results) - len(failed)}/{len(results)} 通过")
     return 1 if failed else 0
+
+
+
+import unittest  # DeepSeek-14 B1 integration test harness
+
+
+class CommandFallbackIntegrationTest(unittest.IsolatedAsyncioTestCase):
+    """DeepSeek-14 B1: _send_account_command -> REST fallback must carry the
+    SAME command_id so Core's claim ledger can replay instead of double-run."""
+
+    async def asyncSetUp(self):
+        import app.main as main_module
+        self.main_module = main_module
+        self.recorded = {}
+        original_bridge = main_module.bridge
+        self._original_bridge = original_bridge
+
+        async def fake_start(account_id, command_id=None):
+            self.recorded["start"] = (account_id, command_id)
+            return {"status": "completed", "success": True, "changed": True}
+
+        async def fake_stop(account_id, command_id=None):
+            self.recorded["stop"] = (account_id, command_id)
+            return {"status": "completed", "success": True, "changed": True}
+
+        fake_core = AsyncMock()
+        fake_core.start_script = fake_start
+        fake_core.stop_script = fake_stop
+        main_module.bridge = type("FakeBridge", (), {"core": fake_core})()
+
+    async def asyncTearDown(self):
+        self.main_module.bridge = self._original_bridge
+
+    def _make_runtime(self):
+        from app.events import EventHub
+        from app.runtime import AccountRuntime
+        return AccountRuntime("oas1", "ws://fake", EventHub())
+
+    async def test_not_accepted_falls_back_with_same_command_id(self):
+        from app.runtime import CommandNotAccepted
+
+        runtime = self._make_runtime()
+        runtime.connected = True
+        runtime.wait_connected = lambda timeout=2.0: True  # noqa: E731
+
+        async def rejecting_try(command):
+            raise CommandNotAccepted(runtime._last_command_id or "cmd-none")
+
+        runtime.try_command = rejecting_try
+        runtime._last_command_id = "cmd-fallback-1"
+
+        result = await self.main_module._send_account_command("oas1", "start", runtime)
+        self.assertTrue(result["success"])
+        account, command_id = self.recorded["start"]
+        self.assertEqual(account, "oas1")
+        self.assertEqual(command_id, "cmd-fallback-1")
+
 
 
 if __name__ == "__main__":

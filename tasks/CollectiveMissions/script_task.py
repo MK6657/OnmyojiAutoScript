@@ -58,7 +58,7 @@ class ScriptTask(GameUi, CollectiveMissionsAssets):
         if current == total == 30:
             logger.warning('Today\'s missions have been completed')
             self.set_next_run(task='CollectiveMissions', success=False, finish=True)
-            raise TaskEnd('CollectiveMissions')
+            raise TaskEnd.completed('CollectiveMissions')
         #切换为目标任务
         mission_name = self.config.collective_missions.missions_config.missions_select
         self.select_mission(mission_name)
@@ -91,7 +91,7 @@ class ScriptTask(GameUi, CollectiveMissionsAssets):
                 continue
 
         self.set_next_run(task='CollectiveMissions', success=True, finish=True)
-        raise TaskEnd('CollectiveMissions')
+        raise TaskEnd.completed('CollectiveMissions')
 
 
     def detect_one(self, ocr_1: RuleOcr, ocr_2: RuleOcr) -> MC:
@@ -164,7 +164,14 @@ class ScriptTask(GameUi, CollectiveMissionsAssets):
                 return True
             return False
         if not bondling_finish():
-            self.config.bondling_fairyland.scheduler.next_run = self.start_time
+            # DeepSeek-13 1.6 (F-4): route through schedule() so the cross-task
+            # write is allowlisted and audited instead of a direct model write.
+            self.config.schedule(
+                task='bondling_fairyland',
+                when=self.start_time,
+                reason='CollectiveMissions harvest linked bondling_fairyland',
+                caller='CollectiveMissions',
+            )
             if not self.config.bondling_fairyland.scheduler.enable:
                 logger.error('The scheduler of bondling_fairyland is not enable')
                 logger.error('Please enable it in config file')

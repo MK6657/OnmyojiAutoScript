@@ -7,10 +7,35 @@ import time
 from collections import deque
 from datetime import datetime, timezone
 from typing import Any
+from uuid import uuid4
 
 import websockets
 
 from .events import EventHub
+
+
+class CommandExecutionError(RuntimeError):
+    """Core acknowledged a command but reported execution failure."""
+
+
+class CommandInProgress(RuntimeError):
+    """Core acknowledged the command (command_ack) but the completion receipt
+    has not arrived within the wait window. Callers must surface 202/in_progress
+    and retrieve the result from the query/event channel instead of failing or
+    re-issuing via REST."""
+
+    def __init__(self, command_id: str) -> None:
+        super().__init__(f"command in progress: command_id={command_id}")
+        self.command_id = command_id
+
+
+class CommandNotAccepted(RuntimeError):
+    """No command_ack and no completion receipt arrived; Core never took the
+    command. A REST fallback carrying the SAME command_id is safe."""
+
+    def __init__(self, command_id: str) -> None:
+        super().__init__(f"command not accepted: command_id={command_id}")
+        self.command_id = command_id
 
 
 STATE_LABELS = {
@@ -74,6 +99,12 @@ class AccountRuntime:
         self._websocket: Any = None
         self._watch_task: asyncio.Task | None = None
         self._send_lock = asyncio.Lock()
+        self._pending_commands: dict[str, asyncio.Future] = {}
+        self._last_command_id: str | None = None
+        self._acked_commands: set[str] = set()
+        self._late_results: dict[str, dict[str, Any]] = {}
+        # Serialize start/stop/restart per account; different accounts remain independent.
+        self.action_lock = asyncio.Lock()
         self._closed = False
         self._short_sessions = 0
 
@@ -95,6 +126,7 @@ class AccountRuntime:
         self._watch_task = None
         self._websocket = None
         self.connected = False
+        self._fail_pending_commands("runtime_closed")
 
     async def wait_connected(self, timeout: float = 2.0) -> bool:
         self.start_watching()
@@ -105,20 +137,95 @@ class AccountRuntime:
             await asyncio.sleep(0.05)
         return self._websocket is not None
 
-    async def command(self, command: str) -> None:
+    async def command(self, command: str, timeout: float = 5.0) -> dict[str, Any]:
+        if not await self.wait_connected():
+            raise RuntimeError(f"Account {self.account_id} Core WebSocket is unavailable")
+        command_id = f"cmd_{uuid4().hex}"
+        future = asyncio.get_running_loop().create_future()
+        self._pending_commands[command_id] = future
+        self._last_command_id = command_id
+        async with self._send_lock:
+            await self._websocket.send(json.dumps({
+                "command_id": command_id,
+                "command": command,
+            }))
+        try:
+            # DeepSeek-14 B1/A1: wait on a shielded future so a late receipt can
+            # still be adopted; triage on timeout by whether Core acked.
+            result = await asyncio.wait_for(
+                asyncio.shield(future), timeout=max(timeout, 0.1)
+            )
+        except asyncio.TimeoutError as error:
+            acked = command_id in self._acked_commands
+            async def _reap_late() -> None:
+                await asyncio.sleep(60)
+                self._pending_commands.pop(command_id, None)
+                self._acked_commands.discard(command_id)
+
+            asyncio.get_running_loop().create_task(_reap_late())
+            if acked:
+                raise CommandInProgress(command_id) from error
+            raise CommandNotAccepted(command_id) from error
+        self._pending_commands.pop(command_id, None)
+        self._acked_commands.discard(command_id)
+        self._late_results[command_id] = result
+        if len(self._late_results) > 128:
+            oldest = next(iter(self._late_results))
+            self._late_results.pop(oldest, None)
+        if not result.get("success", False):
+            raise CommandExecutionError(
+                f"Core command failed: command_id={command_id}, "
+                f"reason={result.get('reason', 'unknown')}"
+            )
+        await self.events.emit(
+            "task.commanded",
+            self.account_id,
+            level="info",
+            payload={"command": command, "command_id": command_id, "result": result},
+        )
+        return result
+
+    async def _legacy_command_without_receipt(self, command: str) -> None:
         if not await self.wait_connected():
             raise RuntimeError(f"账号 {self.account_id} 的 OAS WebSocket 未连接")
         async with self._send_lock:
             await self._websocket.send(command)
         await self.events.emit("task.commanded", self.account_id, level="info", payload={"command": command})
 
-    async def try_command(self, command: str) -> bool:
+    async def try_command(self, command: str) -> dict[str, Any] | None:
         """尽力通过 WebSocket 下发命令；失败返回 False，让调用方走 REST 兜底。"""
         try:
-            await self.command(command)
-            return True
-        except Exception:
-            return False
+            return await self.command(command)
+        except (CommandExecutionError, CommandInProgress, CommandNotAccepted):
+            raise
+        except Exception as exc:
+            reason = f'{type(exc).__name__}: {exc}'
+            self.last_error = reason
+            try:
+                await self.events.emit(
+                    "task.command.fallback",
+                    self.account_id,
+                    level="warn",
+                    payload={"command": command, "reason": reason},
+                )
+            except Exception:
+                pass
+            return None
+
+    async def wait_last_command_result(
+        self, timeout: float = 2.0
+    ) -> dict[str, Any] | None:
+        """DeepSeek-13 2.4 (F-14): briefly await the receipt of the last WS
+        command after a timeout so the REST fallback never double-issues
+        start/stop. Returns None immediately when nothing is in flight."""
+        command_id = self._last_command_id
+        future = self._pending_commands.get(command_id) if command_id else None
+        if future is None or future.done():
+            return None
+        try:
+            return await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -128,6 +235,11 @@ class AccountRuntime:
             "schedule": self.last_schedule,
             "last_error": self.last_error,
         }
+
+    def invalidate_schedule(self) -> None:
+        """Discard a schedule snapshot after a scheduler field changes via Bridge."""
+        self.last_schedule = {}
+        self.last_schedule_at = 0.0
 
     def scheduled_tasks(self) -> dict[str, str | None] | None:
         """从 Core 的调度快照里推导「已启用的任务」。
@@ -173,6 +285,7 @@ class AccountRuntime:
             finally:
                 self._websocket = None
                 self.connected = False
+                self._fail_pending_commands("core_disconnected")
 
             if self._closed:
                 return
@@ -206,6 +319,32 @@ class AccountRuntime:
         if not isinstance(data, dict):
             await self._append_log(text)
             return
+        message_type = data.get("type")
+        if message_type == "command_ack":
+            # DeepSeek-14 B1/A1: record that Core took the command so the
+            # command() timeout path can triage ack-vs-never-received.
+            ack_id = str(data.get("command_id") or "")
+            if ack_id:
+                self._acked_commands.add(ack_id)
+            await self.events.emit(
+                "task.command.accepted",
+                self.account_id,
+                payload={
+                    "command": data.get("command"),
+                    "command_id": ack_id,
+                },
+            )
+            return
+        if message_type == "command_result":
+            command_id = str(data.get("command_id") or "")
+            future = self._pending_commands.get(command_id)
+            if future is not None and not future.done():
+                future.set_result(data)
+            else:
+                # DeepSeek-14 B1/A1: receipt arrived after the HTTP request
+                # ended; park it for the query channel.
+                self._late_results[command_id] = data
+            return
         if "state" in data:
             raw_state = data["state"]
             try:
@@ -223,6 +362,16 @@ class AccountRuntime:
             self.last_schedule = data["schedule"] or {}
             self.last_schedule_at = time.time()
             await self.events.emit("schedule.updated", self.account_id, payload={"schedule": self.last_schedule})
+
+    def _fail_pending_commands(self, reason: str) -> None:
+        for command_id, future in list(self._pending_commands.items()):
+            if not future.done():
+                future.set_exception(
+                    RuntimeError(
+                        f"Core command interrupted: command_id={command_id}, reason={reason}"
+                    )
+                )
+        self._pending_commands.clear()
 
     async def _append_log(self, message: str, level: str | None = None) -> None:
         resolved = level or parse_log_level(message)

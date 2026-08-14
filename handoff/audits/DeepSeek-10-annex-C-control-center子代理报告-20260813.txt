@@ -1,0 +1,99 @@
+审查完成。以下为完整中文报告。
+
+---
+
+# control-center 未提交变更只读审查报告
+
+审查范围：`git diff HEAD(1724ce44)` 全部未提交变更 + untracked 新文件（Bridge/前端/启动器/文档）。全程只读：未改任何文件、未装依赖、未启动 Bridge/前端/Core 服务。
+
+## ① 变更盘点
+
+**Bridge（M）**
+- `main.py`：版本 1.1.4→1.1.5；新增 `CoreConflict→409` 错误映射、`_confirmed_command_result`（成功必须携带 Core 完成回执）、`_send_account_command`（WS 失败兜底 REST，stop/start 失败不再包装成功）；改名/删除先停后办且失败即中止并保留运行时与元数据；`account_action` 用 `action_lock` 串行化并返回 `{accepted,status:"completed",commands,state}`；`set_task_enabled` 走 revision+原子 PATCH、下架任务启用返回 409、停用后清旧调度快照；`patch_task_config` 要求 revision（428）/陈旧 409、If-Match 头兼容、单次原子 PATCH；`task_config` 返回 `revision`；catalog 不再缓存（防活动下架残留）；新增 `XiuxingHexun` 标签与 activity_enabled 双重门禁；`infer_window_serial` 删除“单设备即猜 serial”分支（fail-closed）。
+- `runtime.py`：`command()` 改为带 `command_id` 的请求-回执协议（5s 超时），`success:false → CommandExecutionError`（不再降级为传输失败兜底）；`_pending_commands` 在断线/关闭时全部失败化；新增 `action_lock`、`invalidate_schedule`；Bridge→Core WS 带 `ping_interval=20` 心跳。
+- `core_client.py`：新增 `CoreConflict`、`config_revision()`、`patch_values()`（原子 PATCH `/values`，time_delta>99 天拒绝）。
+- `models.py`：`TaskConfig.revision`、`ConfigPatch.revision`。
+- `tests/`：mock_core 补 revision/428/409/command_ack/command_result/REST 回执；stubs 补 `Header`；test_bridge 新增 13 个用例（428/409/stop 失败/改名保留草稿/动作串行/下架门禁等）；test_integration 全部 PATCH 用例改经 revision。
+
+**前端（大部分 untracked 新文件）**
+- `src/{api,store,emulator,views,components,fields}.jsx/js` 全新；`App.jsx` 重写（脏字段追踪、全局 WS 单例+指数退避重连、未保存守卫、409/428 保留草稿、乐观开关+失败回滚、窗口一键绑定要求 Bridge 核验 serial）；`api.js` 集中全部网络访问；`emulator.js` 纯启发式，写枚举前与 Core 真实枚举比对，识别不了写 null。
+- `tools/{mock-bridge,e2m,e2e-real}.mjs` 全新；`docs/` 3 张截图；package.json 依赖钉版本（react 18.3.1/vite 5.4.11/playwright）。
+- `vite.config.js`：dev/preview `/api` 代理到 `OAS_BRIDGE_URL`（默认 22367），`build:desktop` 模式。
+
+**启动器**
+- `start.ps1`：删除 `-Prod`/UI-claude 分支；Bridge 复用必须 `health.core_url` 与本次 CoreUrl 端点一致，否则保留旧 Bridge 另起新端口；前端登记文件 `output/control-center/frontend.json`（port/PID/StartTime/bridge_url），复用需 进程身份一致 + HTML 指纹（title+`<div id="root">`）+ bridge_url 一致，否则拒绝静默复用；停止只杀登记进程（PID+StartTime 双校验），未知进程不误杀；新增 `-HiddenWindows`。
+- `wiring.ps1`（新）：`ConvertTo-EndpointKey`（拒绝 userinfo/query/fragment）、`Test-SameEndpoint`、`Test-BridgeHealthMatchesCore`。
+- `launcher/tests/test-wiring.ps1`（新）：9 条端点等价断言，实跑通过。
+- `start-frontend.ps1` 重写（正式前端 4175 默认、`--strictPort`、设置 `OAS_BRIDGE_URL`）；`start-dev-stack.ps1` 改指正式前端、UI 端口自动顺延（4176~4475）、UI 端口冲突不再直接 throw。
+- **删除** `desktop/release/UI-claude/` 全部 24 个文件、`使用说明.html`。
+
+**文档**：`docs/contracts.md`（新，39 行契约）、`architecture.md/.mmd` 同步重写（唯一前端）、README/桌面 README/使用说明.md 同步；`check-wiring.ps1` 缓存步骤改为硬断言（第二次未快于首次即 fail）。
+
+## ② 历史声明核对表
+
+| 声明 ID | 结论 | 证据（代码位置，均在 `control-center/`） |
+|---|---|---|
+| CONTROL-ACK-001（发送成功≠执行成功；command_id 贯通；停止失败不包装成功） | ✅ 已验证 | `runtime.py:117-147` command 带 `command_id`、等 `command_result`；`runtime.py:136-140` success:false 抛 `CommandExecutionError`；`main.py:423-448` REST 兜底也强制 `success:True` 回执；改名/删除停失败即 502 且保留 runtime+元数据（`main.py:516-525,545-553`）；真 Core `module/server/script_router.py:160-218` 实现同协议（ack+result，异常回 success:False）。测试：test_bridge 29/29 含 `test_stop_failure_is_not_reported_as_accepted`、`test_action_rejects_core_execution_failure`、`test_rename_rejects_stop_failure`、`test_delete_rejects_stop_failure`；test_runtime_commands 3/3。 |
+| CONFIG-CONCURRENCY-001（428/409；前端传 revision；Bridge 转发） | ✅ 已验证 | 缺 revision→428（`main.py:687-689`，测试证明不静默代填）；陈旧→Core 409→`CoreConflict`→Bridge 409（`core_client.py:48-51`、`main.py:416-417`）；原子批 PATCH 转发 `expected_revision`（`core_client.py:184-191`，真 Core `script_router.py:384-433` 同契约，revision 为文件 sha256）；前端保存携带 body.revision + `If-Match` 头（`api.js:119-124`），409/428 保留草稿并提示（`App.jsx:527-534`），保存成功后更新 revision（`App.jsx:515-519`）。测试：`test_stale_config_revision_returns_409`、`test_missing_config_revision_returns_428`、`test_if_match_supplies_config_revision`。 |
+| LAUNCH-WIRING-001（Bridge 校验 core_url；前端登记校验 bridge_url；不一致拒绝复用） | ✅ 已验证 | `start.ps1`：`Test-BridgeHealthMatchesCore $health $CoreUrl` 才复用 Bridge（`health.core_url` 与请求 CoreUrl 端点级比较），不一致保留旧 Bridge、新起 22368-22390；前端登记文件含 `bridge_url`，复用须进程身份（PID+StartTime）+页面指纹+`Test-SameEndpoint` 三关，任一不满足清理登记重新拉起（`start.ps1` 前端段 + `wiring.ps1`）。`test-wiring.ps1` 实跑通过（大小写/尾斜杠等价、端口不同不等价、非法 URL 拒绝）。 |
+| BINDING-001 附带（不再“唯一 serial 猜测”） | ✅ 附带验证 | `main.py:99-114` 非 MuMu 一律返回 None；`test_window_serial_mapping` 断言“单设备也不能替未知模拟器猜测”。 |
+
+## ③ 前端↔Bridge 契约表（逐条核对，全部对得上）
+
+| 前端调用（api.js） | Bridge 路由 | 请求字段 | 响应字段 | 结论 |
+|---|---|---|---|---|
+| `health()` GET /health | main.py:451 | — | status/bridge/core/core_url/version | ✅ 前端另查 `mock`/`core_url` 前缀，真 Bridge 无 `mock` 键→不触发横幅 |
+| `accounts()` GET /accounts | main.py:466 | — | AccountView[]（state/state_label/connected/selected_count…） | ✅ |
+| `createAccount` POST /accounts | main.py:477 | {name,avatar,tags,device_label} | AccountView | ✅（同名 409） |
+| `patchAccount` PATCH /accounts/{id} | main.py:502 | {name,…} | AccountView | ✅（改名先停，停失败 502 不改名） |
+| `deleteAccount` DELETE | main.py:540 | — | {deleted} | ✅ |
+| `catalog()` GET /tasks/catalog | main.py:561 | — | TaskSummary[] | ✅ |
+| `accountTasks` GET …/tasks?refresh= | main.py:574 | — | TaskSummary[] | ✅ |
+| `taskConfig` GET …/config | main.py:648 | — | {task_id,title,groups{name,title,description,default,value,type,options},**revision**} | ✅ |
+| `saveTaskConfig` PATCH …/config | main.py:679 | {fields[{group,name,value,type}],revision} + If-Match | {saved,updated,**revision**}；428/409/502/503 | ✅ 前端 409/428 分支保留草稿 |
+| `setTaskEnabled` PUT …/enabled?enabled= | main.py:610 | — | TaskSummary；下架启用 409 | ✅ 前端失败回滚强制刷新 |
+| `action` POST …/actions | main.py:736 | {action: start\|stop\|restart\|refresh} | {accepted,status,commands,state} | ✅（前端不解析 body） |
+| `logs` GET …/logs?limit= | main.py:778 | — | {timestamp,level,message}[]（上限 300） | ✅ 前端默认 200 |
+| `windows` GET /windows | main.py:569 | — | {handle,title,pid,process,serial,serial_source} | ✅ 前端绑定要求 serial 非空（fail-closed） |
+| `schedule` GET …/schedule | main.py:584 | — | {running,pending,waiting,state,state_label,connected} | ✅ optional 降级 |
+| `templates` GET/POST/DELETE /templates | main.py:786-799 | TemplatePayload | []/{deleted} | ✅ null 哨兵区分接口缺失与空 |
+| `taskOrder` GET/PUT …/task-order | main.py:802-810 | {order} | []/{saved,order} | ✅ optional 降级 |
+| WS `createEventStream` /api/v1/events | main.py:813 | — | {version,seq,timestamp,type,accountId,taskId,level,payload}；首帧 bridge.ready | ✅ 事件类型与 App.jsx 消费面（log.appended/schedule.updated/task.*/account.*/bridge.ready）逐一对上；断线指数退避 1s→15s 重连 |
+
+Bridge→Core 侧反向核对：真 Core `script_router.py` 已实现 `/start`、`/stop`（均返回 `{success:True,...}`）、`/config/revision`（sha256）、`PATCH /{script}/{task}/values`（428/409/`{saved,updated,migrated,revision}`）与 WS `command_ack/command_result` 协议——Bridge 新契约与真 Core 全部吻合，REST 兜底不会因回执格式失败。
+
+## ④ 新发现
+
+| # | 级别 | 发现 | 证据 | 置信度 |
+|---|---|---|---|---|
+| F1 | 中 | **Bridge→前端事件 WS 无心跳**：`events.py` 只收不发（无 ping），前端只在 onclose 重连。半开连接（静默断网）可能要等 TCP 超时才恢复，期间界面停留在旧状态。Bridge→Core 方向有 ping（20s），不对称。 | events.py:11-60；api.js:160-202 | 高 |
+| F2 | 中 | **命令 5s 超时后 REST 重发可能双发**：WS 已送达但 Core 结果迟到→`try_command` 返回 None→REST 兜底再发 start/stop。Core `script_process.start/stop` 状态机对重复调用大体幂等（stop 无害、start 已运行则 changed=False），故实际风险低，但机制上存在。 | runtime.py:117-135 + main.py:430-448 | 高（机制）/中（影响） |
+| F3 | 低 | **contracts.md 信封规范与实现不符**：文档规定“新路由应使用 {code,data,request_id}、错误含 detail.code”，但本批新接口（/schedule、/templates、/task-order、PATCH config）均返回裸 dict/list，错误仍是 FastAPI 默认 `{"detail":str}` 无 code。文档是自设标准未被执行。 | contracts.md:11-21 vs main.py 各新路由 | 高 |
+| F4 | 低 | **mock-bridge 不实现 428/409/revision**：GET config 无 revision、PATCH 不校验。轻量 e2e 覆盖不到并发语义路径（e2e-real 可覆盖）；且 MENU/ENUMS 为硬编码副本，会随上游漂移（如 emulatorinfo_type 枚举不全）。 | mock-bridge.mjs:97-117,409-437 | 高 |
+| F5 | 低 | **成功文案与语义微偏**：`runAction` 成功提示“已发送启动命令”，而 Bridge 现在返回的是已完成执行（失败会抛 502）。 | App.jsx:447 | 高 |
+| F6 | 低 | **三层无鉴权**：Core script 路由无 token 校验（`-k/--key` 参数存在但 script_router/app.py 未见强制）、Bridge 无鉴权、前端无 token（localStorage 仅存主题/模板，无凭据）。全部仅监听 127.0.0.1 + CORS 仅本机，符合本地工具定位，但与 PRODUCT-001 授权路线尚未衔接。 | module/server/app.py、bridge/app/main.py、frontend/src/store.js | 高（无鉴权）/中（-k 实际作用点未深查） |
+| F7 | 通过 | **XSS 面干净**：前端全 React JSX，无 innerHTML/dangerouslySetInnerHTML/eval；日志/窗口标题等外部文本全部走文本节点渲染。 | 全量 grep frontend/src | 高 |
+| F8 | 通过 | **端口冲突/单实例**：start.ps1 实际绑定探测（含 Windows 保留端口）、Bridge 22368-22390 顺延、前端 4176 起顺延+strictPort；停止仅按登记（PID+StartTime）执行，误杀风险低。局限：手动另开的前端不在登记内（不会被杀也不会被复用），属设计取舍。 | start.ps1、start-dev-stack.ps1、start-frontend.ps1 | 高 |
+
+## ⑤ 测试实跑（真实输出）
+
+| 套件 | 命令 | 结果 |
+|---|---|---|
+| unittest discover | `env -u PYTHONPATH .venv/Scripts/python.exe -B -m unittest discover -s control-center/bridge/tests -v` | **3/3 通过**（test_runtime_commands：等待回执/超时/失败不降级） |
+| test_bridge.py（自建 runner，stub FastAPI+FakeCore，临时数据目录，不启动真实服务） | 直接执行 | **29/29 通过** |
+| test_integration.py | 无环境变量直接执行 | 安全预检拒绝并退出（`OAS_TEST_BRIDGE_URL/MOCK_URL` 未设，0 写操作）——按只读约束未启动 mock Core/隔离 Bridge，其 34 用例未执行 |
+| launcher/tests/test-wiring.ps1 | powershell 执行 | **通过**（9 条端点等价断言） |
+| 前端 e2e.mjs/e2e-real.mjs | 未运行 | 需 Playwright+启动 mock/隔离服务，违反“不启动服务”约束 |
+
+## ⑥ 通过项 / 无法判定项
+
+**通过项**：三项历史声明（CONTROL-ACK-001 / CONFIG-CONCURRENCY-001 / LAUNCH-WIRING-001）全部在代码与测试中落地且与真 Core 实现吻合；前端↔Bridge 契约 16 组调用零失配；删除 UI-claude 后无残留引用（全树仅历史性提及）；Bridge 1.1.5/前端 0.2.0 版本与变更一致；架构图/README/使用说明/contracts 相互同步（唯一前端、端口顺延、隔离端口约定一致）；CORS 测试放行 4175/任意本机端口与实现一致。
+
+**无法判定项**：
+1. 428/409 并发路径的**真实多窗口并发**（仅离线单进程测试覆盖，需两前端同时编辑——handoff 中本就标注“待正式并发实测”）。
+2. `XiuxingHexun` 的 `activity_enabled` 分组字段名与真 Core schema 的运行时一致性（`tasks/XiuxingHexun/config.py` 存在，但未跑真 Core 验证）。
+3. 真 Core `-k/--key` 鉴权参数的实际生效位置（本次未深挖 home_router/pywebio 入口）。
+4. F2 双发风险在真 Core `script_process.start` 上的实际幂等行为（需实机/集成注入迟到回执验证）。
+5. 前端 e2e（Playwright）与 test_integration 34 用例、mock-bridge 层契约——均需启动服务，按只读约束未执行。
+
+**未修改任何文件；测试仅产生临时目录（test_bridge 自建 temp mkdtemp），未触碰项目数据。**

@@ -46,6 +46,8 @@ class GameUiAssets:
 	I_CHECK_MAIN = RuleImage(roi_front=(807,108,76,45), roi_back=(49,98,1033,61), threshold=0.8, method="Template matching", file="./tasks/GameUi/page/page_check_main.png")
 	# 庭院卷轴关闭标识 
 	I_MAIN_SCROLL_CLOSE = RuleImage(roi_front=(1181,634,28,39), roi_back=(1162,595,77,112), threshold=0.8, method="Template matching", file="./tasks/GameUi/page/page_main_scroll_close.png")
+	# 长时间无操作后的保护界面返回箭头（当前版本新增）
+	I_MAIN_PROTECTION_BACK = RuleImage(roi_front=(24,24,64,64), roi_back=(0,0,100,100), threshold=0.75, method="Template matching", file="./tasks/GameUi/page/page_main_protection_back.png")
 	# 【二开 handoff/22】庭院会随时间/活动换皮，「探索」灯笼配色变化很大：
 	#   白天模板在夜间皮肤下最高只有 0.561，而阈值是 0.8 -> 永远进不去探索，整条玩法链路断掉。
 	# 解法不是降阈值(离噪声 0.363 太近)，而是用【多模板】：白天一张、夜间一张，取最高分。
@@ -167,7 +169,7 @@ class GameUiAssets:
 	# description 
 	I_MAIN_GOTO_COLLECTION = RuleImage(roi_front=(70,590,36,41), roi_back=(70,590,120,100), threshold=0.7, method="Template matching", file="./tasks/GameUi/page/page_main_goto_collection.png")
 	# description 
-	I_CHECK_RECORDS = RuleImage(roi_front=(269,71,55,50), roi_back=(269,71,55,50), threshold=0.8, method="Template matching", file="./tasks/GameUi/page/page_check_records.png")
+	I_CHECK_RECORDS = RuleImage(roi_front=(269,71,55,50), roi_back=(269,71,55,50), threshold=0.8, method="Template matching", file="./tasks/GameUi/page/page_check_records.png|./tasks/GameUi/page/page_check_records_current.png")
 	# description 
 	I_CHECK_ONMYODO = RuleImage(roi_front=(1166,117,84,547), roi_back=(1166,117,84,547), threshold=0.8, method="Template matching", file="./tasks/GameUi/page/page_check_onmyodo.png")
 	# description 
@@ -282,5 +284,3 @@ class GameUiAssets:
 	O_HOME_EXPLORE = RuleOcr(roi=(310,105,858,194), area=(0,0,100,100), mode="Full", method="Default", keyword="探索", name="home_explore")
 	# Ocr-description 
 	O_NEW = RuleOcr(roi=(0,0,100,100), area=(0,0,100,100), mode="Single", method="Default", keyword="", name="new")
-
-

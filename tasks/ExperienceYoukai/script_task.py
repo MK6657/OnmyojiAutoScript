@@ -115,7 +115,7 @@ class ScriptTask(GameUi, GeneralBattle, GeneralRoom, GeneralInvite, SwitchSoul, 
             self.close_buff()
 
         self.set_next_run(task='ExperienceYoukai', success=True, finish=False)
-        raise TaskEnd('ExperienceYoukai')
+        raise TaskEnd.completed('ExperienceYoukai')
 
 if __name__ == '__main__':
     from module.config.config import Config

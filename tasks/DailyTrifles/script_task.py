@@ -40,7 +40,7 @@ class ScriptTask(GameUi, Summon, DailyTriflesAssets):
         if con.store_sign or con.buy_sushi_count > 0:
             self.run_store()
         self.set_next_run('DailyTrifles', success=True, finish=False)
-        raise TaskEnd('DailyTrifles')
+        raise TaskEnd.completed('DailyTrifles')
 
     def run_one_summon(self):
         self.ui_get_current_page()

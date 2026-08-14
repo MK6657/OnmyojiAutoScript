@@ -51,7 +51,10 @@ class ExplorationAssets:
 
 	# Click Rule Assets
 	# 点击设置按钮 
-	C_CLICK_SETTINGS = RuleClick(roi_front=(55,662,21,21), roi_back=(55,662,21,21), name="click_settings")
+	# The current client puts the settings control at the bottom edge.  Keep
+	# this fallback aligned with the image rule below; the old y=662 ROI was
+	# above the real control and caused repeated no-op clicks.
+	C_CLICK_SETTINGS = RuleClick(roi_front=(37,692,53,26), roi_back=(37,692,53,26), name="click_settings")
 	# 选中候补出战 
 	C_CLICK_STANDBY_TEAM = RuleClick(roi_front=(545,222,506,100), roi_back=(545,222,506,100), name="click_standby_team")
 	# 点击全部式神按钮 
@@ -68,6 +71,8 @@ class ExplorationAssets:
 	C_CLICK_ROTATE_4 = RuleClick(roi_front=(921,590,21,21), roi_back=(921,590,21,21), name="click_rotate_4")
 	# 随机点 
 	C_SAFE_RANDOM = RuleClick(roi_front=(0,0,111,12), roi_back=(0,0,111,12), name="safe_random")
+	# Safe area below the discovery modal and above the bottom controls.
+	C_DISCOVERY_DISMISS = RuleClick(roi_front=(520,575,240,35), roi_back=(520,575,240,35), name="discovery_popup_dismiss")
 
 
 	# Image Rule Assets
@@ -109,6 +114,9 @@ class ExplorationAssets:
 	I_RED_CLOSE = RuleImage(roi_front=(1027,129,41,42), roi_back=(1021,121,54,55), threshold=0.6, method="Template matching", file="./tasks/Exploration/res/res_red_close.png")
 	# description 
 	I_E_EXIT_CONFIRM = RuleImage(roi_front=(694,380,163,49), roi_back=(694,380,163,49), threshold=0.8, method="Template matching", file="./tasks/Exploration/res/res_e_exit_confirm.png")
+	# Current skins can miss the legacy exit-confirm template.  Keep a narrow
+	# OCR fallback so shared page recovery closes this modal before its back arrow.
+	O_E_EXIT_CONFIRM_TEXT = RuleOcr(roi=(735,378,100,34), area=(735,378,100,34), mode="Full", method="Default", keyword="", name="exploration_exit_confirm_text")
 	# 宝箱 
 	I_TREASURE_BOX_CLICK = RuleImage(roi_front=(34,386,47,37), roi_back=(2,130,135,406), threshold=0.65, method="Template matching", file="./tasks/Exploration/res/res_treasure_box_click.png")
 	# 困28滚动到最后 
@@ -145,6 +153,9 @@ class ExplorationAssets:
 	O_REALM_RAID_NUMBER = RuleOcr(roi=(739,11,78,37), area=(739,11,78,37), mode="DigitCounter", method="Default", keyword="", name="realm_raid_number")
 	# （点出困难28时候）探索右上角 突破卷的数量 
 	O_REALM_RAID_NUMBER1 = RuleOcr(roi=(936,10,82,36), area=(936,10,82,36), mode="DigitCounter", method="Default", keyword="", name="realm_raid_number1")
+	O_E_AUTO_CHALLENGE = RuleOcr(roi=(1020,650,180,70), area=(1020,650,180,70), mode="Single", method="Default", keyword="自动挑战", name="e_auto_challenge")
+	# The discovery modal title stays near the center on current exploration skins.
+	O_E_DISCOVERY_TITLE = RuleOcr(roi=(500,160,300,110), area=(500,160,300,110), mode="Full", method="Default", keyword="", name="e_discovery_title")
 
 
 	# Swipe Rule Assets
@@ -160,5 +171,3 @@ class ExplorationAssets:
 	S_SWIPE_SHIKI_TO_LEFT = RuleSwipe(roi_front=(890,587,21,21), roi_back=(351,584,21,21), mode="default", name="swipe_shiki_to_left")
 	# 滑动一个式神的宽度 
 	S_SWIPE_SHIKI_TO_LEFT_ONE = RuleSwipe(roi_front=(977,582,21,21), roi_back=(889,584,21,22), mode="default", name="swipe_shiki_to_left_one")
-
-

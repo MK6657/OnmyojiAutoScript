@@ -1,0 +1,139 @@
+# 只读审查报告：D:\OSAyys 最新未提交工作（tasks/XiuxingHexun + config 事务层 + script_router 批量路由 + sub_ocr）
+
+审查纯只读完成：未改任何文件、未 commit/checkout/stash、未装依赖、未启动任何服务/游戏。仅执行了用户明确授权的测试运行（`env -u PYTHONPATH .venv/Scripts/python.exe -B`）。
+
+---
+
+## ① 新模块功能盘点（能力 → file:line → 状态）
+
+**tasks/XiuxingHexun/（全新任务模块，全部 untracked）**
+
+| 能力 | 位置 | 状态 |
+|---|---|---|
+| 状态机常量 | `script_task.py:18-28`（`XiuxingHexunState`） | 🟢 定义但**从未被引用**（死代码，见②） |
+| 票务/搜索决策枚举 | `script_task.py:31-41` | 🟢 被 `_choose_search_decision` 使用 |
+| run() 主循环 | `script_task.py:61-110` | 🟢 循环体每轮都经 `_finish`/`_fail` 终止，无裸死循环尾坠 |
+| 战斗恢复（重启后） | `_resume_active_battle:112-130`、`_recover_existing_result:132-142` | 🟢 记录 ABORTED/DEFEAT/VICTORY |
+| 入场链路 | `_ensure_courtyard_or_activity:216-231`、`_enter_activity:233-258` | 🟢 有 20s 页面超时门禁 |
+| 票务 OCR 读取 | `_read_ticket_count:260-303` | 🟢 只读左侧免费票数；`"O"→0` 与 digit 校验抗误判 |
+| 稳定零票确认（3 采样） | `_ticket_count_is_stably_zero:339-390` | 🟢 不假设票数递减、拒绝对比历史值 |
+| 搜索决策 | `_choose_search_decision:392-408` + `_search:464-526` + `_open_own_card:410-424` | 🟢 防队友卡：非「自己发现」徽标卡拒开 |
+| 预设链（4 种回退） | `_prepare_named_preset:635-715`、`_select_activity_preset_group:609-633`、`_select_legacy_named_preset_fallback:553-607`、`preapply_preset_team_from_records` | 🟢 命名校验 `_preset_markers_match:528-541` 阻断改名卡误上阵 |
+| 出战/续战 | `_start_challenge:717-728`、`_continue_to_activity:730-743`、`battle_wait`（限时 600s）`:53-59` | 🟢 每步均带 deadline 且失败即 raise |
+
+- `config.py`（39 行）：`XiuxingHexun(ConfigBase)`，默认预设 `【修行合训】顶配/每月活动`，`max_challenges ge=0 le=100`。
+- `availability.py`（8 行）：`OAS_XIUXING_HEXUN_ENABLED` 环境开关。
+- `assets.py`（215 行）：RuleImage/RuleOcr/RuleClick 全套，多模板 `|` 语法（`battle_prepare_button.png|...latest.png`），ROI/点击区均有注释说明防误点。
+
+**config 事务层（新文件 config_transaction.py 185 行）+ config 系列 diff**：见②③。
+**script_router.py 批量路由 diff（462 行）**：见②。
+**sub_ocr.py diff**：仅删去文件末尾一个空行（`diff` 显示 `-` 一行），无行为变更，🟢 平凡改动。
+
+---
+
+## ② 边界问题清单（按严重度）
+
+### 🟡-1 | 主循环无计数上限时，唯一终态完全依赖 OCR 票务耗尽判定
+- **证据**：`script_task.py:87` `while max_challenges == 0 or completed < max_challenges:`；`config.py:25-31` 默认 `max_challenges=0`（"continue until activity reports no tickets"）。
+- **根因**：`max_challenges==0` 使循环退化为无上限；唯一正常出口是 `_search` 返回 `EMPTY`（`script_task.py:89-90`），而 EMPTY 依赖 `I_SEARCH_AVAILABLE` 模板失配 + 稳定零票 OCR。若活动皮肤/分辨率导致搜索按钮模板仍匹配（代码注释 `:426-434` 反复讨论该场景），任务只能靠 OCR 零票确认兜底，任何 OCR 把非零读成零的抖动都被 3 采样拦截，反之把 0 读成非 0 且搜索按钮仍匹配则可能空转。
+- **置信度**：待实机（每轮子步骤均有 deadline + 失败即 raise，**不构成「break 落进尾部无条件 raise」类的 P1 回归**，该历史模式在 743 行内逐 break 排查未发现：`break` 仅出现在 `:376/380/654/658`，均无尾坠 raise）。
+- **最小修复**：建议对「搜索无结果且非零不稳定」路径增加连续空转上限计数，或文档明示 `max_challenges` 应为活动限期内保守值。
+
+### 🟡-2 | `_recover_existing_result` 单凭 VICTORY 标题模板即记 VICTORY
+- **证据**：`script_task.py:132-142`；模板文件 `res/battle_result_victory_title.png`（`assets.py:111`）。
+- **根因**：只要 `I_RESULT`（victory_title 模板，threshold 0.8）匹配就 `record_battle_result(VICTORY, recovered=True)`。若重启时结算页实际是战败，模板应不匹配（标题不同），会落空并继续走安全 `_fail`；但若战败页局部与胜利标题相似度 ≥0.8，则可能误记胜利并 `completed+=1`。
+- **置信度**：待实机（模板为胜利专用标题，误匹概率低——实测该模板均值 75、非黑底，见⑤）。
+- **最小修复**：可增加 DEFEAT 标题负模板互斥校验后再生效 recovered VICTORY。
+
+### 🟡-3 | `Config.schedule()` 存在 __setattr__ 自动保存与显式 save 重复触发
+- **证据**：`module/config/config_model.py:191-199`（`__setattr__` → `self.save()`，已加 `key.startswith("_")` 短路保护）；`module/config/config.py:212-254` `schedule()` 中 `scheduler.next_run = when`（触发自动 save）后再 `self.save()`。
+- **根因**：这是历史上 write amplification 的延续。实际效果：`schedule()` 内 `reload()` 重建 model（baseline=最新磁盘态），赋值触发一次 merge 写入，随后显式 `save()` 因 baseline==current 走 `merge_changed_json` 早退（`config_transaction.py:156-157` 无更新直接 return），**二次调用是冗余读+无操作，并非双重原子写**。但任何对 model 连续多字段赋值仍会产生 N 次 save。
+- **置信度**：高概率（读代码可证早退逻辑）。
+- **最小修复**：在 `save()` 内或 `schedule()` 内聚合单次 merge 提交，避免依赖 __setattr__ 隐式保存的副作用语义。
+
+### 🟡-4 | 批量 PATCH 路由有 revision 门禁，旧单值 PUT 路由（非 XiuxingHexun 分支）无 revision 门禁
+- **证据**：`script_router.py` `script_set_values`（PATCH）强制 `expected_revision`（428/409）；`script_set_value`（PUT，`:393-397` 非 xiuxing_hexun 分支）仍走 `mm.config_cache(...).model.script_set_arg` → 仅靠 `ConfigModel.save()` 的 merge（无 HTTP 层 428/409）。
+- **根因**：两条写入口的并发/校验语义不对称；旧路由写同一字段时靠 3-way merge 兜底，但对调用方不报冲突。
+- **置信度**：已证实（diff 可读）。
+- **最小修复**：让 PUT 单值路由也复用 `apply_json_patch` + revision 检查，或明确旧路由为兼容遗留。
+
+### 🟡-5 | 服务器测试与真实 Core 共享账号租约文件，测试环境会互相污染
+- **证据**：`module/server/tests/test_script_process.py:64-95` `ScriptProcessLifecycleTest` 不 mock `AccountRunLease`，直接 `ScriptProcess('oas1')`；租约路径派生自 `Path.cwd().resolve()::oas1`（`script_process.py:47-49`），落到真实 `Temp/oas-account-leases/b0952a...lock`。实跑发现该锁被一个仍在运行的 python.exe（PID 5936 等）持有（`PermissionError: [Errno 13]`），9 个生命周期用例全部 `AccountLeaseError: account lease held by another Core: oas1`。
+- **根因**：租约作用域含真实 cwd + 真实账号名；本机有 ~10 个无关 python.exe 进程残留，锁未随进程退出释放（或属另一次运行的 Core）。
+- **置信度**：已证实（实测 9 ERROR 均为此因）。
+- **最小修复**：该测试使用局部临时 cwd/独立账号名并 mock 租约；同时核对租约 release 是否在 Core 崩溃路径遗漏。
+
+### 🟢-6 | 死代码 / 无引用的状态类与资产别名
+- `script_task.py:18-28` `XiuxingHexunState`（纯字符串常量，非 Enum）在任务逻辑中零引用；`assets.py:78-79` `I_SEARCH_RESULT = I_CHALLENGE_PAGE`、`I_BATTLE_ENTRY = I_CHALLENGE_PAGE` 别名未被使用。仅 `test_flow.py:16-19` 用 `XiuxingHexunState` 做稳定性断言。
+- **置信度**：已证实（grep 无引用）。
+
+### 🟢-7 | 批量路由布尔解析对任意非空字符串返回 True
+- `script_router.py _parse_config_value` `boolean` 分支：对非 "true/1/false/0" 的字符串走 `bool(value)` → `bool("no")==True`。与旧实现完全一致，非回归，仅记录。
+
+---
+
+## ③ 框架契约合规性
+
+### TaskEnd（TASKEND-001）✅ 合规
+- `_finish`（`:144-147`）：先 `set_next_run(task="XiuxingHexun", success=True, finish=True)` 再 `raise TaskEnd.completed(reason, statistics={"challenges": ...})` —— 结构化 outcome/reason/statistics 完整，success 判定由 `module/exception.py:23` `SUCCESS_OUTCOMES={'victory','returned'}` 保证。
+- `_stop`（`:149-152`）：`raise TaskEnd.stopped(...)`，outcome='stopped'→FAILURE_ACTION=PRESERVE（`exception.py:59-65`），**不重置不大于连续失败计数**，也不写 next_run（禁用态不推进调度）——语义正确。
+- `_fail`（`:163-166`）：`raise GameStuckError(reason)`，非 TaskEnd。经 `script.py:553-563` 捕获 → `TaskExecutionResult.failed(outcome='game_stuck')` → INCREMENT 失败计数 → `task_call('Restart')` + 10s 重启游戏。**失败治理闭环成立**（连续 3 次 `script.py:692` 退出）。
+- run() 从不裸 return True/False，始终 raise 终结，`script.py:530 run()` 调用点契约匹配。
+
+### set_next_run / 越权（SCHED-AUTH-001）✅ 合规
+- XiuxingHexun 唯一写调度发生在 `_finish`，且**只写自己** `task="XiuxingHexun"`（`:146`），无任何跨任务 set_next_run/config 改动。
+- 授权白名单 `_CROSS_TASK_SCHEDULE_ALLOWLIST`（`config.py:22-40`）**未收录 xiuxing_hexun 作为 source**；即使误写也会被 `_assert_schedule_authorized`（`config.py:48-59`）以 `ScriptError('not authorized')` 拦截。`test_schedule_contract.py:100-155` 覆盖越权拒绝矩阵（含跨任务矩阵）全部通过。
+
+### 失败计数 / 退出语义 ✅
+- 成功→RESET、失败(GameStuckError)→INCREMENT、禁用→PRESERVE，三者严格区分；`_finish` 使用 `finish=True` 以当前时间为基准。
+
+### 死循环 deadline 防护 ✅（针对 quit_explore 历史 P1 模式）
+- run() 循环体每轮有界：`_search/_prepare_named_preset/_start_challenge/_continue_to_activity` 内部全部经 `_wait_for/_required_click`（`time.monotonic + timeout`）或 `time.monotonic + BATTLE_TIMEOUT(600)` 封顶，超时即 `_fail` raise；无「break 落进尾部无条件 raise/无限 continue」分支。唯一长期依赖点见 ②-1。
+
+---
+
+## ④ 测试实跑结果（真实输出）
+
+> 全部经 `env -u PYTHONPATH .venv/Scripts/python.exe -B` 运行，测试均使用 `tempfile.TemporaryDirectory`/临时 cwd，未写生产 `config/oas1.json`（config 事务/批量路由测试自行 `shutil.copy2` 至临时目录）。
+
+| 套件 | 结果 | 备注 |
+|---|---|---|
+| `tasks/XiuxingHexun/tests/test_flow.py` | **32/32 OK**（4.1s） | 纯决策/ROI 边界/OCR mock；**无真机、无 run() 全流程** |
+| `module/config/tests/`（discover，3 文件） | **18/18 OK**（0.16s） | 含 428/409/并发 merge/批量原子回滚/跨任务授权矩阵 |
+| `module/server/tests/`（discover，整目录） | **39 跑 / 9 ERROR，30 OK** | 9 个 ERROR **全部**落在 `test_script_process.py::ScriptProcessLifecycleTest`，根因＝真实 `oas1` 账号租约被本机残留 python.exe 进程持有（`AccountLeaseError`，见 ②-5），**非产品回归、非被测代码缺陷**；批量路由/迁移/命令协议/账号变更守卫等 30 个用例全部通过 |
+
+- `test_config_batch_routes.py`：428 缺 revision、409 陈旧 revision 且不写入、If-Match 头、禁用态保留未知扩展字段、全局活动开关拒绝启用——全部通过。
+- `test_xiuxing_hexun_migration.py`：缺失任务父节点显式重建 + 单 revision 原子写 + 未知字段保留——通过。
+- `test_xiuxing_hexun_scheduler.py`：活动开关/全局开关均可从调度器移除任务——通过。
+
+---
+
+## ⑤ 通过项
+
+1. **资产风格与模板健康度**：全部 13 个模板经灰度统计（self 实算），均非黑底（dark<30 占比 ≤0.17，bright>200 普遍 0.07~0.51），**不触发历史「黑色背景→TM_CCOEFF_NORMED 天花板 <0.9」教训**。threshold 0.8（I_PREPARE 0.75）与 RealmRaid/GeneralBattle 风格一致；坐标/点击区注释清楚标注防误点。
+2. **防队友卡误战**：`I_OWN_DISCOVERED_BADGE` 显式徽标 + `_choose_search_decision`「搜索优先、仅开自己发现」策略，测试逐例覆盖（`test_flow.py:74-124`）。
+3. **票务零读防抖 + O→0 抗干扰**：`_read_ticket_count:299-302` 对 letter-O→0 单独拦截；3 采样稳定确认不假设递减（`test_flow.py:227-325` 覆盖）。
+4. **事务层 revision 语义达标**：`file_revision`=内容 SHA256，`apply_json_patch` 在 FileLock 内校验 → 429 缺版/409 陈旧不写、验证失败整体回滚（`test_config_transaction.py:29-75` 逐项通过）。`merge_validated_existing` 保留未知扩展字段（`test_xiuxing_hexun_migration.py:68-79`）。
+5. **SCHED-AUTH/TASKEND 契约**：见③，全部合规且有测试锚定。
+6. **sub_ocr 改动平凡**（仅尾部空行删除），无行为变更。
+7. **config_menu/config_manual**：XiuxingHexun 以环境开关条件性入列「Activity Task」，未破坏既有任务列表。
+
+---
+
+## ⑥ 无法判定项
+
+1. **run() 端到端编排未验证**：test_flow.py 全部为 SimpleNamespace 纯逻辑/坐标断言 + `grep` 确认无真实 device/进程调用，run()→搜索→预设→出战→续战的完整点击链零测试覆盖，**只能靠实机矩阵（胜/负/卡结算/人工停/重启恢复）补证**。
+2. **模板阈值 0.8 在真实游戏/皮肤/分辨率下的命中率与误匹**（尤其 `battle_result_victory_title.png` 对 DEFEAT 页的互斥性，见 ②-2）——待实机。
+3. **GUI 渲染**：`config_model.py` schema 生成新增「标量任务控件单字段分组」分支（`:353-370`）与 `$ref` 分支重排，未实机核对控制台菜单展现在前端是否符合预期。
+4. **`merge_changed_json` 新增键的并发写**：两个写者各自新增不同键互为兼容（`_collect_changed_paths` 对新增路径跳冲突检查 `config_transaction.py:167`），但两写者同时新增**同名**新键会静默 last-writer-wins（无冲突检测）——影响低，未列为问题，仅记录。
+5. **9 个租约 409 的根因归属**：确认是环境态（残留 python.exe 锁），但未进一步判定锁是否本应随某次 Core 退出而释放（可能揭示 `AccountRunLease.release` 在崩溃路径的真问题）——需要非只读的进程排查，本审查未越权动作。
+
+---
+
+## 总结
+
+- **做了什么**：只读通读 tasks/XiuxingHexun 743+215+39+8+438 行、config_transaction.py 185 行、config/config_model/config_manual/config_menu/script_router/sub_ocr 全量 git diff、exception.py/base_task.py/script.py 契约链；实算 13 个模板灰度特征；实跑 3 个测试套件。
+- **主要发现**：无 🔴 已证实缺陷；5 个 🟡（OCR 无上限终态依赖、VICTORY 标题单凭恢复、schedule 自动保存重复触发、PUT 路由无 revision 门禁、测试与真实 Core 共享租约）+ 若干 🟢；TASKEND/SCHED-AUTH/失败治理三大契约**全部合规**。
+- **测试实况**：flow 32/32、config 18/18、server 30/39（9 个 ERROR 全为租约环境污染，非代码缺陷）。
+- **创建/修改文件**：无（严格只读，未改任何文件）。
+- **遇到的问题**：`module/server/tests` 中 `ScriptProcessLifecycleTest` 因本机残留 python.exe 持有真实 `oas1` 租约锁导致 9 ERROR（环境态，已留证）；其余全部通过。

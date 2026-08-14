@@ -81,6 +81,16 @@ def field_value(account: str, task: str, group: str, name: str):
     return next(f["value"] for f in config["groups"][group] if f["name"] == name)
 
 
+def patch_config(account: str, task: str, fields: list[dict]) -> tuple[int, object]:
+    status, config = call("GET", f"{BRIDGE}/accounts/{account}/tasks/{task}/config")
+    if status != 200:
+        return status, config
+    return call("PATCH", f"{BRIDGE}/accounts/{account}/tasks/{task}/config", {
+        "revision": config.get("revision"),
+        "fields": fields,
+    })
+
+
 def require_isolated_environment() -> None:
     """Fail before the first mutation unless Bridge is explicitly test-only."""
     if not BRIDGE_ROOT or not MOCK:
@@ -162,9 +172,9 @@ def t_snapshot_beats_scan():
 
 @check("date_time 规范化：16 位输入被补秒后 Core 严格解析通过")
 def t_datetime_normalize():
-    status, body = call("PATCH", f"{BRIDGE}/accounts/oas1/tasks/Orochi/config", {
-        "fields": [{"group": "scheduler", "name": "next_run", "value": "2026-07-27T09:30", "type": "date_time"}],
-    })
+    status, body = patch_config("oas1", "Orochi", [
+        {"group": "scheduler", "name": "next_run", "value": "2026-07-27T09:30", "type": "date_time"},
+    ])
     expect(status == 200 and body["saved"], f"{status} {body}")
     stored = field_value("oas1", "Orochi", "scheduler", "next_run")
     expect(stored == "2026-07-27 09:30:00", f"存储值 {stored!r}")
@@ -172,9 +182,9 @@ def t_datetime_normalize():
 
 @check("time_delta 规范化：'0 6:0:0' 落库为 '00 06:00:00'")
 def t_delta_normalize():
-    status, body = call("PATCH", f"{BRIDGE}/accounts/oas1/tasks/Orochi/config", {
-        "fields": [{"group": "scheduler", "name": "success_interval", "value": "0 6:0:0", "type": "time_delta"}],
-    })
+    status, body = patch_config("oas1", "Orochi", [
+        {"group": "scheduler", "name": "success_interval", "value": "0 6:0:0", "type": "time_delta"},
+    ])
     expect(status == 200, f"{status} {body}")
     stored = field_value("oas1", "Orochi", "scheduler", "success_interval")
     expect(stored == "00 06:00:00", f"存储值 {stored!r}")
@@ -182,23 +192,23 @@ def t_delta_normalize():
 
 @check("time_delta 两位天数：30 天能正确存（Core C1 修复），100 天被拒绝")
 def t_delta_range():
-    status, body = call("PATCH", f"{BRIDGE}/accounts/oas1/tasks/Orochi/config", {
-        "fields": [{"group": "scheduler", "name": "success_interval", "value": "30 00:00:00", "type": "time_delta"}],
-    })
+    status, body = patch_config("oas1", "Orochi", [
+        {"group": "scheduler", "name": "success_interval", "value": "30 00:00:00", "type": "time_delta"},
+    ])
     expect(status == 200, f"30 天应当成功: {status} {body}")
     stored = field_value("oas1", "Orochi", "scheduler", "success_interval")
     expect(str(stored).startswith("30"), f"30 天没存对(可能 Core 未打 C1 补丁): {stored!r}")
-    status, body = call("PATCH", f"{BRIDGE}/accounts/oas1/tasks/Orochi/config", {
-        "fields": [{"group": "scheduler", "name": "success_interval", "value": "100 00:00:00", "type": "time_delta"}],
-    })
+    status, body = patch_config("oas1", "Orochi", [
+        {"group": "scheduler", "name": "success_interval", "value": "100 00:00:00", "type": "time_delta"},
+    ])
     expect(status == 502 and "99 天" in str(body), f"100 天应被拒: {status} {body}")
 
 
 @check("非法枚举值：Core 返回 false → Bridge 502 拒绝（不再假成功）")
 def t_enum_rejected():
-    status, body = call("PATCH", f"{BRIDGE}/accounts/oas1/tasks/Script/config", {
-        "fields": [{"group": "device", "name": "screenshot_method", "value": "bogus_method", "type": "enum"}],
-    })
+    status, body = patch_config("oas1", "Script", [
+        {"group": "device", "name": "screenshot_method", "value": "bogus_method", "type": "enum"},
+    ])
     expect(status == 502, f"应 502，实际 {status} {body}")
     expect("拒绝" in str(body), f"错误文案不对: {body}")
     stored = field_value("oas1", "Script", "device", "screenshot_method")
@@ -207,9 +217,9 @@ def t_enum_rejected():
 
 @check("格式非法的 date_time：Core 400 → Bridge 502 且带原因")
 def t_bad_datetime():
-    status, body = call("PATCH", f"{BRIDGE}/accounts/oas1/tasks/Orochi/config", {
-        "fields": [{"group": "scheduler", "name": "next_run", "value": "not-a-date", "type": "date_time"}],
-    })
+    status, body = patch_config("oas1", "Orochi", [
+        {"group": "scheduler", "name": "next_run", "value": "not-a-date", "type": "date_time"},
+    ])
     expect(status == 502 and "Argument type error" in str(body), f"{status} {body}")
 
 
@@ -294,9 +304,9 @@ def t_core_fault():
     try:
         _, health = call("GET", f"{BRIDGE}/health")
         expect(health["core"] == "offline", f"health 未反映故障: {health}")
-        status, body = call("PATCH", f"{BRIDGE}/accounts/oas1/tasks/Orochi/config", {
-            "fields": [{"group": "scheduler", "name": "priority", "value": 4, "type": "integer"}],
-        })
+        status, body = patch_config("oas1", "Orochi", [
+            {"group": "scheduler", "name": "priority", "value": 4, "type": "integer"},
+        ])
         expect(status in (502, 503), f"应 5xx，实际 {status} {body}")
     finally:
         call("POST", f"{MOCK}/__mock__/fault?on=false")

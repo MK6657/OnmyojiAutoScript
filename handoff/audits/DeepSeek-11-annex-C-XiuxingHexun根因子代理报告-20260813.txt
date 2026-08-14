@@ -1,0 +1,56 @@
+# 任务三报告：XiuxingHexun 凌晨三连败未触发禁用 —— 根因定位（DeepSeek-11，只读）
+
+一句话结论：三连败未触发禁用的直接根因不是 F-3（GotoMain 重置计数），而是 2026-08-13 凌晨 Core/web 服务两次重启（05:42:35、05:56:11）连带重启了工作进程，内存中的 failure_record 被清空，三次失败（05:36、05:46、06:00）分别落在三个不同的 worker 进程里，每次计数都只到 1，failed >= 3（script.py:692）从未满足。搜索失败链本身的根因是 OCR 把票数「0」误读为字母「O」（非数字），被 O→0 防护刻意拒信 → ticket_count=None → 仍点击搜索 → 无结果 → GameStuckError；06:04 读到真「0」才正常收工。
+
+## 1. 失败计数逻辑逐行核对（F-3 判定）
+
+调用顺序与文件:行号（当前磁盘代码；运行期版本行号有差异，见 §5）：
+
+1. script.py:59 — self.failure_record = {}，进程内存字典，按任务名分键（Script.__init__，每进程仅初始化一次）。
+2. script.py:516-602 run() — 任务执行。GameStuckError 分支 script.py:553-563：logger.error → save_error_log() → _schedule_failure_retry（→config.task_delay(success=False)，script.py:487-503）→ task_call('Restart') → sleep(10) → 返回 TaskExecutionResult.failed(outcome='game_stuck')。
+3. module/exception.py:68-74 — TaskExecutionResult.failed → failure_action=INCREMENT；TaskEnd.completed（194-211）→ RESET；stopped/deferred → PRESERVE。三态枚举 module/exception.py:5-10；next_failure_count（32-38）：RESET→0，INCREMENT→+1，PRESERVE→不变。
+4. script.py:691 — failed = self._record_task_result(task, result)；script.py:505-514 — previous = self.failure_record.get(task, 0)（task 即本轮刚跑完的任务名）→ next_failure_count(previous) → 写回 failure_record[task]。
+5. script.py:692-707 — failed>=3 → CRITICAL + 推送 + 可选关模拟器 + exit(1)。
+6. script.py:709-725 — failure_action 三态分发：RESET/PRESERVE/handle_error 均 continue，不触碰其他任务键。
+7. GotoMain：tasks/GotoMain/script_task.py:25 — TaskEnd.completed('Goto main end') → RESET，只作用于 failure_record['GotoMain']。
+8. module/config/config.py:258-302 update_scheduler / 385-478 task_delay — 只改 scheduler.next_run，不读写失败计数。
+
+F-3 判定：不是代码事实。「GotoMain 成功 → XiuxingHexun 计数 RESET」不成立：GotoMain 的 failure_action=reset 只清 GotoMain 键（script.py:511 按 task 名取键）。反证（已证实）：08-12 22:48–22:56 同一 worker 内三次失败（22:50 preset、22:54 search、22:56 search），每次失败后同样穿插 GotoMain 成功（22:50:28、22:55:07，日志均 TASK_END outcome=returned success=True failure_action=reset），计数仍 1→2→3，log/2026-08-12_oas1.txt 22:56:43.458 script.py:0693 CRITICAL "Task XiuxingHexun failed 3 or more times." → 0698 Request human takeover → exit(1)（2026-08-12_server.txt 22:56:43.900 Script process exited exitcode=4294967295=-1）。
+
+前序报告把「GotoMain 后 failure_action=reset 日志」误读为 XiuxingHexun 计数被重置；实际重置计数的是 worker 进程重启（§3）。
+
+## 2. OCR 0→O 链条（完整代码路径 + 06:04 为何成功）
+
+- 票数 ROI：tasks/XiuxingHexun/assets.py:117-124 O_TICKET_COUNT = RuleOcr(roi=(970,5,55,42), mode="Digit")（55×42px 小 ROI，stylized 游戏字体）。
+- 读取函数 script_task.py:260-303 _read_ticket_count()：取 model.ocr_single_line(roi裁剪图) 得 raw_text 原文 + score（source_text 保存原文，行 274）→ contains_digit（行 275）→ 接受判定 score>=rule.score(0.6) 或 (score>=min_score(0.3) 且含数字)（行 276-278，阈值 module/ocr/base_ocr.py:51-52）→ rule.after_process(raw_text)（module/ocr/sub_ocr.py:97-117 Digit.after_process，行 102 'O':'0' 字母→数字替换后只留数字转 int）→ re.findall(r"d+", text) → 行 299-302 防护：if count == 0 and source_text is not None and "0" not in source_text: return None。
+- 0→O 触发路径：OCR 读 raw_text='O' → after_process('O')=0 → count=0 → source_text='O' 不含 '0' → 防护拒信 → return None。
+- 搜索失败链（script_task.py:464-526 _search）：_choose_search_decision（行 392-408，按钮模板可见性是主证据，票数 OCR 只用于耗尽判定）→ search_available=True → decision=SEARCH → 行 506 点击 C_SEARCH → 行 508-515 等 20s（PAGE_TIMEOUT）不见挑战页/自己发现卡 → 行 517 _confirm_empty_after_search（行 426-462，需 count==0 才能进 stably-zero 确认）→ count=None 永远无法确认 → 行 523-526 _fail(stage=search) → _fail（行 163-166）raise GameStuckError。
+- 为何 06:04 能读真 0：日志不输出 OCR 原文——[XIUXING_FREE_TICKET_COUNT 0.002s] [0] 是 after_process 之后的结果（base_ocr.py:173-176 先 after_process 再 logger.attr）；原文只有走低分 WARNING 分支（base_ocr.py:167，如 05:22:36.315 Score 0.44 is low, but result "13" contains a digit）才可见，而 0/O 帧 score 足够高不打印原文。差异来自 PPOCR 帧级波动：同一 ROI、同一恒等 pre_process（base_ocr.py:101-107，无预处理差异），05:36/05:45/06:00 各帧判为 'O'（非数字）→ None，06:04 帧判为 '0' → count=0。决定性佐证：06:00:51.200–53.903 十次连续 [0] 读取全部 → ticket_count=None（confirm 循环跑满 3s 失败），而 06:04:27.236/535/833 同样 3 次 [0] → XIUXING_FREE_TICKET_ZERO_CONFIRM readings=[0,0,0] confirmed=True——同样 after_process=[0] 行为不同，唯一变量是 raw_text 是 'O' 还是 '0'（已证实）。
+- 06:04 收工：06:04:06.813 SEARCH_DECISION ticket_count=0 → 06:04:07.105 点击搜索 → 20s 无结果 → 06:04:27.240 XIUXING_SEARCH_EMPTY_CONFIRM home=True search=True own=False count=0 → 06:04:27.837 readings=[0,0,0] confirmed=True → 06:04:27.840 decision=empty_after_search_no_result → 06:04:27.842 XIUXING_HEXUN_FINISH reason='no ticket evidence' challenges=0（运行期文案；当前磁盘改为 "tickets exhausted" 行 90）→ TASK_END success=True failure_action=reset。
+
+## 3. 日志时间线还原（log/2026-08-13_oas1.txt + server.txt，均已证）
+
+- 05:36:16.052 最后正常战斗 BATTLE_RESULT count=27 VICTORY；05:36:16.384 [XIUXING_FREE_TICKET_COUNT][0]；05:36:16.389 SEARCH_DECISION decision=search ticket_count=None（script_task.py:0364）；05:36:16.681 点击 XIUXING_SEARCH。
+- 失败#1：05:36:37.035 XIUXING_HEXUN_FAILURE stage=search（GameStuckError）；05:36:37.611 Delay task xiuxing_hexun to 2026-08-14 05:36:37 (success=False)（失败间隔=1天，config/oas1.json failure_interval="01 00:00:00"）；05:36:37.649 "Game stuck ... restarted in 10 seconds"；05:36:37.655 Task call: restart (skipped because disabled by user)（restart.scheduler.enable=false → 游戏从未重启，页面停留在已耗尽的合训页）；05:36:47.677 End task → 05:36:47.702 GotoMain → 05:36:55.674 TASK_END outcome=returned success=True failure_action=reset 'Goto main end'。
+- Core 重启#1：05:42:35.750 server LAUNCHER CONFIG / 05:42:37.940 OAS web service startup done；05:42:57.000 server Script started: account=oas1, source=rest, run_id=b2e5a35e32a7, parent_pid=20608；05:42:59.860 oas1 Log cleanup finished / 05:42:59.863 Start scheduler loop: oas1（worker B 全新 Script，failure_record={}；05:36:55.677 后 worker A 日志中断=被连带杀掉）。
+- 05:45:34.830 server Delay task xiuxing_hexun to 2026-08-13 05:45:34 (success=True)——控制中心覆盖失败延时（05:56/06:03 两条完整行显示 caller='ControlCenter.sync_next_run' reason='control center requested next_run synchronization'，即 module/server/script_router.py:479-495 把 next_run 推为 now，覆盖 worker 的次日失败延时）。
+- 失败#2：05:45:35.781/37.581 Start task（双启动，旧 worker 残留冲突；05:45:35.788 Run script oas1 error、05:45:37.396 WinError 232 管道正在被关闭）；05:45:42.465 [0] → 05:45:42.472 ticket_count=None（script_task.py:0383）；05:45:42.764 点击搜索；05:46:03.171 FAILURE；05:46:03.615 Delay 至 2026-08-14 05:46:03；05:46:13.684 End task → GotoMain → 05:46:20.816 TASK_END reset。
+- Core 重启#2：05:56:11.192 server LAUNCHER CONFIG / 05:56:13.764 startup done；05:56:29.983 server Delay task xiuxing_hexun to 2026-08-13 05:56:29 (success=True)（caller='ControlCenter.sync_next_run'）；05:56:30.952 oas1 Start task → 05:56:30.961 Run script oas1 error（worker B 日志管道随 Core 重启断裂，WinError 232 崩溃）；06:00:20.153 server Script stop ignored reason=not_running；06:00:22.199 server Script started source=rest run_id=5e0223d66db2 parent_pid=5936（worker C 全新 Script，failure_record={}）；06:00:25.100/103 oas1 Log cleanup + Start scheduler loop。
+- 失败#3：06:00:30.772 [0] → 06:00:30.778 ticket_count=None（script_task.py:0428）；06:00:51-53 十次 [0] confirm 读取全 None；06:00:54.437 FAILURE；06:00:54.905 Delay 至次日；06:01:04.972 End task → GotoMain → 06:01:12.173 TASK_END reset。
+- 收工：06:03:57.368 server Delay task xiuxing_hexun to 2026-08-13 06:03:57 (success=True)（ControlCenter.sync_next_run）；06:04:02.216 Start task → 06:04:06.813 ticket_count=0（script_task.py:0436）→ 06:04:27.842 FINISH 'no ticket evidence' → 06:04:27.883 TASK_END reset → 06:04:28.130 GotoMain → 06:04:35.972 TASK_END reset。此后 config next_run=2026-08-14 06:04:27（config/oas1.json 现存值）。
+
+三次失败计数落点：失败#1 在 worker A（0→1）→ Core 重启#1 → 失败#2 在 worker B（0→1）→ Core 重启#2 → 失败#3 在 worker C（0→1）→ 06:04 成功（RESET）。没有任何一个 worker 进程内累计到 3。
+
+## 4. 结论
+
+1. 三连败未触发禁用的根因：不是 F-3，而是 worker 进程重启清空内存计数（script.py:59 初始化 + 每次 Script started source=rest 全新实例）。Core 于 05:42:35、05:56:11 重启（server.txt LAUNCHER CONFIG/OAS web service startup done），连带杀掉/崩溃旧 worker（日志中断、WinError 232、Run script oas1 error），新 worker 从 failure_record={} 开始。对照 08-12：同一 worker 内连续三败正常触发 failed 3 or more times + Request human takeover。已证实。
+2. 搜索失败链中的环节根因：起点是 OCR 误读（'0'→'O'，55×42 ROI 帧级波动）；放大环节是 O→0 防护刻意拒信（script_task.py:299-302 及等价运行期实现）使 count=None，导致 _confirm_empty_after_search 永远无法确认耗尽（行 456 count==0 分支进不去）→ 每次 GameStuckError（stage=search）。模板匹配/点击正常（C_SEARCH 被点击、按钮模板持续命中）；deadline（20s+3s）只是超时路径；失败类型归类（GameStuckError→INCREMENT）正确。高概率（OCR 原文未打日志，'O' 由差分行为+测试用例 tasks/XiuxingHexun/tests/test_flow.py:269-288 推断）。
+3. F-7（max_challenges=0）的作用：config/oas1.json max_challenges=0 → run() 行 87 while 无上限循环，唯一正常出口是 OCR 耗尽判定（行 89-90）。它让任务在 sync_next_run 反复重调度后总是继续尝试搜索、持续产生 GameStuckError；它不是计数不触发的直接原因，但是"反复失败重试"的背景条件。已证实（配置）+ 作用判定。
+4. 附带事实：restart.scheduler.enable=false → 每次 GameStuckError 后游戏未重启（Task call: restart (skipped because disabled by user)），失败现场持续存在；control center sync_next_run（script_router.py:479-495）以 success=True 把 next_run 覆盖为 now，抵消失败延时（05:45:34/05:56:29/06:03:57），是任务能连续重跑 4 次的前提。
+
+## 5. 证据缺口 / 待查
+
+- 运行期 script_task.py 确切实现不可直接取证：文件 untracked（git 无历史）且事发时正在被编辑——四次运行 SEARCH_DECISION 日志行号 0364→0383→0428→0436 递增，FINISH 文案 "no ticket evidence" 与当前磁盘 "tickets exhausted" 不同。当前磁盘文件（行 260-303，防护 299-302）是最接近的已检实现且与全部日志行为吻合；运行期 [XIUXING_FREE_TICKET_COUNT][0] 日志来自 rule 级 OCR 调用（base_ocr.py:175），当前文件 raw 路径不打印该日志——布局差异无法还原，不影响结论。
+- Core 两次重启的触发者未定位：server.txt 只有重启结果，触发前旧 Core 的最后动作无日志（可能在 launcher 层）；可能是人工重启、崩溃或被看门狗拉起——待查。
+- log/2026-08-13_python.txt 中 00:34/00:38/01:06/05:41/05:42/05:55 存在毫秒级完成的 XiuxingHexun 模拟执行（XIUXING_HEXUN_STOP reason='activity disabled' + FAILURE stage=page unknown page + 固定 readings），疑似 Core 进程内配置校验/harness，不属生产失败计数链，调用方未确认——待查。
+- OCR 原文（'O' vs '0'）不在日志中，只有差分行为证据；如需 100% 证实可查 log/error/1786570597044/（05:36:37 save_error_log 保存的 60 张截图）人工核验票数区域——本次未读图。

@@ -46,6 +46,7 @@ class TaskConfig(BaseModel):
     task_id: str
     title: str
     groups: dict[str, list[ConfigField]]
+    revision: str | None = None
 
 
 class ConfigPatchField(BaseModel):
@@ -57,6 +58,7 @@ class ConfigPatchField(BaseModel):
 
 class ConfigPatch(BaseModel):
     fields: list[ConfigPatchField] = Field(default_factory=list)
+    revision: str | None = None
 
 
 class AccountCreate(BaseModel):

@@ -29,7 +29,7 @@ class ScriptTask(GameUi, TalismanPassAssets):
             self.ui_goto_page(page_main)
             self.harvest_soul()
         self.set_next_run(task='TalismanPass', success=True, finish=True)
-        raise TaskEnd('TalismanPass')
+        raise TaskEnd.completed('TalismanPass')
 
     def get_all(self):
         """

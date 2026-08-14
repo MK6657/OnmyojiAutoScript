@@ -45,7 +45,7 @@ class ScriptTask(RightActivity, FloatParadeAssets, TalismanPassAssets):
         self.ui_goto(page_main)
 
         self.set_next_run(task='FloatParade', success=True, finish=True)
-        raise TaskEnd('FloatParade')
+        raise TaskEnd.completed('FloatParade')
 
     def get_mileage(self):
         self.screenshot()

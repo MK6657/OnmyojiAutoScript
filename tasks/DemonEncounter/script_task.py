@@ -39,7 +39,7 @@ class ScriptTask(GameUi, GeneralBattle, DemonEncounterAssets, SwitchSoul):
         self.conf = self.config.demon_encounter
         if not self.check_time():
             logger.warning('Time is not right')
-            raise TaskEnd('DemonEncounter')
+            raise TaskEnd.completed('DemonEncounter')
         self.ui_get_current_page()
         # 切换御魂
         soul_config = self.config.demon_encounter.demon_soul_config
@@ -52,7 +52,7 @@ class ScriptTask(GameUi, GeneralBattle, DemonEncounterAssets, SwitchSoul):
         self.execute_boss()
 
         self.set_next_run(task='DemonEncounter', success=True, finish=False)
-        raise TaskEnd('DemonEncounter')
+        raise TaskEnd.completed('DemonEncounter')
 
     def checkout_soul(self):
         """
@@ -86,7 +86,7 @@ class ScriptTask(GameUi, GeneralBattle, DemonEncounterAssets, SwitchSoul):
                 if timer_find_boss.reached():
                     logger.warning('find boss timeout')
                     self.set_next_run(task='DemonEncounter', success=False, finish=True, server=False)
-                    raise TaskEnd('DemonEncounter')
+                    raise TaskEnd.completed('DemonEncounter')
                 if self.appear(self.I_JADE_50):
                     # 没找到boss但地图中央出现宝箱，导致点击宝箱出现50勾玉购买界面
                     self.ui_click_until_smt_disappear(self.I_DE_FIND, self.I_JADE_50, interval=1)
@@ -143,7 +143,7 @@ class ScriptTask(GameUi, GeneralBattle, DemonEncounterAssets, SwitchSoul):
                     logger.warning('Boss battle already done')
                     self.set_next_run(task='DemonEncounter', success=False, finish=True, server=True)
                     self.ui_click_until_disappear(self.I_UI_BACK_RED)
-                    raise TaskEnd('DemonEncounter')
+                    raise TaskEnd.completed('DemonEncounter')
 
                 if (self.appear_then_click(self.I_BOSS_FIRE, interval=3)
                         or self.appear_then_click(self.I_BEST_BOSS_FIRE, interval=3)):

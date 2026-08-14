@@ -55,7 +55,7 @@ class ScriptTask(WQExplore, SecretScriptTask, WantedQuestsAssets):
             logger.warning('Cannot pre-work')
             logger.warning('You may have completed the reward task')
             self.next_run()
-            raise TaskEnd('WantedQuests')
+            raise TaskEnd.completed('WantedQuests')
 
         self.screenshot()
         number_challenge = self.O_WQ_NUMBER.ocr(self.device.image)
@@ -97,7 +97,7 @@ class ScriptTask(WQExplore, SecretScriptTask, WantedQuestsAssets):
             sleep(1.5)
 
         self.next_run()
-        raise TaskEnd('WantedQuests')
+        raise TaskEnd.completed('WantedQuests')
 
     def next_run(self):
         before_end: time = self.get_config().before_end

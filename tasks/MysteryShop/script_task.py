@@ -205,7 +205,7 @@ class ScriptTask(FriendshipPoints, MysteryShopAssets, GeneralInvite):
                 self.set_next_run(task='MysteryShop', success=True, finish=True)
             else:
                 self.set_next_run(task='MysteryShop', success=False, finish=True)
-            raise TaskEnd('MysteryShop')
+            raise TaskEnd.completed('MysteryShop')
         now = datetime.now()
         day_of_week = now.weekday()
         now_datetime = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -219,7 +219,7 @@ class ScriptTask(FriendshipPoints, MysteryShopAssets, GeneralInvite):
             next_time = now_datetime + timedelta(days=2 - day_of_week) + target_time
             logger.warning('Now is not in the time of mystery shop')
         self.set_next_run(task='MysteryShop', target=next_time)
-        raise TaskEnd('MysteryShop')
+        raise TaskEnd.completed('MysteryShop')
 
 
 if __name__ == '__main__':

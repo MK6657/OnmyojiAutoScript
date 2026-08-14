@@ -41,7 +41,7 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, DyeTrialsAssets):
         self.ui_goto(page_main)
 
         self.set_next_run(task='DyeTrials', success=True, finish=True)
-        raise TaskEnd('DyeTrials')
+        raise TaskEnd.completed('DyeTrials')
 
     def get_all(self):
         while 1:

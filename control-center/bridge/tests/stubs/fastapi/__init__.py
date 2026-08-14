@@ -26,6 +26,10 @@ class WebSocket:  # pragma: no cover - 测试里不需要真实实现
     async def receive_text(self) -> str: return ""
 
 
+def Header(default: Any = None, **_kwargs: Any) -> Any:
+    return default
+
+
 def _decorator(*_args: Any, **_kwargs: Any) -> Callable[[Callable], Callable]:
     def wrap(func: Callable) -> Callable:
         return func

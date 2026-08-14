@@ -1,19 +1,24 @@
 {
-  "name": "oas-control-center",
+  "name": "oas-control-center-frontend",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "build:desktop": "vite build --mode desktop",
+    "preview": "vite preview",
+    "mock": "node tools/mock-bridge.mjs --port 22368",
+    "test:e2e": "node tools/e2e.mjs",
+    "test:e2e:real": "node tools/e2e-real.mjs"
   },
   "dependencies": {
-    "@vitejs/plugin-react": "latest",
-    "vite": "latest",
-    "react": "latest",
-    "react-dom": "latest"
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "playwright": "^1.62.1",
+    "vite": "^5.4.11"
+  }
 }
-

@@ -1,3 +1,4 @@
+import time
 import timeit
 import numpy as np
 from datetime import datetime
@@ -29,19 +30,36 @@ class HyaDevice(BaseTask):
     hya_fs_check_timer = Timer(3 * 60)  # 五分钟跑不完就应该是出问题了
 
     def fast_screenshot(self, screenshot: ScreenshotMethod):
-        self.hya_screenshot_interval.wait()
-        self.hya_screenshot_interval.reset()
-        self.device.image = self.device.screenshot_window_background() if screenshot == ScreenshotMethod.WINDOW_BACKGROUND else self.device.screenshot_nemu_ipc()
-        if image_black(self.device.image):
-            logger.error('Screenshot image is black, try again')
-            raise RequestHumanTakeover('Screenshot image is black, try again')
-        if self.hya_fs_check_timer.reached():
-            logger.error('Fast screenshot check timer reached')
-            logger.error('Five minutes have not ended, the game is probably stuck, please check the game')
-            raise GameStuckError
-        if self.config.script.error.save_error:
-            self.device.screenshot_deque.append({'time': datetime.now(), 'image': self.device.image})
-        return self.device.image
+        def capture_fast_frame():
+            started_at = time.monotonic()
+            self.hya_screenshot_interval.wait()
+            self.hya_screenshot_interval.reset()
+            if screenshot == ScreenshotMethod.WINDOW_BACKGROUND:
+                image = self.device.screenshot_window_background()
+            else:
+                image = self.device.screenshot_nemu_ipc()
+            self.device.image = image
+            if image_black(self.device.image):
+                logger.error('Screenshot image is black, try again')
+                raise RequestHumanTakeover('Screenshot image is black, try again')
+            if self.hya_fs_check_timer.reached():
+                logger.error('Fast screenshot check timer reached')
+                logger.error('Five minutes have not ended, the game is probably stuck, please check the game')
+                raise GameStuckError
+            publish_frame = getattr(self.device, 'publish_frame', None)
+            if callable(publish_frame):
+                publish_frame(started_at=started_at)
+            if self.config.script.error.save_error:
+                self.device.screenshot_deque.append({
+                    'time': datetime.now(),
+                    'image': self.device.image,
+                })
+            return self.device.image
+
+        return self.protected_screenshot(
+            capture=capture_fast_frame,
+            capture_deadline_capable=screenshot == ScreenshotMethod.NEMU_IPC,
+        )
 
     def fast_click(self, x: int, y: int, control_method: ControlMethod = ControlMethod.WINDOW_MESSAGE) -> None:
         logger.info(
@@ -78,4 +96,3 @@ if __name__ == '__main__':
     # print(f"执行总的时间: {execution_time * 1000} ms")
 
     hd.fast_screenshot()
-

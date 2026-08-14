@@ -46,7 +46,7 @@ class ScriptTask(GameUi, GeneralBattle, SwitchSoul, DemonRetreatAssets, AbyssSha
 
                 # 设置下次运行时间
             self.custom_next_run(task='DemonRetreat', custom_time=cfg.demon_retreat_time.custom_run_time, time_delta=days_until_saturday)
-            raise TaskEnd
+            raise TaskEnd.completed('DemonRetreat completed')
 
         if cfg.switch_soul_config.enable:
             self.ui_get_current_page()
@@ -64,7 +64,7 @@ class ScriptTask(GameUi, GeneralBattle, SwitchSoul, DemonRetreatAssets, AbyssSha
                 pass
             self.goto_main()
             self.set_next_run(task='DemonRetreat', finish=False, server=True, success=False)
-            raise TaskEnd
+            raise TaskEnd.completed('DemonRetreat completed')
 
         # 首领退治战斗
         success = self.demon_retreat()
@@ -96,7 +96,7 @@ class ScriptTask(GameUi, GeneralBattle, SwitchSoul, DemonRetreatAssets, AbyssSha
         else:
             self.set_next_run(task="DemonRetreat", finish=True, server=True, success=False)
 
-        raise TaskEnd
+        raise TaskEnd.completed('DemonRetreat completed')
 
 
 
@@ -140,7 +140,7 @@ class ScriptTask(GameUi, GeneralBattle, SwitchSoul, DemonRetreatAssets, AbyssSha
                 logger.info(f"The next time the demon retreat is next Saturday")
                 self.custom_next_run(task='DemonRetreat', custom_time=cfg.demon_retreat_time.custom_run_time,
                                      time_delta=7)
-                raise TaskEnd
+                raise TaskEnd.completed('DemonRetreat completed')
 
             if self.appear(self.I_RANK_LSIT):
                 logger.info("Enter demon_retreat false")
@@ -231,6 +231,12 @@ class ScriptTask(GameUi, GeneralBattle, SwitchSoul, DemonRetreatAssets, AbyssSha
         :param random_click_swipt_enable:
         :return:
         """
+        # This special three-round flow bypasses GeneralBattle.run_general_battle;
+        # keep the shared auto-mode guard here so it cannot remain in manual
+        # mode while the custom wait loop is running.
+        if not self._ensure_auto_battle_mode():
+            logger.warning('Demon retreat auto mode was not confirmed; abort battle safely')
+            return False
         self.device.stuck_record_add('BATTLE_STATUS_S')
         self.device.click_record_clear()
         # 战斗过程 随机点击和滑动 防封 并点击 准备
@@ -280,4 +286,3 @@ if __name__ == '__main__':
     t.screenshot()
 
     t.run()
-

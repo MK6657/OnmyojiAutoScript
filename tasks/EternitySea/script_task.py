@@ -51,7 +51,7 @@ class ScriptTask(
         else:
             self.set_next_run(self.task_name, finish=False, success=False)
 
-        raise TaskEnd(self.task_name)
+        raise TaskEnd.completed(self.task_name)
 
 
     def run_leader(self):

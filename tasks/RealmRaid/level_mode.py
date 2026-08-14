@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
+import uuid
 from collections import Counter
-from dataclasses import asdict, dataclass, field
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -36,58 +39,77 @@ class PendingAction(str, Enum):
     REFRESH = 'refresh'
 
 
+CHECKPOINT_CACHE_MAX_AGE_SECONDS = 900
+CHECKPOINT_SCHEMA_VERSION = 3
+
+
+class CheckpointError(RuntimeError):
+    pass
+
+
+class CheckpointLockTimeout(CheckpointError):
+    pass
+
+
+class CheckpointConflictError(CheckpointError):
+    pass
+
+
+class CheckpointCorruptError(CheckpointError):
+    def __init__(self, message: str, quarantine_path: str | Path) -> None:
+        super().__init__(message)
+        self.quarantine_path = str(quarantine_path)
+
+
+@contextmanager
+def _cross_process_file_lock(path: Path, timeout: float, poll_interval: float = 0.05):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open('a+b')
+    if path.stat().st_size == 0:
+        handle.write(b'0')
+        handle.flush()
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    locked = False
+    try:
+        while not locked:
+            handle.seek(0)
+            try:
+                if os.name == 'nt':
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except (OSError, BlockingIOError):
+                if time.monotonic() >= deadline:
+                    raise CheckpointLockTimeout(
+                        f'timed out acquiring checkpoint lock: {path}'
+                    )
+                time.sleep(poll_interval)
+        yield
+    finally:
+        if locked:
+            handle.seek(0)
+            if os.name == 'nt':
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
 def _int_tuple(values: Iterable[int]) -> tuple[int, ...]:
     return tuple(int(value) for value in values)
 
 
 def _int_set(values: Iterable[int]) -> frozenset[int]:
     return frozenset(int(value) for value in values)
-
-
-def resolve_broken_levels(
-    levels: Iterable[int],
-    broken: Iterable[int],
-    expected_level: int = 0,
-    min_observed_levels: int = 4,
-    min_observed_votes: int = 4,
-) -> tuple[tuple[int, ...], frozenset[int], str]:
-    """Replace unreliable OCR from broken cards with trusted board-level evidence.
-
-    Broken cards are visually dimmed by the game, so their level plaques cannot be
-    treated as normal OCR input. A fresh partial board needs at least four visible
-    unbroken cards agreeing on the mode. Once a checkpoint exists, the caller may
-    provide its expected level after separately confirming the board signature.
-    """
-    raw = _int_tuple(levels)
-    broken_set = _int_set(broken)
-    if len(raw) != 9 or not broken_set:
-        return raw, frozenset(), ''
-    if any(index < 1 or index > len(raw) for index in broken_set):
-        return raw, frozenset(), ''
-
-    unbroken = [
-        level for index, level in enumerate(raw, start=1)
-        if index not in broken_set
-    ]
-    if any(not 1 <= level <= 60 for level in unbroken):
-        return raw, frozenset(), ''
-
-    if 1 <= int(expected_level or 0) <= 60:
-        challenge_level = int(expected_level)
-        source = 'checkpoint'
-    else:
-        if len(unbroken) < min_observed_levels:
-            return raw, frozenset(), ''
-        counts = Counter(unbroken)
-        challenge_level, votes = max(counts.items(), key=lambda item: (item[1], item[0]))
-        if votes < min_observed_votes:
-            return raw, frozenset(), ''
-        source = 'visible-unbroken'
-
-    resolved = list(raw)
-    for index in broken_set:
-        resolved[index - 1] = challenge_level
-    return tuple(resolved), broken_set, source
 
 
 @dataclass(frozen=True)
@@ -103,6 +125,7 @@ class BoardSnapshot:
     refresh_available: bool = False
     refresh_cd_seconds: int | None = None
     layout_signature: str = ''
+    level_source: str = 'ocr'
     captured_at: datetime = field(default_factory=datetime.now)
     imputed: frozenset[int] = field(default_factory=frozenset)
 
@@ -132,7 +155,7 @@ class BoardSnapshot:
             return False
         return self.attack_record != len(self.broken)
 
-    def is_safe(self, min_valid_levels: int = 6, min_level_votes: int = 4) -> bool:
+    def is_safe(self, min_valid_levels: int = 9, min_level_votes: int = 4) -> bool:
         if len(self.levels) != 9:
             return False
         if self.valid_level_count < min_valid_levels:
@@ -157,15 +180,25 @@ class BoardSnapshot:
 
 @dataclass
 class RealmRaidCheckpoint:
-    schema_version: int = 1
+    schema_version: int = CHECKPOINT_SCHEMA_VERSION
+    revision: int = 0
+    run_id: str = ''
     account: str = ''
     board_signature: str = ''
     mode: str = ''
     target_level: int = 59
     observed_level: int = 0
+    observed_level_votes: int = 0
+    observed_levels: tuple[int, ...] = field(default_factory=tuple)
+    observed_broken: tuple[int, ...] = field(default_factory=tuple)
+    observed_failure_marked: tuple[int, ...] = field(default_factory=tuple)
     failure_count: int = 0
     success_count: int = 0
     pending_action: str = PendingAction.NONE.value
+    # For attack/surrender recovery, distinguish target selection from the
+    # point after the battle transition. Older checkpoints default to
+    # ``unknown`` and keep the conservative evidence-based recovery path.
+    pending_stage: str = 'unknown'
     pending_success_before: int = 0
     pending_tickets_before: int = -1
     pending_failure_marked_before: bool = False
@@ -174,6 +207,23 @@ class RealmRaidCheckpoint:
     last_target: int = 0
     recovery_hold: bool = False
     updated_at: str = ''
+
+    def __post_init__(self) -> None:
+        self.observed_levels = _int_tuple(self.observed_levels)
+        self.observed_broken = _int_tuple(self.observed_broken)
+        self.observed_failure_marked = _int_tuple(self.observed_failure_marked)
+
+    def remember_board(self, snapshot: BoardSnapshot) -> None:
+        """Persist complete nine-cell evidence for the current board generation."""
+        self.schema_version = CHECKPOINT_SCHEMA_VERSION
+        self.board_signature = snapshot.board_signature
+        self.observed_level = snapshot.challenge_level
+        self.observed_level_votes = snapshot.challenge_level_votes
+        self.observed_levels = snapshot.levels
+        self.observed_broken = tuple(sorted(snapshot.broken))
+        self.observed_failure_marked = tuple(sorted(snapshot.failure_marked))
+        self.success_count = snapshot.success_count
+        self.touch(snapshot.captured_at)
 
     def touch(self, now: datetime | None = None) -> None:
         self.updated_at = (now or datetime.now()).isoformat(timespec='seconds')
@@ -185,6 +235,11 @@ class RealmRaidCheckpoint:
         target: int = 0,
     ) -> None:
         self.pending_action = action.value
+        self.pending_stage = (
+            'selection'
+            if action in (PendingAction.ATTACK, PendingAction.SURRENDER)
+            else 'action'
+        )
         self.pending_success_before = snapshot.success_count
         self.pending_tickets_before = snapshot.tickets_current
         self.last_target = int(target)
@@ -193,6 +248,7 @@ class RealmRaidCheckpoint:
 
     def finish_action(self) -> None:
         self.pending_action = PendingAction.NONE.value
+        self.pending_stage = 'none'
         self.pending_success_before = 0
         self.pending_tickets_before = -1
         self.pending_failure_marked_before = False
@@ -231,35 +287,114 @@ class LevelDecision:
 
 
 class CheckpointStore:
-    def __init__(self, account: str, root: str | Path = './output/realm_raid_state'):
+    def __init__(
+        self,
+        account: str,
+        root: str | Path = './output/realm_raid_state',
+        *,
+        run_id: str | None = None,
+        lock_timeout: float = 5.0,
+    ):
         safe_account = re.sub(r'[^0-9A-Za-z_.-]+', '_', account).strip('._') or 'default'
         self.path = Path(root) / f'{safe_account}.json'
+        self.lock_path = self.path.with_suffix(self.path.suffix + '.lock')
+        self.run_id = str(run_id or uuid.uuid4().hex)
+        self.lock_timeout = max(0.0, float(lock_timeout))
 
-    def load(self) -> RealmRaidCheckpoint | None:
+    @contextmanager
+    def _locked(self):
+        with _cross_process_file_lock(self.lock_path, self.lock_timeout):
+            yield
+
+    def _quarantine_unlocked(self, reason: str) -> Path:
+        stamp = datetime.now().strftime('%Y%m%dT%H%M%S%f')
+        quarantine = self.path.with_name(
+            f'{self.path.stem}.corrupt.{stamp}.{uuid.uuid4().hex}{self.path.suffix}'
+        )
+        try:
+            os.replace(self.path, quarantine)
+        except OSError as error:
+            raise CheckpointError(
+                f'checkpoint is corrupt ({reason}) and quarantine failed: {error}'
+            ) from error
+        return quarantine
+
+    def _load_unlocked(self) -> RealmRaidCheckpoint | None:
         if not self.path.exists():
             return None
         try:
             data = json.loads(self.path.read_text(encoding='utf-8'))
+            if not isinstance(data, dict):
+                raise TypeError('checkpoint root must be an object')
             checkpoint = RealmRaidCheckpoint.from_dict(data)
-            if checkpoint.schema_version != 1:
-                return None
+            if checkpoint.schema_version not in (1, 2, CHECKPOINT_SCHEMA_VERSION):
+                raise ValueError(
+                    f'unsupported checkpoint schema {checkpoint.schema_version}'
+                )
+            if checkpoint.revision < 0:
+                raise ValueError('checkpoint revision cannot be negative')
             return checkpoint
-        except (OSError, ValueError, TypeError):
-            return None
+        except (ValueError, TypeError, json.JSONDecodeError) as error:
+            quarantine = self._quarantine_unlocked(str(error))
+            raise CheckpointCorruptError(
+                f'checkpoint quarantined after validation failure: {error}',
+                quarantine,
+            ) from error
+        except OSError as error:
+            raise CheckpointError(f'checkpoint read failed: {error}') from error
+
+    def load(self) -> RealmRaidCheckpoint | None:
+        with self._locked():
+            return self._load_unlocked()
 
     def save(self, checkpoint: RealmRaidCheckpoint) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        checkpoint.touch()
-        payload = json.dumps(asdict(checkpoint), ensure_ascii=False, indent=2)
-        temporary = self.path.with_suffix(self.path.suffix + '.tmp')
-        temporary.write_text(payload + '\n', encoding='utf-8')
-        os.replace(temporary, self.path)
+        with self._locked():
+            current = self._load_unlocked()
+            current_revision = 0 if current is None else current.revision
+            if current is None and checkpoint.revision != 0:
+                raise CheckpointConflictError(
+                    'checkpoint was cleared after this copy was loaded'
+                )
+            if current is not None and checkpoint.revision != current_revision:
+                raise CheckpointConflictError(
+                    'checkpoint revision conflict: '
+                    f'expected={checkpoint.revision}, current={current_revision}'
+                )
+
+            staged = replace(
+                checkpoint,
+                schema_version=CHECKPOINT_SCHEMA_VERSION,
+                revision=current_revision + 1,
+                run_id=self.run_id,
+            )
+            staged.touch()
+            payload = json.dumps(asdict(staged), ensure_ascii=False, indent=2)
+            temporary = self.path.with_name(
+                f'{self.path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}'
+            )
+            try:
+                with temporary.open('x', encoding='utf-8', newline='\n') as handle:
+                    handle.write(payload + '\n')
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, self.path)
+                checkpoint.schema_version = staged.schema_version
+                checkpoint.revision = staged.revision
+                checkpoint.run_id = staged.run_id
+                checkpoint.updated_at = staged.updated_at
+            finally:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
 
     def clear(self) -> None:
-        try:
-            self.path.unlink()
-        except FileNotFoundError:
-            pass
+        with self._locked():
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def choose_level_mode(current_level: int, target_level: int) -> LevelMode:
@@ -268,6 +403,69 @@ def choose_level_mode(current_level: int, target_level: int) -> LevelMode:
     if current_level < target_level:
         return LevelMode.RAISE
     return LevelMode.HOLD
+
+
+def cached_board_levels(
+    checkpoint: RealmRaidCheckpoint | None,
+    layout_signature: str,
+    broken: Iterable[int] = (),
+    failure_marked: Iterable[int] = (),
+    now: datetime | None = None,
+    max_age_seconds: int = CHECKPOINT_CACHE_MAX_AGE_SECONDS,
+) -> tuple[int, ...]:
+    """Return previously verified nine-cell levels only for the same board.
+
+    The cache is rejected for old checkpoints, refresh transactions, incomplete
+    evidence, signature changes, or a likely post-win generation reset.
+    """
+    if checkpoint is None or checkpoint.schema_version < 2:
+        return ()
+    if not layout_signature or checkpoint.board_signature != layout_signature:
+        return ()
+    if checkpoint.pending_refresh:
+        return ()
+
+    if now is not None:
+        updated_at = checkpoint.updated_at
+        try:
+            age = (now - datetime.fromisoformat(updated_at)).total_seconds()
+        except (TypeError, ValueError):
+            return ()
+        if age < 0 or age > max(0, int(max_age_seconds)):
+            return ()
+
+    expected_mode = choose_level_mode(checkpoint.observed_level, checkpoint.target_level)
+    if (
+        not checkpoint.recovery_hold
+        and checkpoint.level_mode is not None
+        and checkpoint.level_mode != expected_mode
+    ):
+        return ()
+
+    broken_set = _int_set(broken)
+    if checkpoint.success_count > 0 and not broken_set:
+        return ()
+    failure_set = _int_set(failure_marked)
+    if checkpoint.failure_count > 0 and not broken_set and not failure_set:
+        return ()
+    if checkpoint.observed_broken and broken_set != _int_set(checkpoint.observed_broken):
+        return ()
+    if (
+        checkpoint.observed_failure_marked
+        and failure_set != _int_set(checkpoint.observed_failure_marked)
+    ):
+        return ()
+
+    levels = _int_tuple(checkpoint.observed_levels)
+    if len(levels) != 9 or any(not 1 <= level <= 60 for level in levels):
+        return ()
+    counts = Counter(levels)
+    challenge_level, votes = max(counts.items(), key=lambda item: (item[1], item[0]))
+    if challenge_level != checkpoint.observed_level:
+        return ()
+    if votes != checkpoint.observed_level_votes or votes < 4:
+        return ()
+    return levels
 
 
 def checkpoint_matches(
@@ -282,6 +480,13 @@ def checkpoint_matches(
     if checkpoint.observed_level != snapshot.challenge_level:
         return False
     if checkpoint.success_count > snapshot.success_count and not checkpoint.pending_refresh:
+        return False
+    expected_mode = choose_level_mode(snapshot.challenge_level, target_level)
+    if (
+        not checkpoint.recovery_hold
+        and checkpoint.level_mode is not None
+        and checkpoint.level_mode != expected_mode
+    ):
         return False
     if checkpoint.board_signature and snapshot.board_signature:
         if checkpoint.board_signature != snapshot.board_signature:
@@ -298,15 +503,12 @@ def create_checkpoint(
 ) -> RealmRaidCheckpoint:
     checkpoint = RealmRaidCheckpoint(
         account=account,
-        board_signature=snapshot.board_signature,
         mode=mode.value,
         target_level=target_level,
-        observed_level=snapshot.challenge_level,
         failure_count=0,
-        success_count=snapshot.success_count,
         recovery_hold=recovery_hold,
     )
-    checkpoint.touch(snapshot.captured_at)
+    checkpoint.remember_board(snapshot)
     return checkpoint
 
 
@@ -317,34 +519,35 @@ def reconcile_checkpoint(
     checkpoint: RealmRaidCheckpoint | None,
 ) -> RealmRaidCheckpoint:
     if checkpoint_matches(checkpoint, snapshot, target_level):
-        checkpoint.success_count = snapshot.success_count
-        checkpoint.board_signature = snapshot.board_signature
-        checkpoint.observed_level = snapshot.challenge_level
-        checkpoint.touch(snapshot.captured_at)
+        checkpoint.remember_board(snapshot)
         return checkpoint
 
     partial_board = bool(snapshot.broken or snapshot.failure_marked or snapshot.success_count)
     if partial_board:
-        return create_checkpoint(
+        replacement = create_checkpoint(
             account=account,
             snapshot=snapshot,
             target_level=target_level,
             mode=LevelMode.RECOVERY_HOLD,
             recovery_hold=True,
         )
-
-    return create_checkpoint(
-        account=account,
-        snapshot=snapshot,
-        target_level=target_level,
-        mode=choose_level_mode(snapshot.challenge_level, target_level),
-    )
+    else:
+        replacement = create_checkpoint(
+            account=account,
+            snapshot=snapshot,
+            target_level=target_level,
+            mode=choose_level_mode(snapshot.challenge_level, target_level),
+        )
+    if checkpoint is not None:
+        replacement.revision = checkpoint.revision
+        replacement.run_id = checkpoint.run_id
+    return replacement
 
 
 def decide_next_action(
     snapshot: BoardSnapshot,
     checkpoint: RealmRaidCheckpoint,
-    min_valid_levels: int = 6,
+    min_valid_levels: int = 9,
     min_level_votes: int = 4,
 ) -> LevelDecision:
     mode = checkpoint.level_mode

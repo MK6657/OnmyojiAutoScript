@@ -69,13 +69,13 @@ class ScriptTask(BaseTask):
         if not self._check_adb_connection():
             logger.error('未检测到ADB设备，请确保模拟器已启动并已连接ADB')
             self.set_next_run('AutoCheckinBigGod', success=False, finish=True)
-            raise TaskEnd('AutoCheckinBigGod')
+            raise TaskEnd.completed('AutoCheckinBigGod')
         logger.info('ADB已连接')
 
         if not self._ensure_frida_server_running():
             logger.error('Frida Server启动失败，请检查模拟器环境')
             self.set_next_run('AutoCheckinBigGod', success=False, finish=True)
-            raise TaskEnd('AutoCheckinBigGod')
+            raise TaskEnd.completed('AutoCheckinBigGod')
         logger.info('Frida Server运行中')
 
         # [2/5] 启动大神APP
@@ -84,7 +84,7 @@ class ScriptTask(BaseTask):
         if not pid:
             logger.error('无法启动大神APP，请确保模拟器中已安装大神APP')
             self.set_next_run('AutoCheckinBigGod', success=False, finish=True)
-            raise TaskEnd('AutoCheckinBigGod')
+            raise TaskEnd.completed('AutoCheckinBigGod')
         self.frida_pid = pid
         logger.info(f'大神APP已运行 (PID: {pid})')
 
@@ -108,7 +108,7 @@ class ScriptTask(BaseTask):
         if not token_data:
             logger.error('无法获取Token，请确保已登录大神APP并绑定阴阳师角色')
             self.set_next_run('AutoCheckinBigGod', success=False, finish=True)
-            raise TaskEnd('AutoCheckinBigGod')
+            raise TaskEnd.completed('AutoCheckinBigGod')
 
         self.gl_uid = token_data.get('GL_UID', '')
         self.gl_token = token_data.get('GL_TOKEN', '')
@@ -143,7 +143,7 @@ class ScriptTask(BaseTask):
             logger.info('没有可领取的礼包')
             self._cleanup(restore_game=True)
             self.set_next_run('AutoCheckinBigGod', success=True, finish=True)
-            raise TaskEnd('AutoCheckinBigGod')
+            raise TaskEnd.completed('AutoCheckinBigGod')
 
         # [5/5] 领取礼包
         logger.info(f'[5/5] 领取 {len(rewards)} 个礼包...')
@@ -156,7 +156,7 @@ class ScriptTask(BaseTask):
         logger.info(f'完成! 成功领取 {success_count}/{len(rewards)} 个礼包')
         self._cleanup(restore_game=True)
         self.set_next_run('AutoCheckinBigGod', success=True, finish=True)
-        raise TaskEnd('AutoCheckinBigGod')
+        raise TaskEnd.completed('AutoCheckinBigGod')
 
     # ======================== 清理 ========================
 

@@ -28,7 +28,7 @@ class ScriptTask(OrochiScriptTask, TrueOrochiAssets):
             # 超过两次就说明这周打完了没有必要再打了
             logger.warning('This week is full')
             self.check_times(True)
-            raise TaskEnd('TrueOrochi')
+            raise TaskEnd.completed('TrueOrochi')
 
         # 御魂切换方式一
         if self.config.true_orochi.switch_soul.enable:
@@ -55,7 +55,7 @@ class ScriptTask(OrochiScriptTask, TrueOrochiAssets):
             if not conf.find_true_orochi:
                 logger.info('Not find_true_orochi_help')
                 self.check_times(False)
-                raise TaskEnd('TrueOrochi')
+                raise TaskEnd.completed('TrueOrochi')
 
             self.check_layer(Layer.TEN)
             self.check_lock(False)
@@ -85,7 +85,7 @@ class ScriptTask(OrochiScriptTask, TrueOrochiAssets):
         if not battle:
             # 如果还没有真蛇，那么就退出
             self.check_times(battle)
-            raise TaskEnd('TrueOrochi')
+            raise TaskEnd.completed('TrueOrochi')
         # 如果有真蛇，那么就开始战斗
         logger.hr('True Orochi Battle')
         conf.current_success += 1
@@ -167,7 +167,7 @@ class ScriptTask(OrochiScriptTask, TrueOrochiAssets):
 
         logger.info("Battle process end")
         self.check_times(battle)
-        raise TaskEnd('TrueOrochi')
+        raise TaskEnd.completed('TrueOrochi')
 
     def check_true_orochi(self, screenshot=False) -> bool:
         """

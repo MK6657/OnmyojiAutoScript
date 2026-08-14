@@ -7,6 +7,7 @@ from cached_property import cached_property
 from pydantic import BaseModel, ValidationError, validator, Field
 
 from module.config.utils import *
+from tasks.XiuxingHexun.availability import xiuxing_hexun_globally_enabled
 
 
 class ConfigMenu:
@@ -41,7 +42,12 @@ class ConfigMenu:
         # 每周任务
         self.menu["Weekly Task"] = ['TrueOrochi', 'RichMan', 'Secret', 'WeeklyTrifles', 'MysteryShop', 'Duel']
         # 活动的任务
-        self.menu["Activity Task"] = ['ActivityShikigami', 'MetaDemon', 'FrogBoss', 'FloatParade', 'Quiz', 'KittyShop', 'DyeTrials']
+        self.menu["Activity Task"] = [
+            'ActivityShikigami', 'MetaDemon', 'FrogBoss', 'FloatParade',
+            'Quiz', 'KittyShop', 'DyeTrials',
+        ]
+        if xiuxing_hexun_globally_enabled():
+            self.menu["Activity Task"].append("XiuxingHexun")
         # 开发工具
         self.menu["Tools"] = ['Image Rule', 'Ocr Rule', 'Click Rule', 'Long Click Rule', 'Swipe Rule', 'List Rule']
 

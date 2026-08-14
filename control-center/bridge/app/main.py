@@ -10,12 +10,12 @@ import subprocess
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from .core_client import CoreError, CoreUnavailable, OasCoreClient
+from .core_client import CoreConflict, CoreError, CoreUnavailable, OasCoreClient
 from .events import EventHub
 from .models import (
     AccountAction,
@@ -31,10 +31,16 @@ from .models import (
     TemplatePayload,
 )
 from .repository import MetadataRepository
-from .runtime import RuntimeRegistry
+from .runtime import (
+    AccountRuntime,
+    CommandExecutionError,
+    CommandInProgress,
+    CommandNotAccepted,
+    RuntimeRegistry,
+)
 
 
-BRIDGE_VERSION = "1.1.4"  # 1.1.4: 集成测试模式、mock Core 和 SQLite 强隔离
+BRIDGE_VERSION = "1.1.5"  # 1.1.5: fail-closed emulator identity binding
 ROOT = Path(os.getenv("OAS_CONTROL_CENTER_ROOT", str(Path(__file__).resolve().parents[2])))
 DEFAULT_DATA_DIR = ROOT / "data"
 DATA_DIR = Path(os.getenv("OAS_CONTROL_CENTER_DATA_DIR", str(DEFAULT_DATA_DIR)))
@@ -66,6 +72,7 @@ TASK_LABELS = {
     "WeeklyTrifles": "每周琐事", "MysteryShop": "神秘商店", "Duel": "自动斗技",
     "ActivityShikigami": "当期式神爬塔", "MetaDemon": "超鬼王", "FrogBoss": "青蛙瓷器",
     "FloatParade": "花车巡游", "Quiz": "智力问答", "KittyShop": "小猫の店", "DyeTrials": "染色试炼",
+    "XiuxingHexun": "修行合训",
 }
 
 CATEGORY_LABELS = {
@@ -108,12 +115,8 @@ def infer_window_serial(process: str, command_line: str, connected_serials: set[
         expected = f"127.0.0.1:{16384 + instance_index * 32}"
         return expected if expected in connected_serials else None
 
-    emulator_process = re.search(
-        r"mumu|nemu|dnplayer|ldplayer|nox|hd-player|bluestacks|memu",
-        process_lower,
-    )
-    if emulator_process and len(connected_serials) == 1:
-        return next(iter(connected_serials))
+    # Other emulator brands do not expose one shared, verified mapping contract here.
+    # A single online ADB device is not evidence that it belongs to this window.
     return None
 
 
@@ -300,9 +303,7 @@ class Bridge:
             raise HTTPException(status_code=503, detail="OAS Core 未启动，请先启动原项目服务")
 
     async def catalog(self, force: bool = False) -> list[TaskSummary]:
-        """任务目录在 Core 一次启动内是固定的（来自 template 的 gui_menu_list），可以缓存。"""
-        if self._catalog is not None and not force:
-            return self._catalog
+        """Read the current Core catalog so activity teardown cannot stay stale."""
         menu = await self.core.menu()
         result: list[TaskSummary] = []
         for category, tasks in menu.items():
@@ -325,6 +326,14 @@ class Bridge:
             enable = fields.get("enable")
             if enable is None or not enable.get("value"):
                 return None
+            if task.id == "XiuxingHexun":
+                activity_fields = {
+                    field.get("name"): field
+                    for field in args.get("activity_enabled", [])
+                }
+                activity_enabled = activity_fields.get("activity_enabled")
+                if activity_enabled is not None and not activity_enabled.get("value"):
+                    return None
             next_run = fields.get("next_run", {}).get("value")
             return task.id, str(next_run) if next_run else None
 
@@ -360,7 +369,9 @@ class Bridge:
         by_id = {task.id: task for task in catalog}
         result: list[TaskSummary] = []
         for task_id, next_run in enabled.items():
-            base = by_id.get(task_id) or TaskSummary(id=task_id, title=task_label(task_id), category=category_label("Other"))
+            base = by_id.get(task_id)
+            if base is None:
+                continue
             result.append(base.model_copy(update={"enabled": True, "next_run": next_run}))
         order = {task.id: index for index, task in enumerate(catalog)}
         result.sort(key=lambda task: order.get(task.id, len(order)))
@@ -408,9 +419,62 @@ def translate_core_error(error: Exception) -> HTTPException:
         return error
     if isinstance(error, CoreUnavailable):
         return HTTPException(status_code=503, detail=str(error))
+    if isinstance(error, CoreConflict):
+        return HTTPException(status_code=409, detail=str(error))
     if isinstance(error, CoreError):
         return HTTPException(status_code=502, detail=str(error))
     return HTTPException(status_code=500, detail=str(error))
+
+
+def _confirmed_command_result(command: str, result: Any) -> dict[str, Any]:
+    if not isinstance(result, dict) or not result.get("success", False):
+        reason = result.get("reason", "missing_completion_receipt") if isinstance(result, dict) else "missing_completion_receipt"
+        raise CoreError(f"Core command failed: command={command}, reason={reason}")
+    return result
+
+
+async def _send_account_command(
+    account_id: str,
+    command: str,
+    runtime: AccountRuntime | None,
+) -> dict[str, Any]:
+    if runtime is not None:
+        try:
+            result = await runtime.try_command(command)
+        except CommandInProgress as error:
+            # DeepSeek-14 B1/A1: Core acked but the receipt is still in flight.
+            # Surface 202/in_progress; never re-issue and never report failure.
+            raise HTTPException(
+                status_code=202,
+                detail={"status": "in_progress", "command_id": error.command_id},
+            ) from error
+        except CommandNotAccepted as error:
+            # WS never accepted the command (no ack, no receipt): REST fallback
+            # carries the SAME command_id so Core can replay instead of
+            # double-run.
+            fallback_id = error.command_id
+        except CommandExecutionError as error:
+            raise CoreError(str(error)) from error
+        else:
+            if result:
+                return _confirmed_command_result(command, result)
+            fallback_id = getattr(runtime, "_last_command_id", None)
+    else:
+        fallback_id = None
+    if command == "start":
+        result = await bridge.core.start_script(account_id, command_id=fallback_id)
+    elif command == "stop":
+        result = await bridge.core.stop_script(account_id, command_id=fallback_id)
+    else:
+        raise HTTPException(status_code=503, detail=f"账号 {account_id} 的 OAS WebSocket 未连接")
+    if isinstance(result, dict) and result.get("status") == "in_progress":
+        # DeepSeek-14 B1 v2: Core is still executing the WS-side command; the
+        # REST fallback must surface 202 instead of a failure.
+        raise HTTPException(
+            status_code=202,
+            detail={"status": "in_progress", "command_id": fallback_id},
+        )
+    return _confirmed_command_result(command, result)
 
 
 @app.get("/api/v1/health")
@@ -476,12 +540,15 @@ async def patch_account(account_id: str, payload: AccountPatch) -> AccountView:
         new_id = patch["name"].strip()
         if not new_id or new_id == "template" or "/" in new_id or "\\" in new_id:
             raise HTTPException(status_code=400, detail="账号名称不可用")
-        # 先尽力停掉这个账号的任务再改名：Core 的 config_rename 内部那次 stop
-        # 因缺 await 是空操作（handoff/15 A2），不先停会留下继续跑旧配置的脱管进程。
-        runtime = bridge.runtimes.peek(account_id)
-        if runtime is not None:
-            await runtime.try_command("stop")
+        # 改名前必须拿到 Core 的完成回执。停止失败时保留运行时和元数据，
+        # 不能把仍在运行的 worker 变成脱管进程。
         try:
+            runtime = bridge.runtimes.peek(account_id)
+            if runtime is None:
+                await _send_account_command(account_id, "stop", None)
+            else:
+                async with runtime.action_lock:
+                    await _send_account_command(account_id, "stop", runtime)
             await bridge.core.rename_account(account_id, new_id)
         except Exception as error:
             raise translate_core_error(error) from error
@@ -504,16 +571,16 @@ async def delete_account(account_id: str) -> dict[str, bool]:
     if account_id == "template":
         raise HTTPException(status_code=400, detail="不能删除模板账号")
     runtime = bridge.runtimes.peek(account_id)
-    if runtime:
-        try:
-            await runtime.try_command("stop")
-        except Exception:
-            pass
-    await bridge.runtimes.drop(account_id)
     try:
+        if runtime is None:
+            await _send_account_command(account_id, "stop", None)
+        else:
+            async with runtime.action_lock:
+                await _send_account_command(account_id, "stop", runtime)
         await bridge.core.delete_account(account_id)
     except Exception as error:
         raise translate_core_error(error) from error
+    await bridge.runtimes.drop(account_id)
     bridge.repository.delete(account_id)
     bridge.task_cache.invalidate(account_id)
     await bridge.events.emit("account.deleted", account_id)
@@ -572,20 +639,35 @@ async def account_schedule(account_id: str) -> dict[str, Any]:
 @app.put("/api/v1/accounts/{account_id}/tasks/{task_id}/enabled", response_model=TaskSummary)
 async def set_task_enabled(account_id: str, task_id: str, enabled: bool) -> TaskSummary:
     try:
-        await bridge.core.set_value(account_id, task_id, "scheduler", "enable", enabled, "boolean")
-        bridge.task_cache.invalidate(account_id)
-        catalog = await bridge.catalog()
-        match = next(
-            (item for item in catalog if item.id == task_id),
-            TaskSummary(id=task_id, title=task_label(task_id), category=category_label("Other")),
+        catalog = await bridge.catalog(force=True)
+        match = next((item for item in catalog if item.id == task_id), None)
+        if enabled and match is None:
+            raise HTTPException(status_code=409, detail=f"任务 {task_id} 当前已下架，不能启用")
+        revision = await bridge.core.config_revision(account_id)
+        await bridge.core.patch_values(
+            account_id,
+            task_id,
+            [{
+                "group": "scheduler",
+                "name": "enable",
+                "value": enabled,
+                "type": "boolean",
+            }],
+            revision,
         )
+        bridge.task_cache.invalidate(account_id)
+        if match is None:
+            match = TaskSummary(id=task_id, title=task_label(task_id), category=category_label("Other"))
         args = await bridge.core.task_args(account_id, task_id)
         fields = {field.get("name"): field for field in args.get("scheduler", [])}
         next_run = fields.get("next_run", {}).get("value")
         runtime = bridge.runtimes.peek(account_id)
-        if runtime is not None and runtime.connected:
-            # 让 Core 重算调度，否则概览里的排期会停留在旧数据上。
-            await runtime.try_command("get_schedule")
+        if runtime is not None:
+            # Core 可能已经离线；先丢弃旧快照，避免它覆盖刚写入的真实配置。
+            runtime.invalidate_schedule()
+            if runtime.connected:
+                # 让 Core 重算调度，否则概览里的排期会停留在旧数据上。
+                await runtime.try_command("get_schedule")
         await bridge.events.emit("task.state", account_id, task_id, payload={"enabled": enabled})
         return match.model_copy(update={"enabled": enabled, "next_run": str(next_run) if next_run else None})
     except Exception as error:
@@ -612,18 +694,32 @@ async def task_config(account_id: str, task_id: str) -> TaskConfig:
                 )
                 for field in fields
             ]
-        return TaskConfig(task_id=task_id, title=task_label(task_id), groups=groups)
+        revision = await bridge.core.config_revision(account_id)
+        return TaskConfig(
+            task_id=task_id,
+            title=task_label(task_id),
+            groups=groups,
+            revision=revision,
+        )
     except Exception as error:
         raise translate_core_error(error) from error
 
 
 @app.patch("/api/v1/accounts/{account_id}/tasks/{task_id}/config")
-async def patch_task_config(account_id: str, task_id: str, payload: ConfigPatch) -> dict[str, Any]:
+async def patch_task_config(
+    account_id: str,
+    task_id: str,
+    payload: ConfigPatch,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+) -> dict[str, Any]:
     try:
+        expected_revision = payload.revision or (if_match or "").strip().strip('"')
+        if not expected_revision:
+            raise HTTPException(status_code=428, detail="配置已过期：保存请求缺少 revision，请重新加载后再试")
         # 只在真的缺类型时读一次 schema。原实现是「每个缺类型的字段读一次」，
         # 保存一张大表单能把同一份几十 KB 的 schema 反复拉几十遍。
         schema: dict[str, list[dict[str, Any]]] | None = None
-        updated = 0
+        prepared_fields = []
         touched_scheduler = False
         for field in payload.fields:
             value_type = field.type
@@ -632,18 +728,36 @@ async def patch_task_config(account_id: str, task_id: str, payload: ConfigPatch)
                     schema = await bridge.core.task_args(account_id, task_id)
                 entry = next((item for item in schema.get(field.group, []) if item.get("name") == field.name), None)
                 value_type = (entry or {}).get("type", "string")
-            await bridge.core.set_value(account_id, task_id, field.group, field.name, field.value, value_type)
-            updated += 1
+            prepared_fields.append({
+                "group": field.group,
+                "name": field.name,
+                "value": field.value,
+                "type": value_type,
+            })
             if field.group == "scheduler":
                 touched_scheduler = True
+
+        result = await bridge.core.patch_values(
+            account_id,
+            task_id,
+            prepared_fields,
+            expected_revision,
+        )
+        updated = int(result.get("updated", len(prepared_fields)))
 
         if touched_scheduler:
             bridge.task_cache.invalidate(account_id)
             runtime = bridge.runtimes.peek(account_id)
-            if runtime is not None and runtime.connected:
-                await runtime.try_command("get_schedule")
+            if runtime is not None:
+                runtime.invalidate_schedule()
+                if runtime.connected:
+                    await runtime.try_command("get_schedule")
         await bridge.events.emit("task.configured", account_id, task_id, payload={"fields": updated})
-        return {"saved": True, "updated": updated}
+        return {
+            "saved": True,
+            "updated": updated,
+            "revision": result.get("revision"),
+        }
     except Exception as error:
         raise translate_core_error(error) from error
 
@@ -655,31 +769,57 @@ async def account_action(account_id: str, payload: AccountAction) -> dict[str, A
             raise HTTPException(status_code=404, detail="账号不存在")
         runtime = bridge.runtimes.get(account_id)
 
-        async def send(command: str) -> None:
+        async def send(command: str) -> dict[str, Any]:
             """先走 WebSocket；连不上时退回 Core 的 REST 入口，
             这样「Core 在跑但 WS 刚断」不会直接变成一次失败的启动。"""
-            if await runtime.try_command(command):
-                return
-            if command == "start":
-                await bridge.core.start_script(account_id)
-            elif command == "stop":
-                await bridge.core.stop_script(account_id)
-            else:
-                raise HTTPException(status_code=503, detail=f"账号 {account_id} 的 OAS WebSocket 未连接")
+            return await _send_account_command(account_id, command, runtime)
 
-        if payload.action == "refresh":
-            await runtime.wait_connected(timeout=2.0)
-            await runtime.try_command("get_state")
-            await runtime.try_command("get_schedule")
-        elif payload.action == "restart":
-            await send("stop")
-            await asyncio.sleep(0.4)
-            await send("start")
-        else:
-            await send(payload.action)
-        return {"accepted": True, "account_id": account_id, "action": payload.action, "state": runtime.snapshot()}
+        async def execute_action() -> list[dict[str, Any]]:
+            command_results = []
+            if payload.action == "refresh":
+                await runtime.wait_connected(timeout=2.0)
+                for command in ("get_state", "get_schedule"):
+                    result = await runtime.try_command(command)
+                    if result:
+                        command_results.append(result)
+            elif payload.action == "restart":
+                command_results.append(await send("stop"))
+                await asyncio.sleep(0.4)
+                command_results.append(await send("start"))
+            else:
+                command_results.append(await send(payload.action))
+            return command_results
+
+        async with runtime.action_lock:
+            command_results = await execute_action()
+        return {
+            "accepted": True,
+            "status": "completed",
+            "account_id": account_id,
+            "action": payload.action,
+            "commands": command_results,
+            "state": runtime.snapshot(),
+        }
     except Exception as error:
         raise translate_core_error(error) from error
+
+
+@app.get("/api/v1/accounts/{account_id}/commands/{command_id}")
+async def account_command_result(account_id: str, command_id: str) -> dict[str, Any]:
+    """DeepSeek-14 B1/A1: query channel for a command whose receipt arrived
+    after the original HTTP request returned 202/in_progress."""
+    runtime = bridge.runtimes.get(account_id)
+    if runtime is None:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    late = runtime._late_results.get(command_id)
+    if late is not None:
+        return {"status": "completed", **late}
+    future = runtime._pending_commands.get(command_id)
+    if future is not None and future.done() and not future.cancelled():
+        return {"status": "completed", **future.result()}
+    if command_id in runtime._acked_commands or (future is not None and not future.done()):
+        return {"status": "in_progress", "command_id": command_id}
+    return {"status": "unknown", "command_id": command_id}
 
 
 @app.get("/api/v1/accounts/{account_id}/logs")

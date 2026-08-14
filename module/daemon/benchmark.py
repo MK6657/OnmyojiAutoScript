@@ -22,10 +22,10 @@ def float2str(n, decimal=3):
 
 
 class Benchmark(DaemonBase):
-    TEST_TOTAL = 15
-    TEST_BEST = int(TEST_TOTAL * 0.8)
+    WARMUP_TOTAL = 5
+    TEST_TOTAL = 30
 
-    def benchmark_test(self, func, *args, **kwargs):
+    def benchmark_test(self, func, *args, validator=None, label=None, **kwargs):
         """
         Args:
             func: Function to test.
@@ -36,21 +36,44 @@ class Benchmark(DaemonBase):
             float: Time cost on average.
         """
         logger.hr(f'Benchmark test', level=2)
-        logger.info(f'Testing function: {func.__name__}')
+        label = label or getattr(func, '__name__', repr(func))
+        logger.info(f'Testing function: {label}')
         record = []
+
+        for n in range(1, self.WARMUP_TOTAL + 1):
+            try:
+                result = func(*args, **kwargs)
+                if validator is not None and not validator(result):
+                    logger.warning(
+                        f'Benchmark warmup rejected contract: {label} warmup={n}'
+                    )
+                    return 'Failed'
+            except RequestHumanTakeover:
+                logger.critical('RequestHumanTakeover')
+                logger.warning(f'Benchmark warmup failed on func: {label}')
+                return 'Failed'
+            except Exception as e:
+                logger.exception(e)
+                logger.warning(f'Benchmark warmup failed on func: {label}')
+                return 'Failed'
 
         for n in range(1, self.TEST_TOTAL + 1):
             start = time.time()
 
             try:
-                func(*args, **kwargs)
+                result = func(*args, **kwargs)
+                if validator is not None and not validator(result):
+                    logger.warning(
+                        f'Benchmark sample rejected contract: {label} sample={n}'
+                    )
+                    return 'Failed'
             except RequestHumanTakeover:
                 logger.critical('RequestHumanTakeover')
-                logger.warning(f'Benchmark tests failed on func: {func.__name__}')
+                logger.warning(f'Benchmark tests failed on func: {label}')
                 return 'Failed'
             except Exception as e:
                 logger.exception(e)
-                logger.warning(f'Benchmark tests failed on func: {func.__name__}')
+                logger.warning(f'Benchmark tests failed on func: {label}')
                 return 'Failed'
 
             cost = time.time() - start
@@ -61,9 +84,48 @@ class Benchmark(DaemonBase):
             record.append(cost)
 
         logger.info('Benchmark tests done')
-        average = float(np.mean(np.sort(record)[:self.TEST_BEST]))
-        logger.info(f'Time cost {float2str(average)} ({self.TEST_BEST} best results out of {self.TEST_TOTAL} tests)')
+        p50 = float(np.percentile(record, 50))
+        p95 = float(np.percentile(record, 95))
+        average = float(np.mean(record))
+        if not hasattr(self, 'last_metrics'):
+            self.last_metrics = {}
+        self.last_metrics[label] = {
+            'warmup': self.WARMUP_TOTAL,
+            'samples': len(record),
+            'p50': p50,
+            'p95': p95,
+            'mean': average,
+        }
+        logger.info(
+            f'Benchmark metrics label={label} samples={len(record)} '
+            f'P50={float2str(p50)} P95={float2str(p95)} mean={float2str(average)}'
+        )
         return average
+
+    def _valid_screenshot_frame(self, image, method):
+        """Only allow canonical RGB 1280x720 frames into recommendations."""
+        if image is None or not isinstance(image, np.ndarray):
+            return False
+        try:
+            image = self.device._handle_orientated_image(image)
+        except Exception as error:
+            logger.warning(f'Benchmark frame normalization failed method={method}: {error}')
+            return False
+        shape = getattr(image, 'shape', ())
+        valid = (
+            len(shape) == 3
+            and shape[0] == 720
+            and shape[1] == 1280
+            and shape[2] == 3
+            and image.dtype == np.uint8
+        )
+        if not valid:
+            logger.warning(
+                f'Benchmark screenshot contract rejected method={method} shape={shape} '
+                f'dtype={getattr(image, "dtype", None)} expected=720x1280x3 uint8 '
+                'color=RGB'
+            )
+        return valid
 
     @staticmethod
     def evaluate_screenshot(cost):
@@ -136,14 +198,23 @@ class Benchmark(DaemonBase):
 
         screenshot_result = []
         for method in screenshot:
-            result = self.benchmark_test(self.device.screenshot_methods[method])
+            result = self.benchmark_test(
+                self.device.screenshot_methods[method],
+                validator=lambda image, method=method: self._valid_screenshot_frame(image, method),
+                label=f'screenshot:{method}',
+            )
             screenshot_result.append([method, result])
 
         area = (120, 20, 200, 50)  # Somewhere safe to click.
         click_result = []
         for method in click:
             x, y = random_rectangle_point(area)
-            result = self.benchmark_test(self.device.click_methods[method], x, y)
+            result = self.benchmark_test(
+                self.device.click_methods[method],
+                x,
+                y,
+                label=f'click:{method}',
+            )
             click_result.append([method, result])
 
         def compare(res):
@@ -154,13 +225,20 @@ class Benchmark(DaemonBase):
                 return res
 
         logger.hr('Benchmark Results', level=1)
-        fastest_screenshot = 'ADB_nc'
+        fastest_screenshot = None
         fastest_click = 'minitouch'
         if screenshot_result:
             self.show(test='Screenshot', data=screenshot_result, evaluate_func=self.evaluate_screenshot)
-            fastest = sorted(screenshot_result, key=lambda item: compare(item))[0]
-            logger.info(f'Recommend screenshot method: {fastest[0]} ({float2str(fastest[1])})')
-            fastest_screenshot = fastest[0]
+            valid_screenshots = [item for item in screenshot_result if isinstance(item[1], (int, float))]
+            if valid_screenshots:
+                fastest = sorted(valid_screenshots, key=lambda item: compare(item))[0]
+                logger.info(f'Recommend screenshot method: {fastest[0]} ({float2str(fastest[1])})')
+                fastest_screenshot = fastest[0]
+            else:
+                logger.error(
+                    'No screenshot method passed the 1280x720 RGB contract; '
+                    'automatic recommendation disabled'
+                )
         if click_result:
             self.show(test='Control', data=click_result, evaluate_func=self.evaluate_click)
             fastest = sorted(click_result, key=lambda item: compare(item))[0]
@@ -199,7 +277,13 @@ class Benchmark(DaemonBase):
 
     def run(self):
         try:
-            self.config.override(self.device.screenshot_method == 'ADB')
+            # The selected method belongs to the config model.  Device does
+            # not expose a duplicate screenshot_method attribute, and using
+            # one here breaks the generic benchmark path before any sample
+            # can be collected.
+            self.config.override(
+                self.config.script.device.screenshot_method == 'ADB'
+            )
             self.device.uninstall_minicap()
 
         except RequestHumanTakeover:
@@ -231,8 +315,6 @@ class Benchmark(DaemonBase):
             screenshot = remove('window_background')
         screenshot = tuple(screenshot)
 
-        self.TEST_TOTAL = 3
-        self.TEST_BEST = 1
         method, _ = self.benchmark(screenshot, tuple())
 
         return method

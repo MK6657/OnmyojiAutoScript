@@ -240,6 +240,7 @@ class RuleImage(RuleImageMallResourceMixin):
         best_score = 0
         best_loc = None
         best_scale = 1.0
+        best_size = (mat_w, mat_h)
 
         for scale in scales:
             scaled_w = int(mat_w * scale)
@@ -258,6 +259,7 @@ class RuleImage(RuleImageMallResourceMixin):
                     best_score = max_val
                     best_loc = max_loc
                     best_scale = scale
+                    best_size = (scaled_w, scaled_h)
             except Exception as e:
                 continue
 
@@ -267,8 +269,11 @@ class RuleImage(RuleImageMallResourceMixin):
         if best_score > threshold and best_loc is not None:
             self.roi_front[0] = best_loc[0] + self.roi_back[0]
             self.roi_front[1] = best_loc[1] + self.roi_back[1]
-            self.roi_front[2] = scaled_w
-            self.roi_front[3] = scaled_h
+            # Use the dimensions belonging to the winning scale.  The old
+            # code wrote the dimensions from the last loop iteration, which
+            # made the following click drift when the best match was not the
+            # final scale in the list.
+            self.roi_front[2], self.roi_front[3] = best_size
             return True
         else:
             return False

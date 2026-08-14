@@ -31,7 +31,7 @@ class ScriptTask(Mall, Guild, ThousandThings, Shrine):
 
         self.set_next_run(task='RichMan', success=True, finish=False)
 
-        raise TaskEnd('RichMan')
+        raise TaskEnd.completed('RichMan')
 
 
 if __name__ == '__main__':

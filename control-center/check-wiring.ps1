@@ -1,4 +1,4 @@
-<#
+﻿<#
   三层连通性自检：OAS Core → Bridge → 前端契约
 
   回答的是「前端和后端到底有没有接上」这个问题，只做只读请求：
@@ -43,17 +43,17 @@ function Get-Json {
 Write-Host ''
 Write-Host '== 第一层：OAS Core ==' -ForegroundColor Cyan
 Step 'Core 存活 (GET /test)' {
-  $result = Get-Json "$CoreUrl/test"
+  $result = Get-Json "${CoreUrl}/test"
   if ("$result" -ne 'success') { throw "返回了 $result，期望 success" }
   $CoreUrl
 }
 Step 'Core 返回配置列表 (GET /config_list)' {
-  $list = Get-Json "$CoreUrl/config_list"
+  $list = Get-Json "${CoreUrl}/config_list"
   if (-not $list) { throw 'Core 没有返回任何配置' }
   "$($list.Count) 个账号：$($list -join ', ')"
 }
 Step 'Core 返回任务菜单 (GET /script_menu)' {
-  $menu = Get-Json "$CoreUrl/script_menu"
+  $menu = Get-Json "${CoreUrl}/script_menu"
   $count = ($menu.PSObject.Properties | ForEach-Object { $_.Value.Count } | Measure-Object -Sum).Sum
   "$count 项任务"
 }
@@ -62,7 +62,7 @@ Write-Host ''
 Write-Host '== 第二层：Bridge ==' -ForegroundColor Cyan
 $bridgeHealth = $null
 Step 'Bridge 存活 (GET /api/v1/health)' {
-  $script:bridgeHealth = Get-Json "$BridgeUrl/api/v1/health"
+  $script:bridgeHealth = Get-Json "${BridgeUrl}/api/v1/health"
   if ($script:bridgeHealth.bridge -ne 'ok') { throw "bridge 字段为 $($script:bridgeHealth.bridge)" }
   "版本 $($script:bridgeHealth.version)"
 }
@@ -75,20 +75,24 @@ Step 'Bridge 已经连上 Core' {
 $accounts = @()
 Step 'Bridge 能读出账号（这一步会真的穿透到 Core）' {
   $started = Get-Date
-  $script:accounts = @(Get-Json "$BridgeUrl/api/v1/accounts")
+  $script:accounts = @(Get-Json "${BridgeUrl}/api/v1/accounts")
   $elapsed = [int]((Get-Date) - $started).TotalMilliseconds
+  $script:firstAccountsElapsedMs = $elapsed
   if (-not $script:accounts) { throw 'Bridge 返回了空账号列表' }
   "$($script:accounts.Count) 个账号，耗时 ${elapsed}ms"
 }
 Step '第二次读账号应该走缓存（明显更快）' {
   if (-not $script:accounts) { throw '上一步没拿到账号' }
   $started = Get-Date
-  Get-Json "$BridgeUrl/api/v1/accounts" | Out-Null
+  Get-Json "${BridgeUrl}/api/v1/accounts" | Out-Null
   $elapsed = [int]((Get-Date) - $started).TotalMilliseconds
-  "耗时 ${elapsed}ms（明显高于首次说明缓存没生效，请检查 Bridge 是否为新版）"
+  if ($elapsed -ge $script:firstAccountsElapsedMs) {
+    throw "第二次耗时 ${elapsed}ms，未快于首次 $($script:firstAccountsElapsedMs)ms，请检查 Bridge 缓存"
+  }
+  "耗时 ${elapsed}ms，首次 $($script:firstAccountsElapsedMs)ms（缓存命中）"
 }
 Step 'Bridge 返回任务目录' {
-  $catalog = @(Get-Json "$BridgeUrl/api/v1/tasks/catalog")
+  $catalog = @(Get-Json "${BridgeUrl}/api/v1/tasks/catalog")
   $english = @($catalog | Where-Object { $_.category -match '[A-Za-z]' })
   if ($english.Count -gt 0) { throw "有 $($english.Count) 个分类没翻译：$(($english.category | Select-Object -Unique) -join ', ')" }
   "$($catalog.Count) 项任务，分类均已中文化"
@@ -99,28 +103,28 @@ if ($accounts) {
   Write-Host ''
   Write-Host "== 第三层：前端会用到的接口（以账号 $first 为例，只读） ==" -ForegroundColor Cyan
   Step "已启用任务 (GET /accounts/$first/tasks)" {
-    $tasks = @(Get-Json "$BridgeUrl/api/v1/accounts/$first/tasks")
+    $tasks = @(Get-Json "${BridgeUrl}/api/v1/accounts/$first/tasks")
     "$($tasks.Count) 项已启用"
   }
   Step "任务配置 (GET /accounts/$first/tasks/Script/config)" {
-    $config = Get-Json "$BridgeUrl/api/v1/accounts/$first/tasks/Script/config"
+    $config = Get-Json "${BridgeUrl}/api/v1/accounts/$first/tasks/Script/config"
     $groups = @($config.groups.PSObject.Properties.Name)
     "分组：$($groups -join ', ')"
   }
   Step "调度快照 (GET /accounts/$first/schedule) — 新增接口" {
-    $schedule = Get-Json "$BridgeUrl/api/v1/accounts/$first/schedule"
+    $schedule = Get-Json "${BridgeUrl}/api/v1/accounts/$first/schedule"
     "待执行 $(@($schedule.pending).Count) 项 / 等待 $(@($schedule.waiting).Count) 项"
   }
   Step "日志 (GET /accounts/$first/logs)" {
-    $logs = @(Get-Json "$BridgeUrl/api/v1/accounts/$first/logs?limit=20")
+    $logs = @(Get-Json "${BridgeUrl}/api/v1/accounts/$first/logs?limit=20")
     "$($logs.Count) 条"
   }
   Step '配置模板 (GET /templates) — 新增接口' {
-    $templates = @(Get-Json "$BridgeUrl/api/v1/templates")
+    $templates = @(Get-Json "${BridgeUrl}/api/v1/templates")
     "$($templates.Count) 个模板"
   }
   Step '窗口列表 (GET /windows)' -Optional {
-    $windows = @(Get-Json "$BridgeUrl/api/v1/windows")
+    $windows = @(Get-Json "${BridgeUrl}/api/v1/windows")
     "$($windows.Count) 个可绑定窗口"
   }
 }

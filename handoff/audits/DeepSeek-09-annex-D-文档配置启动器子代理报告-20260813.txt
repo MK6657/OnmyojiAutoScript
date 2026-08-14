@@ -1,0 +1,101 @@
+核对完成。以下为完整审查报告。
+
+---
+
+# coordinate-calibrator v0.3.8 只读审查报告（文档/配置/启动器/测试）
+
+范围：docs/ 12 个 md、config.example/local.toml、start/stop/test.ps1、scripts/cleanup-generated.ps1、tests/ 13 个文件。**全程只读，未修改任何文件、未运行任何脚本/服务/迁移。**
+
+## ① 文档↔代码一致性核对表
+
+| # | claim（文档出处） | 代码现实 | 判定 | 证据 |
+|---|---|---|---|---|
+| 1 | protocol.md 路由表（62 个方法级路由，含 2 个 WS） | 代码 63 个 API 路由 + `GET /`(HTML)+`/web` 静态挂载；文档列出的 62 个全部存在 | ✅ | app.py:515-1570 全部 @app 装饰器逐一比对 |
+| 2 | protocol.md:139-141 稳定错误码 25 个 | 24 个真实发射；**`lease_required` 全库 0 命中**（缺租约实际走 RepositoryConflict→`lease_conflict`/423） | ❌ | lease_required grep=0；app.py:483-487 |
+| 3 | 错误码反向漂移 | 代码发射 5 个文档未列码：`invalid_owner`、`cross_workspace_selection`、`invalid_content_length`、`bundle_too_large`、`invalid_bundle` | ⚠️ | app.py:401,1490,1431,1475,1480,1486,1501（文档措辞为"include"，非穷举，低危） |
+| 4 | protocol.md:135 会话 WS 5 类事件 | 全部存在：frame_published / capture_error / target_lost / session_state / session_closed | ✅ | runtime.py:1305,1313,1325,1428,1551；app.py:1558,1562 |
+| 5 | protocol.md:137 工作区 WS "committed library changes" + workspace_state + heartbeat | 17 类事件全齐（workspace_updated/group_*/canvas_*/background_*/annotation_*）✅；**心跳实际 ≈1s，非声称的 "approximately 15-second"** | ❌ | app.py:1599 `subscriber.get(True, 1.0)` 空轮询即发 heartbeat（会话 WS 的 15.0s 是状态轮询，非心跳，app.py:1550） |
+| 6 | security.md:12 max_frames/max_samples/max_annotations enforced | 三个键均有运行时强制点（0.3.3 时代为死配置，现已修复） | ✅ | runtime.py:1756/1775、3144、2675；bundles.py:360-361 |
+| 7 | security.md:12 帧剪枝不得删当前帧/软删标注源/样本证据帧 | referenced 集合含 latest_frame+annotations.frame_id+samples(before/after)+backgrounds | ✅ | repository.py `_referenced_frame_ids_in_connection`（3 类来源全收集） |
+| 8 | security.md:9 请求体在 Pydantic 解析前限界 | RequestBodyLimitMiddleware 先于路由读 body | ✅ | app.py:237-283,287 |
+| 9 | security.md:17 TrustedHost + HTTP/WS Origin 检查 | 三者齐全（自定义 origin_guard 中间件 + WS 端 origin 校验） | ✅ | app.py:286,292-302；app.py:1530-1533,1569-1571 |
+| 10 | security.md:17 端口专属 cookie、HttpOnly/SameSite=Strict | 一致 | ✅ | app.py:92,531-539 |
+| 11 | architecture.md:73/README:36 普通启动绝不迁移 | `allow_schema_migration=False`（服务路径）；仅 maintenance migrate 命令为 True | ✅ | app.py:163；maintenance.py:162；runtime.py:223 默认 False |
+| 12 | architecture.md:9 每数据根单实例锁 | msvcrt 非阻塞文件锁，锁内含 pid+启动时刻 | ✅ | instance_lock.py:15,29-46；app.py:139 |
+| 13 | data-model.md schema 字段 ↔ 建表 SQL | 16 张表与文档实体一致；CanvasBackground/Annotation/Frame 字段与 models.py + payload 列吻合 | ✅ | repository.py:530-676；domain/models.py:106-186 |
+| 14 | protocol.md:131 bundle 预校验 8192/50 背景/300 标注/200 组 | 常量与校验点完全一致 | ✅ | bundles.py:29-33,275-287,360-361,387-443 |
+| 15 | protocol.md:9 "所有批写带 selection_hash" | canvas 批操作必填、batch-delete 可选校验；**batch-visibility/batch-restore 无此字段**（audit 已记录的 P3） | ❌ | schemas.py:114,190 vs 1268-1276 两路由无校验；audit-20260809.md:151 |
+| 16 | test-plan.md 审计回归矩阵各条有对应测试 | migrate/bundle 预校验/导出快照/幂等-租约/reconcile/DPI/绑定/鼠标/身份漂移均有具名测试 | ✅ | 测试方法名逐一命中（见④） |
+| 17 | README:106 "146 Python 测试" | 静态清点 `def test_` = 146 | ✅ | 9 文件：47+23+16+16+15+11+10+6+2 |
+| 18 | test-plan/README 声称 test.ps1 检查项 | unittest+compileall+node --check+2 JS 断言+PS AST×3+wheel 构建，全部存在 | ✅ | test.ps1:57-91 |
+| 19 | audit 开放项在 0.3.7/0.3.8 声称修复后是否真关（本范围） | CC-SEC-002 ✅关（server.py:18-40 CLI 绑定拒冲突）；CC-MIGRATE-001 ✅关；CC-BUNDLE-001 ✅关；CC-EXPORT-SNAPSHOT-001 ✅关（锁序+快照导出+2 个专项测试）；P2 幂等指纹含 lease ✅关（app.py:412-414）；**P2 quarantine 无界 ❌仍开**（maintenance 无 gc/purge）；**P3 selection_hash 缺口 ❌仍开**；**P3 失败 .ccproj 遗留空组 ❌仍开**（bundles.py:643-654 补偿不删 create_group 建的分组）；**P3 build_report 双遍历 ❌仍开**（statistics.py:177-188）；P3 详情视图 include_archived ⚠️ 经 API 简化消解（app.py:646-648 已无该参数，summary 路由 631-643 正常） | 详见各证据 | — |
+| 20 | 0.3.8 worklog：netstat 改纯字节解析 | 属实，`_local_endpoint_pid` 读 `stdout or b""` 字节切列，无 text=True | ✅ | common.py:135-172 |
+| 21 | security.md:10 ADB 流式硬字节上限 | 专项测试存在（test_adb_streaming_path_kills_process_at_limit） | ✅(测试存在) | tests/test_capture_sources.py |
+
+## ② 死配置清单（inert-config）
+
+**config.example.toml 全部 22 个键均有解析点+强制点，死配置清单为空。** 逐键证据：max_frames→runtime.py:1756/1775；max_samples→runtime.py:3144；max_annotations→runtime.py:2675+bundles.py:361；max_workspaces→runtime.py:332+bundles.py:383；max_sessions→runtime.py:641+bundles.py:405；max_workspace_canvases→runtime.py:642+bundles.py:374/385；max_backgrounds→runtime.py:1725+bundles.py:360；max_session/max_total/min_free_bytes→runtime.py:1665-1677；max_output_files/bytes→app.py:1089-1090,1329-1330,1365-1366；per_monitor_dpi→app.py:141；mouse_backend→runtime.py:3006；max_request_bytes→app.py:287；require_token/allow_remote→app.py:89-90；root/output_root/log_root→settings.py:153-155；oas 四键→settings.py:152-156+app.py:145-146。**与 0.3.3 时代（max_* 三键 0 命中）相比已全部激活，无安全类死旋钮。**
+
+config.local.toml 凭据检查：token/key/secret/password 均为 **0 命中**，无真实凭据（仅 `[oas]` enabled=true/root=D:/OSAyys/config_name=oas1/window_title=2301 与 `[windows]` per_monitor_dpi=true，无任何密钥值）。
+
+配额默认值三方一致：README"最多 50 背景"=example 50=settings 默认 50 ✅；协议 300 标注/200 组/8192= bundles 常量 ✅（注意：`min(300, max_annotations=200)` 下本地导入上限实为 200，300 是共享上限，与文档不矛盾）。
+
+## ③ 启动器问题清单
+
+| 文件:行 | 严重度 | 现象/证据 |
+|---|---|---|
+| start.ps1:52-55 | 🟢 | 端口检查用 Get-NetTCPConnection（仅 Listen）；Windows 保留端口范围内的监听对其不可见——需同时起第二个进程才由 .instance.lock 兜底，属双重防护设计，观察项 |
+| start.ps1:63,125 | 🟡 | `-Port` 参数经 CALIBRATOR_PORT env 注入，settings.port 随之改变，故 "CLI 与配置必须一致" 对启动器实际是 launcher 权威；与 server.py:18-40 的直接 CLI 拒冲突语义并存（前者为设计，后者为 0.3.7 修复），文档措辞可商榷 |
+| start.ps1:15-41 | 🟢 | `-Install`：venv 仅缺失时创建（py -V:3.11 优先、uv 兜底）；venv 已存在时仍执行 `pip install -e` ✅；Python 3.11 版本断言(43-46)+依赖断言(47-50) ✅ |
+| start.ps1:75-101 | 🟢 | 单实例语义完整：.service.json 三字段存在性(81-83)→活进程 cmdline 匹配 `coordinate_calibrator\.server`(93)→启动时刻 ±5s(92)；死进程清残留(100)；服务端另有 .instance.lock（instance_lock.py:15）+ .service.json 由 server.py:62-86 写入（pid/instance_id/started_at_unix/host/port/data_root）双保险 ✅ |
+| start.ps1:103-110 | 🟢 | `-ShowToken` 只读 data/.auth-token，未创建时仅提示，不预生成 ✅ |
+| start.ps1:66-70 | 🟡 | architecture.md:77 称 "start.ps1 validates … schema, data-root ownership"——start.ps1 本身不校验这两项，由服务进程完成（旧 schema 拒启 + instance lock）；文档措辞与实现分层有出入，🟡 措辞问题 |
+| stop.ps1:28-40,73-92 | 🟢 | 三校验（PID/cmdline/启动时刻±5s）后才行动 ✅；.shutdown-request.json 原子写入(tmp+Move)→server.py:86-99 watcher 校验 pid+instance_id 后优雅退出 ✅；超时须 -Force(94-106)；PID 被复用检测(86-92) ✅ |
+| test.ps1:67-80 | 🟡 | PS AST 仅覆盖 start/stop/test 三个脚本，**不含 scripts/cleanup-generated.ps1**；其余与 README 声称完全一致（unittest discover:57、compileall:59、node --check app.js:61、2 个 JS 断言:63,65、wheel:81-91） |
+| test.ps1:12-56,92-106 | 🟢 | 测试环境全隔离（16 项 CALIBRATOR_* + PYTHONPATH + PYTHONPYCACHEPREFIX 指向临时目录），finally 恢复+清理；不会污染项目 data/logs ✅ |
+| cleanup-generated.ps1:13-34,41-53 | 🟢 | 白名单仅 work\package/build/.pytest_cache/egg-info/work\test-runtime/src+tests 的 __pycache__/两个显式 backup 路径——**不触碰 data/logs/outputs**；另有根逃逸(41)、.venv 与 \data\ 保护(44)、backups 白名单外拒绝(47)、重解析点拒绝(51) 四道防线 ✅ |
+| cleanup-generated.ps1:10 | 🟡 | 硬编码项目根必须恰好为 `D:\coordinate-calibrator`，项目移动即拒绝执行（安全侧设计，观察项） |
+
+## ④ 测试覆盖静态清点（未实跑，按只读约束）
+
+| 文件 | 测试数 | 覆盖 |
+|---|---|---|
+| test_runtime_safety.py | 47 | 运行时/租约/配额/帧剪枝/鼠标围栏/Nemu/ADB 身份 |
+| test_full_remediation.py | 23 | 迁移/幂等/事务/实例锁/维护 |
+| test_domain.py | 16 | 几何/统计/坐标变换 |
+| test_storage_and_export.py | 16 | 存储/导出/OAS exporter/迁移 |
+| test_capture_sources.py | 15 | ADB/Nemu/DPI/注入拒绝 |
+| test_v037_data_security.py | 11 | 幂等持久化/bundle 预校验/序号复用 |
+| test_library_bundles.py | 10 | 库实体/bundle 往返/路径遍历 |
+| test_frontend_usability.py | 6 | 自动选择/徽章 |
+| test_api_contract.py | 2 | 安全/幂等/ETag/契约 |
+| test_web_math.js / test_web_state.js | 17+34 assert 调用 | 前端坐标/显示帧上下文 |
+| **合计** | **146（与 README/test-plan 声称一致）** | |
+
+- 缺口：① WS 心跳行为无任何测试（且 protocol "15s" 声称错误）；② 标注配额计入软删行的语义无测试（quota 测试只测活跃场景；runtime.py:2675 `len(session.annotations)` 含软删行——观察项，文档未再称 "active"）；③ 失败导入遗留空组无测试（P3 开放）；④ 前端 app.js 主逻辑无自动化测试（test-plan 已如实标注为浏览器验收）。
+- 写盘风险静态判定：**全部测试使用 tempfile.TemporaryDirectory()**；test_api_contract.py 在函数内将 CALIBRATOR_ROOT/DATA_ROOT/LOG_ROOT/CONFIG 指向临时目录后才 import app，无项目 data/ 写入 → 理论上可安全运行，但本审查按约束未执行。
+
+## ⑤ 通过项
+
+- 路由表双向 100% 吻合（62/62，无文档有码无、无码有文档无的 API 路由；仅 UI 层 `GET /` 与 /web 挂载未入协议表，合理）。
+- 测试数声称（146）与静态清点精确一致；JS 断言为真实断言脚本（51 处 assert.*）。
+- 全部配置键有强制点，0 死配置；无安全类死旋钮。
+- config.local.toml 无凭据（四类密钥模式 0 命中）。
+- 迁移政策（普通启动绝不迁移）与代码一致；单实例锁+服务身份文件+优雅关停链路完整。
+- cleanup-generated.ps1 白名单与保护逻辑不可能删到 data/logs/outputs。
+- 0.3.8 netstat 字节解析修复证据确凿（common.py:135-172）。
+- 审计回归矩阵中 CC-SEC-002/CC-MIGRATE-001/CC-BUNDLE-001/CC-EXPORT-SNAPSHOT-001/幂等-租约 P2 的"已修复"声称与当前代码一致（工作日志可信）。
+
+## ⑥ 无法判定项
+
+- audit P2"部分路由配额/状态错误可能以非结构化 500 逃逸"：operation() 通用映射（RuntimeError/ValueError→409 invalid_state，app.py:490-491）存在，但静态无法穷举所有路由路径 → 无法判定，需运行时验证。
+- security.md:10 ADB 硬字节上限的运行时实现细节（专项测试存在，实现未逐行核对）。
+- 前端 UI 声称（面板 220-420px、blink 500ms 等）：本次仅抽查 900px 抽屉阈值（app.js:1892,4133 存在），未通读 4192 行 app.js。
+- 实机验收矩阵（DPI/真实鼠标/真实 ADB/双 MuMu）：文档明示开放，与 audit 一致，无法判定属实性。
+- P2"token 创建依赖继承 ACL"：0.3.7/0.3.8 工作日志未声称修复，仍属开放项，未运行时验证。
+
+**遗留开放项汇总（低危为主）**：protocol 错误码 `lease_required` 从未发射、`~1s` vs 声称 `15s` 心跳、batch-visibility/restore 无 selection_hash、失败导入遗留空组、build_report 双遍历、quarantine 无界无 GC——后四项均在 audit-20260809.md 中有记录，属"文档诚实、实现未关"，非文档造假。
+
+---
+
+**工作小结**：完成了 D:\coordinate-calibrator 四块只读审查——①逐条核对了 protocol/security/architecture/data-model/test-plan/audit/README 的关键声称 vs 代码（路由 62/62 吻合、146 测试数吻合、25 个稳定错误码中 `lease_required` 从未发射、心跳 1s≠声称 15s、selection_hash 缺口仍开），②全配置键强制点普查（0 死配置，与 0.3.3 时代结论已根本不同），③四个启动器脚本的锁语义/校验链/白名单安全性核查（无 🔴，3 个 🟡 观察项），④13 个测试文件静态清点（146 Python + 51 处 JS 断言，全部临时目录隔离）。未创建/修改任何文件，未运行任何项目脚本或服务。

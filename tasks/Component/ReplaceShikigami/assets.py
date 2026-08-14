@@ -13,6 +13,10 @@ class ReplaceShikigamiAssets:
 	# Click Rule Assets
 	# description 
 	C_SHIKIGAMI_SWITCH_1 = RuleClick(roi_front=(31,618,66,64), roi_back=(31,618,66,64), name="shikigami_switch_1")
+	# Current candidate panel: open the category fan from the visible upper part of 全部.
+	C_SHIKIGAMI_CATEGORY_ALL = RuleClick(roi_front=(31,612,66,20), roi_back=(31,612,66,20), name="shikigami_category_all")
+	# Current game skin can render the material category differently from the legacy template.
+	C_SHIKIGAMI_CLASS_MATERIAL = RuleClick(roi_front=(38,286,54,52), roi_back=(38,286,54,52), name="shikigami_class_material")
 	# description 
 	C_SHIKIGAMI_LEFT_1 = RuleClick(roi_front=(163,487,100,179), roi_back=(163,487,100,179), name="shikigami_left_1")
 	# description 
@@ -94,5 +98,3 @@ class ReplaceShikigamiAssets:
 	I_U_CONFIRM_ALTERNATE = RuleImage(roi_front=(692,407,134,47), roi_back=(692,407,134,47), threshold=0.8, method="Template matching", file="./tasks/Component/ReplaceShikigami/rs/rs_u_confirm_alternate.png")
 	# 候补式神圆圈 
 	I_U_CIRCLE_ALTERNATE = RuleImage(roi_front=(535,339,41,43), roi_back=(535,339,41,43), threshold=0.8, method="Template matching", file="./tasks/Component/ReplaceShikigami/rs/rs_u_circle_alternate.png")
-
-
