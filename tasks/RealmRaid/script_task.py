@@ -1329,10 +1329,10 @@ class ScriptTask(GeneralBattle, GameUi, SwitchSoul, RealmRaidAssets):
                 if not reward_logged:
                     logger.info('RealmRaid reward overlay detected; board OCR is blocked')
                     reward_logged = True
-                if not reward_clicked or time.time() - reward_click_at >= 1.5:
-                    if reward_attempts >= 3:
+                if not reward_clicked or time.time() - reward_click_at >= 2.0:
+                    if reward_attempts >= 5:
                         logger.warning(
-                            'RealmRaid reward overlay did not clear after 3 dismiss attempts'
+                            'RealmRaid reward overlay did not clear after 5 dismiss attempts'
                         )
                         return False
                     self.dismiss_level_reward_overlay()
