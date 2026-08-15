@@ -5,6 +5,7 @@ from tasks.GuildActivityMonitor.config import GuildActivityMonitor
 from typing import Dict, Any
 
 import re
+import threading
 import inflection
 
 from pathlib import Path
