@@ -1,8 +1,20 @@
-[CmdletBinding(SupportsShouldProcess)]
+﻿[CmdletBinding(SupportsShouldProcess)]
 param()
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# Migration 2026-08-15: all file deletions go to the Recycle Bin for rollback.
+function Remove-ItemRecycleBin {
+  param([Parameter(Mandatory=$true)][string]$LiteralPath)
+  if (-not (Test-Path -LiteralPath $LiteralPath)) { return }
+  Add-Type -AssemblyName Microsoft.VisualBasic
+  if ((Get-Item -LiteralPath $LiteralPath -Force).PSIsContainer) {
+    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($LiteralPath, 'OnlyErrorDialogs', 'SendToRecycleBin')
+  } else {
+    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($LiteralPath, 'OnlyErrorDialogs', 'SendToRecycleBin')
+  }
+}
 
 $root = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 if ($root -ne 'D:\OSAyys') { throw "Unexpected project root: $root" }
@@ -43,6 +55,6 @@ foreach ($target in $targets) {
 Write-Output ("Cleanup plan: targets={0}, files={1}, bytes={2}" -f $targets.Count, $fileCount, $byteCount)
 foreach ($path in @($targets | ForEach-Object FullName | Sort-Object Length -Descending)) {
   if ($PSCmdlet.ShouldProcess($path, 'Remove reproducible Python cache')) {
-    Remove-Item -LiteralPath $path -Recurse -Force
+    Remove-ItemRecycleBin -LiteralPath $path
   }
 }

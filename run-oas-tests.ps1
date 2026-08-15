@@ -1,4 +1,4 @@
-# DeepSeek-14 B4 v3: unified OAS test entry.
+﻿# DeepSeek-14 B4 v3: unified OAS test entry.
 # - isolation env set BEFORE any import
 # - excludes .venv/__pycache__/backups/work/node_modules/.git
 # - reliable suffix removal ([IO.Path]::GetFileNameWithoutExtension)

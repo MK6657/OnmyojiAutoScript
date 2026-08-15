@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 
 . (Join-Path (Split-Path -Parent $PSScriptRoot) 'wiring.ps1')
 

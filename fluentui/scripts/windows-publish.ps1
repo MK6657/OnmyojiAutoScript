@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param (
     [string] $archiveName, [string] $targetName
 )
@@ -19,6 +19,18 @@ param (
 # msvcArch: x86
 
 $scriptDir = $PSScriptRoot
+
+# Migration 2026-08-15: all file deletions go to the Recycle Bin for rollback.
+function Remove-ItemRecycleBin {
+  param([Parameter(Mandatory=$true)][string]$LiteralPath)
+  if (-not (Test-Path -LiteralPath $LiteralPath)) { return }
+  Add-Type -AssemblyName Microsoft.VisualBasic
+  if ((Get-Item -LiteralPath $LiteralPath -Force).PSIsContainer) {
+    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($LiteralPath, 'OnlyErrorDialogs', 'SendToRecycleBin')
+  } else {
+    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($LiteralPath, 'OnlyErrorDialogs', 'SendToRecycleBin')
+  }
+}
 $currentDir = Get-Location
 Write-Host "currentDir" $currentDir
 Write-Host "scriptDir" $scriptDir
@@ -32,7 +44,7 @@ function Main() {
     windeployqt --qmldir . --plugindir $archiveName\plugins --no-translations --compiler-runtime $archiveName\$targetName
     # 删除不必要的文件
     $excludeList = @("*.qmlc", "*.ilk", "*.exp", "*.lib", "*.pdb")
-    Remove-Item -Path $archiveName -Include $excludeList -Recurse -Force
+    Get-ChildItem -Path $archiveName -Include $excludeList -Recurse -Force | ForEach-Object { Remove-ItemRecycleBin -LiteralPath $_.FullName }
     # 拷贝vcRedist dll
     $redistDll="{0}{1}\*.CRT\*.dll" -f $env:vcToolsRedistDir.Trim(),$env:msvcArch
     Copy-Item $redistDll $archiveName\

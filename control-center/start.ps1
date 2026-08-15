@@ -76,6 +76,18 @@ try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 $cc   = $PSScriptRoot                     # ...\control-center
 $root = Split-Path -Parent $cc            # 项目根 D:\OSAyys
 $frontendStateFile = Join-Path $root 'output\control-center\frontend.json'
+
+# Migration 2026-08-15: all file deletions go to the Recycle Bin for rollback.
+function Remove-ItemRecycleBin {
+  param([Parameter(Mandatory=$true)][string]$LiteralPath)
+  if (-not (Test-Path -LiteralPath $LiteralPath)) { return }
+  Add-Type -AssemblyName Microsoft.VisualBasic
+  if ((Get-Item -LiteralPath $LiteralPath -Force).PSIsContainer) {
+    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($LiteralPath, 'OnlyErrorDialogs', 'SendToRecycleBin')
+  } else {
+    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($LiteralPath, 'OnlyErrorDialogs', 'SendToRecycleBin')
+  }
+}
 $wiringHelpers = Join-Path $cc 'launcher\wiring.ps1'
 . $wiringHelpers
 
@@ -121,7 +133,7 @@ function Get-FrontendState {
 }
 
 function Clear-FrontendState {
-  Remove-Item -LiteralPath $frontendStateFile -Force -ErrorAction SilentlyContinue
+  Remove-ItemRecycleBin -LiteralPath $frontendStateFile
 }
 
 function Save-FrontendState([int]$Port, [int]$ProcessId, [string]$ProcessStartedAt, [string]$BridgeUrl) {

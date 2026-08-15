@@ -1,4 +1,4 @@
-function ConvertTo-EndpointKey([string]$Url) {
+﻿function ConvertTo-EndpointKey([string]$Url) {
   if ([string]::IsNullOrWhiteSpace($Url)) { return $null }
   $uri = $null
   if (-not [Uri]::TryCreate($Url.Trim(), [UriKind]::Absolute, [ref]$uri)) { return $null }

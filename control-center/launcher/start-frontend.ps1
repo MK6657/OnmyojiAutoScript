@@ -1,4 +1,4 @@
-param(
+﻿param(
   [int]$Port = 4175,
   [string]$BridgeUrl = 'http://127.0.0.1:22367'
 )
@@ -12,4 +12,6 @@ if (-not (Test-Path (Join-Path $frontend 'node_modules'))) {
   npm install
 }
 Write-Host ("OAS 控制中心前端：http://127.0.0.1:{0}/  (Bridge {1})" -f $Port, $BridgeUrl) -ForegroundColor Cyan
-npm run dev -- --host 127.0.0.1 --port $Port --strictPort
+# Migration 2026-08-15: npm 12 no longer forwards `-- --host/--port/--strictPort` to the
+# script target (EUNKNOWNCONFIG), so invoke the Vite CLI binary directly.
+node (Join-Path $frontend 'node_modules\vite\bin\vite.js') --host 127.0.0.1 --port $Port --strictPort

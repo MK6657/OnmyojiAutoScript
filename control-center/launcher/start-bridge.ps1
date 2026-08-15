@@ -1,4 +1,4 @@
-param(
+﻿param(
   [int]$Port = 22367,
   [string]$CoreUrl = $env:OAS_CORE_URL,
   [string]$DataDir = $env:OAS_CONTROL_CENTER_DATA_DIR,
