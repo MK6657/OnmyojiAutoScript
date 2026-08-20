@@ -34,7 +34,7 @@ D:\OSAyys
 ├─ gui.py                        旧 QML 桌面入口（非当前主链路）
 ├─ 启动.bat / 重启Core.bat        控制中心启动入口
 ├─ requirements.txt / requirements-in.txt
-├─ run-oas-tests.ps1             统一测试入口（89 模块 / 510 项）
+├─ run-oas-tests.ps1             统一测试入口（91 模块 / 503 项，逐模块进程隔离）
 ├─ config\
 │  ├─ template.json              账号配置模板
 │  ├─ oas1.json                  当前本机账号配置
@@ -106,7 +106,7 @@ D:\coordinate-calibrator
 | 服务 | 地址 | 启动方式 |
 |---|---|---|
 | OAS Core | `http://127.0.0.1:22267` | `D:\OSAyys\control-center\start.ps1` 第 1 层 |
-| Bridge | `http://127.0.0.1:22367` | 同上第 2 层；冲突时自动换 22368+ |
+| Bridge | `http://127.0.0.1:22367` | 同上第 2 层；冲突或 Core 目标不一致时拒绝启动，不自动换端口 |
 | 前端 | `http://127.0.0.1:4175` | 同上第 3 层；冲突自动顺延 |
 | 隔离联调 | mock Core `22268` + Bridge `22368` + 前端 | `control-center\launcher\start-dev-stack.ps1` |
 | CC | `http://127.0.0.1:22880` | `D:\coordinate-calibrator\start.ps1` |
@@ -162,7 +162,7 @@ uv pip install --python .venv\Scripts\python.exe -e ".[windows,vision,dev]"
 |---|---|---|
 | `D:\OSAyys\config\deploy.yaml` | `deploy\template` 改 | AutoUpdate=false、KeepLocalChanges=true、Webui 127.0.0.1:22267 |
 | `D:\OSAyys\config\oas1.json` | 备份恢复的标准版 | serial=127.0.0.1:16384，只启用 Restart |
-| `D:\coordinate-calibrator\config.local.toml` | `config.example.toml` | OAS root=D:/OSAyys，adapter 暂 disabled |
+| `D:\coordinate-calibrator\config.local.toml` | `config.example.toml` | OAS root=D:/OSAyys，adapter 已启用，config=`oas1`，窗口=`2301` |
 | Bridge SQLite | 自动生成 | `D:\OSAyys\control-center\data\control_center.db` |
 | CC token / 数据库 | 首次启动自动生成 | data 目录从空开始 |
 
@@ -192,7 +192,7 @@ git -C D:\coordinate-calibrator checkout handoff-v0.3.8-20260814
 ## 8. 验证命令
 
 ```powershell
-# OSA 统一测试（期望 89 模块 / 510 项）
+# OSA 统一测试（期望 91 模块 / 503 项；每个模块独立进程）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File D:\OSAyys\run-oas-tests.ps1
 
 # Markdown 链接
@@ -220,6 +220,17 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\test.ps1 -Package
 - 2026-08-15 保级 58 完整一轮因安全边界 `enemy_selected`（绿标检测到敌方红色箭头）主动停止；**游戏画面停在 `page_battle`，需要人工确认回主界面后再继续任何任务**。
 - 真机证据：`D:\OSAyys\handoff\records\evidence\Codex-实测-RR-HOLD58-20260815-01.md`。
 - 所有删除操作必须走回收站；本项目相关脚本已统一为 `Remove-ItemRecycleBin`。
+
+### 2026-08-15 迁移整合修复结果
+
+- CC 导出保留 `oas.res.v1` 兼容字段，并在来源帧 ID、SHA-256、画布 profile 和 mapping revision 齐全时附带中立 v1 `CandidateEnvelope`；仍为 `candidate_only`，不会写回 OAS。
+- Bridge 启动脚本统一优先使用 `control-center\bridge\.venv`；每个数据目录有进程锁，22367 被占用或指向其他 Core 时直接失败，避免共享 SQLite 的多实例漂移。
+- Core 启动/停止/关服控制入口统一为 POST；跨站 Origin 的写请求被拒绝；默认监听地址回退为 `127.0.0.1`。如配置了 `--key`/Password，写请求需带 `X-OAS-Key`，Bridge 可通过 `OAS_CORE_KEY` 传递。
+- Core 非回环绑定现在默认拒绝；只有显式启用 `Webui.EnableRemoteAccess` 且配置 `--key`/Password 才会启动，HTTP/WebSocket 远程入口均要求密钥。
+- OAS 账号配置名经过路径边界校验，Windows 删除通过回收站执行；CC `start.ps1 -Install` 优先使用 uv 对指定解释器安装依赖。
+- `run-oas-tests.ps1` 已改为每个测试模块独立 Python 进程，消除导入顺序污染；最新证据为 `IMPORT_OK 91`、`91/91` 模块通过、`503` 项通过。此前单进程 `512` 项为顺序依赖快照，不再作为验收口径。
+- Bridge/CC 的 FastAPI、Uvicorn、Pydantic、HTTPX、WebSocket 版本声明已对齐并锁定；`module.device` 启动时加载 `pkg_resources` 兼容层，适配新版 setuptools。
+- 离线回归：CC `178/178`，OAS 全量 `91 模块 / 503 项`（含 Bridge）；未启动服务或真实设备任务。
 
 ---
 

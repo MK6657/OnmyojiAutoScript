@@ -1,6 +1,6 @@
 # MK6657 OAS 二次开发分支
 
-当前分支：`codex/mk6657-secondary-development`
+当前分支：`migration/20260815-local`（本机迁移修复分支）
 
 这是基于 OnmyojiAutoScript 上游代码建立的 MK6657 定制二次开发分支，目标是保留上游可同步能力，同时沉淀更适合本机、多账号和控制中心使用方式的修补与任务流程。
 
@@ -19,4 +19,4 @@
 4. 当前控制中心唯一前端源码为 `control-center/frontend/`；浏览器、隔离联调和 portable 都从这里构建，不再保留平行生产前端。
 5. 未完成的个人结界突破卡级功能以 `handoff/Codex-04-个人结界突破半成品进度与规则.md` 为进度基线。
 
-项目审计入口：`handoff/Codex-README.md`。
+项目审计入口：`handoff/README.md`；本机双项目结构和启动约束以 `MIGRATION-GUIDE-20260815.md` 为准。

@@ -14,11 +14,11 @@
 
 旧版扁平文档已经移入 [历史归档](archive/README.md)。根目录只保留当前状态、运行规范、任务生命周期、测试规范、待办总表和坐标清单；历史文件可按原文件名和 SHA-256 追溯。
 
-最新只读审计是 [2026-08-13 DeepSeek-12 记录体系审查](audits/DeepSeek-12-记录体系审查-20260813.md)（前序：[DeepSeek-11 根因定位审查](audits/DeepSeek-11-根因定位审查-20260813.md) + [复验结论](audits/DeepSeek-11-复验结论-20260813.md)、[DeepSeek-10 OAS 全项目审查](audits/DeepSeek-10-OSAyys全项目只读审查-20260813.md)（头部有 errata）、[DeepSeek-09 CC 审查](audits/DeepSeek-09-coordinate-calibrator-v0.3.8只读审查-20260813.md)（头部有 errata）、[2026-08-10 P0/P1 复核审计](audits/Codex-双项目P0P1复核审计-20260810.md)）。DeepSeek-13 修复轮（2026-08-13 晚）正在执行，实施记录见 records/implementation/Codex-实施-DeepSeek13-*.md。
+最新只读审计是 [2026-08-13 DeepSeek-12 记录体系审查](audits/DeepSeek-12-记录体系审查-20260813.md)（前序：[DeepSeek-11 根因定位审查](audits/DeepSeek-11-根因定位审查-20260813.md) + [复验结论](audits/DeepSeek-11-复验结论-20260813.md)、[DeepSeek-10 OAS 全项目审查](audits/DeepSeek-10-OSAyys全项目只读审查-20260813.md)（头部有 errata）、[DeepSeek-09 CC 审查](audits/DeepSeek-09-coordinate-calibrator-v0.3.8只读审查-20260813.md)（头部有 errata）、[2026-08-10 P0/P1 复核审计](audits/Codex-双项目P0P1复核审计-20260810.md)）。DeepSeek-13 历史修复记录已封存；2026-08-15 迁移整合修复以 [迁移指南](../MIGRATION-GUIDE-20260815.md) 和当前源码为准。
 
 最新寮突破证据为 [自动选寮完整链路实测](records/evidence/Codex-实测-RY-GUILD-FULL-20260811-01.md) 和 [阵容锁定/准备页边界实测](records/evidence/Codex-实测-RY-LOCK-BOUNDARY-20260811-01.md)；对应实现见 [排序验证与固定首卡选择修复](records/implementation/Codex-RY-GUILD排序验证与固定首卡选择修复-20260811.md)。
 
-当前离线基线为 coordinate-calibrator `0.3.8 / schema 6 / 149/149`（DS-13 修复轮新增 3 测试后实测）、OAS 全量 85 个测试模块 `491/491`（08-13 晚 unittest 实测，含 Bridge 套件）、wiring `15/15`（08-14 00:13 服务在线实测）。控制面、checkpoint、任务结果、页面所有权、探索边界、弹窗 deadline、绿标颜色槽位诊断链和当前寮突破排序协议已实施；真实设备、真实弹窗、绿标靶场和长程业务仍按待办补证。
+当前离线基线为 coordinate-calibrator `0.3.8 / schema 6 / 178/178`，OAS 全量测试和 Bridge 回归以 2026-08-15 迁移记录为准；控制面、checkpoint、任务结果、页面所有权、探索边界、弹窗 deadline、绿标颜色槽位诊断链和当前寮突破排序协议已实施；真实设备、真实弹窗、绿标靶场和长程业务仍按待办补证。
 
 文档流转约定：
 

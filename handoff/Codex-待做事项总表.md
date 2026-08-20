@@ -1,6 +1,6 @@
 # Codex 待做事项总表与文档流转规范
 
-最后更新：2026-08-13（DeepSeek-13 修复轮前置补记；修复完成后再统一重写）
+最后更新：2026-08-15（双项目迁移整合修复后；历史条目保留原验收口径）
 项目：MK6657 二次开发分支
 分支：`codex/mk6657-secondary-development`
 
@@ -160,7 +160,7 @@
 | CC-LEASE-STORM-001 | 租约乒乓（多客户端+TTL/心跳失配+无退避） | 已修（同 owner 活租约原样返回+TTL 60+前端退避；双标签 30min 量化复测待浏览器实机） | P1 | DS-09 F16/DS-11 R-6；DS-13 Phase3 3.2 |
 | CC-DOC-DRIFT-001 | CC 文档漂移 5 条 | 已修（protocol.md 信封/错误码/心跳、architecture.md start.ps1 措辞） | P3 | DS-09 文档漂移；DS-13 Phase3 3.20 |
 | CC-P3-BATCH-001 | CC P3 降级清单（build_report 双遍历/selection_hash 缺口/.ccproj 遗留空组/半开区间/DOM 重建/画笔自交/MUTATING_CONTROL_IDS/XSS 单引号/N12/N15/心跳测试缺口） | 待排期 | P3 | DS-09 §1 P3 + annex-A/C；本轮不修（理由存档于 DS-13 报告 §P3 降级清单） |
-| OAS-TEST-ORDER-001 | OAS 测试套件存在顺序依赖（先导入的模块可破坏后导入的 green_mark/battle_page 测试；DS-14 实测：文件系统序失败、mtime 降序全过） | 待排期 | P2 | DS-14 全量回归实测；run-oas-tests.ps1 暂以 mtime 降序复刻 491 轮已证顺序 |
+| OAS-TEST-ORDER-001 | OAS 测试套件存在顺序依赖（先导入的模块可破坏后导入的 green_mark/battle_page 测试） | 已修（逐模块独立进程） | P2 | `run-oas-tests.ps1` 每个模块独立解释器；最新 `IMPORT_OK 91`、`91/91` 模块、`503` 项通过，单进程旧口径 `512` 不再作为验收 |
 
 
 ### 4.10 DeepSeek-13 修复轮 CC 批量收口（DS-09 F2-F19，指针式登记）
@@ -270,10 +270,12 @@
 
 > **2026-08-13 23:07 状态注记（DeepSeek-13 修复轮）**：OAS Core（PID 5936）与 coordinate-calibrator（PID 25064）均已优雅停止（/home/kill_server 与 stop.ps1），进入停服修复；Bridge/前端本已停。修复完成后本节整体重写。DB 基线（停服后只读核验 08-13 23:10）：CC sessions 17、annotations 81、frames 17、artifacts 17、leases 17（全部过期）、idempotency_operations 394、quarantine_items 6、integrity=ok；sessions「9」为迁移时点快照、「19」为 data/sessions 目录数（含空/迁移遗留）。
 
+> **2026-08-15 迁移整合覆盖说明**：上面的 2026-08-13 注记是历史快照，不再表示当前服务状态。当前服务仍保持停服；本轮已修复 CC/OAS 候选契约对接、Bridge 单实例/环境隔离、Core 写入口和默认回环绑定、配置路径与回收站删除、CC 安装脚本、Core 远程 HTTP/WebSocket 鉴权和 OAS 测试顺序污染，并完成 CC `178/178` 与 OAS `91 模块 / 503 项` 离线回归。真实设备和业务实测仍按本表开放事项执行。
+
 - 双项目只读审计和交叉验证已经完成，六个子代理均已结束。
 - 后续第 0、1、2 步已完成：建立可恢复基线，并修复校准器坐标可信性、持久化事务、异步竞态和租约一致性。
 - coordinate-calibrator 当前为 `0.3.8`、schema 6，正式套件 `146/146` 及 22881 复制数据验收通过；本地化 Windows 端点识别已修，有效 bind、显式迁移、持久幂等、Bundle 和采集门禁已实现，真实 DPI/ADB/双设备问题保持开放。
 - OAS 当前 15 个定向与回归套件合计 `444/444`，Bridge `27/27 + 3/3`，隔离 Core/Bridge 集成 `16/16`；控制面、checkpoint、任务结果、页面所有权、探索边界、弹窗 deadline 和绿标诊断链已有新增覆盖。
 - `GotoMain page_battle` 当前已有代码门禁和 unittest，状态是待真实异常链复测，不再记为“尚未实现”。
 - 绿标旧模板失配已被 2026-08-09 靶场和 2026-08-10 寮突破左三再次复现；左三最高分 `0.702876 < 0.8`。HSV 能看到典型 `63×61` 候选，但 45 轮旧样本的 `0.35s` 目标命中仅 `32/45`，暂不进入生产确认。
-- 当前 Core、Bridge、前端和 coordinate-calibrator 均运行；`oas1` 已停止。MuMu `2301` 可见，Bridge 已验证 serial `127.0.0.1:16384`；跨 DPI、双 MuMu 和完整坐标映射仍未确认。
+- 迁移修复后当前 Core、Bridge、前端和 coordinate-calibrator 均保持停服；`oas1` 配置保留，MuMu `2301` 的 serial `127.0.0.1:16384` 仅作已知绑定记录；跨 DPI、双 MuMu 和完整坐标映射仍未确认。

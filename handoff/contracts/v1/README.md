@@ -26,6 +26,8 @@ Compatibility rules:
 - Producers must preserve unknown fields when relaying an envelope.
 - Consumers must reject a frame/candidate relationship when device identity, frame hash,
   canvas profile, or mapping revision conflicts.
+- Coordinate Calibrator's `oas_candidate` export includes a `candidate_envelope`
+  with these provenance fields when a trusted persisted source frame is available;
+  the legacy `oas.res.v1` fields remain for compatibility.
 - This contract does not add an OAS apply endpoint. Applying candidates requires a
   separate version with preview, backup, lock, hash verification, and human confirmation.
-
