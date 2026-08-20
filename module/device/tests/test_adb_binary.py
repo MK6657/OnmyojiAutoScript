@@ -1,6 +1,9 @@
 import os
 import unittest
 
+# adbutils 0.11.0 imports the legacy pkg_resources name.  Importing the
+# product package first exercises the same bootstrap used by production code.
+import module.device.pkg_resources  # noqa: F401
 import adbutils
 
 from module.device.connection_attr import ConnectionAttr

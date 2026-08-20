@@ -32,15 +32,10 @@ New-Item -ItemType Directory -Force -Path $ev | Out-Null
 Set-Location $root
 
 $excludePattern = '__pycache__|\.venv|\.git|\backups\|\work\|node_modules|site-packages'
-# Root order matters: the bridge tests insert their fastapi/websockets stubs
-# into sys.path at import time, which would contaminate later imports in the
-# same process. Keep bridge LAST (same order as the proven 491-module run).
-#
-# Within a root, files run in LastWriteTime DESCENDING order. The OAS test
-# suite currently has order-dependent tests (a module imported earlier can
-# break green_mark/battle_page tests imported later); the 491-module pass was
-# produced with mtime-descending order, so the runner reproduces exactly that.
-# Tracked: OAS-TEST-ORDER-001 (make the suite order-independent).
+# Every test module is run in its own Python process. Bridge tests insert local
+# FastAPI/websocket stubs at import time, and several legacy OAS tests retain
+# module-level state; process isolation makes results independent of file
+# system order and prevents one module from contaminating another.
 $orderedRoots = @('tasks', 'module', 'control-center\bridge') |
   Where-Object { $Roots -contains $_ }
 $moduleMap = @{}  # dotted-name -> file path
@@ -91,27 +86,48 @@ if failures:
     sys.exit(2)
 print("IMPORT_OK " + str(len(names)))
 '@ | Set-Content -Path $checkPy -Encoding UTF8
-$checkOut = & (Join-Path $root '.venv\Scripts\python.exe') -B $checkPy @modules 2>&1
-if ($LASTEXITCODE -ne 0) {
-  Write-Output ("self-check failed:")
-  Write-Output ($checkOut | Select-Object -First 10)
+$python = Join-Path $root '.venv\Scripts\python.exe'
+$checkFailures = New-Object System.Collections.Generic.List[string]
+foreach ($module in $modules) {
+  $checkOut = @(& $python -B $checkPy $module 2>&1 | ForEach-Object { $_.ToString() })
+  $checkCode = $LASTEXITCODE
+  if ($checkCode -ne 0) {
+    $checkFailures.Add("$module :: $($checkOut | Select-Object -First 1)")
+  }
+}
+if ($checkFailures.Count -gt 0) {
+  Write-Output 'self-check failed:'
+  Write-Output ($checkFailures | Select-Object -First 10)
   exit 2
 }
-Write-Output ("self-check: " + ($checkOut | Select-Object -Last 1))
+Write-Output ("self-check: IMPORT_OK " + $modules.Count)
 Write-Output ("modules (" + $modules.Count + "):")
 Write-Output ($modules -join " ")
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $out = Join-Path $ev ("oas-tests-all-" + $stamp + ".txt")
 Add-Content -Path $out -Value ("# MODULES=" + $modules.Count) -Encoding UTF8
-Add-Content -Path $out -Value ("# SELF_CHECK=" + ($checkOut | Select-Object -Last 1)) -Encoding UTF8
+Add-Content -Path $out -Value ("# SELF_CHECK=IMPORT_OK " + $modules.Count) -Encoding UTF8
 Add-Content -Path $out -Value ("# " + ($modules -join " ")) -Encoding UTF8
-# Capture explicitly (no Tee-Object: PS 5.1 would write UTF-16) and persist
-# as UTF-8 so the evidence file is single-encoding.
-$captured = & (Join-Path $root '.venv\Scripts\python.exe') -B -m unittest @modules 2>&1 |
-  ForEach-Object { $_.ToString() }
-$code = $LASTEXITCODE
+# Run each module in a clean interpreter. Capture explicitly (no Tee-Object:
+# PS 5.1 would write UTF-16) and persist as UTF-8 evidence.
+$captured = New-Object System.Collections.Generic.List[string]
+$failedModules = New-Object System.Collections.Generic.List[string]
+foreach ($module in $modules) {
+  $captured.Add("===== $module =====")
+  $moduleOutput = @(& $python -B -m unittest $module 2>&1 | ForEach-Object { $_.ToString() })
+  $moduleCode = $LASTEXITCODE
+  foreach ($line in $moduleOutput) { $captured.Add($line) }
+  $captured.Add("MODULE_EXIT_CODE=$moduleCode")
+  if ($moduleCode -ne 0) { $failedModules.Add($module) }
+}
+$code = if ($failedModules.Count -eq 0) { 0 } else { 1 }
 Add-Content -Path $out -Value $captured -Encoding UTF8
+if ($failedModules.Count -gt 0) {
+  Add-Content -Path $out -Value ("FAILED_MODULES=" + ($failedModules -join ",")) -Encoding UTF8
+  Write-Output 'FAILED_MODULES:'
+  Write-Output ($failedModules -join "`n")
+}
 Add-Content -Path $out -Value ("EXIT_CODE=" + $code) -Encoding UTF8
 Write-Output ("EXIT_CODE=" + $code)
 exit $code
