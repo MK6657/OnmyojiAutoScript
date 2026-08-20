@@ -54,7 +54,7 @@ class ConfigModel:
     SSHExecutable: Optional[str] = None
 
     # Webui
-    WebuiHost: str = "0.0.0.0"
+    WebuiHost: str = "127.0.0.1"
     WebuiPort: int = 22267
     Language: str = "en-US"
     Theme: str = "default"
@@ -166,4 +166,3 @@ class DeployConfig(ConfigModel):
             "and re-open Alas.exe"
         )
         logger.info("Take the screenshot of entire window if you need help")
-

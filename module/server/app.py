@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 
 import argparse
 import asyncio
+import re
 from starlette import status
 from starlette.responses import JSONResponse
 from fastapi import FastAPI, Request
@@ -33,6 +34,34 @@ app = FastAPI(
     version='0.0.0',
     lifespan=lifespan,
 )
+app.state.api_key = None
+app.state.remote_access = False
+
+_MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+_LOCAL_ORIGIN = re.compile(r"^https?://(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$")
+
+
+@app.middleware("http")
+async def protect_mutations(request: Request, call_next):
+    """Fail closed for cross-site mutations and make ``--key`` effective.
+
+    CORS controls whether a browser can read a response; it does not stop a
+    simple cross-site POST from reaching a local service.  The explicit Origin
+    check closes that CSRF-shaped gap while keeping native clients (no Origin)
+    and local browser tools working.  A configured ``--key``/Password is
+    checked on every mutating request via ``X-OAS-Key``.
+    """
+    remote_access = bool(getattr(request.app.state, "remote_access", False))
+    if request.method in _MUTATING_METHODS or remote_access:
+        origin = request.headers.get("origin")
+        if request.method in _MUTATING_METHODS and origin and origin != "null" and not _LOCAL_ORIGIN.fullmatch(origin):
+            return JSONResponse(status_code=403, content={"detail": "cross-site mutation denied"})
+        configured_key = getattr(request.app.state, "api_key", None)
+        if remote_access and not configured_key:
+            return JSONResponse(status_code=503, content={"detail": "remote access requires an OAS key"})
+        if configured_key and request.headers.get("x-oas-key") != configured_key:
+            return JSONResponse(status_code=401, content={"detail": "OAS key required"})
+    return await call_next(request)
 
 app.add_middleware(
     CORSMiddleware,
@@ -101,6 +130,8 @@ def fastapi_app():
         help="Run OAS by config names on startup",
     )
     args, _ = parser.parse_known_args()
+    app.state.api_key = args.key or State.deploy_config.Password
+    app.state.remote_access = bool(State.deploy_config.EnableRemoteAccess)
     # ------------------------------------------------------------------------------------------------------------------
 
     runs = None

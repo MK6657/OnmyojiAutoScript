@@ -22,6 +22,7 @@ from module.config.config_transaction import (
 
 from module.logger import logger
 from module.server.main_manager import mm
+from module.server.security import authorize_websocket
 from module.server.script_process import (
     AccountRunLease,
     AccountLeaseError,
@@ -150,7 +151,7 @@ def _guard_activity_availability(
     value: Any,
 ) -> None:
     if (
-        task_path == 'xiuxing_hexun'
+        task_path in {'xiuxing_hexun', 'xiuxing_hexun_climb'}
         and update_path[-2:] == ('scheduler', 'enable')
         and bool(value)
         and not xiuxing_hexun_globally_enabled()
@@ -343,7 +344,8 @@ async def config_list():
 
 @script_app.post('/config_copy')
 async def config_copy(file: str, template: str = 'template'):
-    mm.copy(file, template)
+    if not mm.copy(file, template):
+        raise HTTPException(status_code=400, detail='Copy failed')
     return mm.all_script_files()
 
 @script_app.get('/config_new_name')
@@ -423,7 +425,7 @@ async def task_group_copy(task_name: str, group_name: str, dest_config_name: str
 
 
 # ---------------------------------   脚本实例管理   ----------------------------------
-@script_app.get('/{script_name}/start')
+@script_app.post('/{script_name}/start')
 async def script_start(script_name: str, command_id: str | None = None):
     # DeepSeek-14 B1/A1 v2: atomic claim — concurrent same-id WS/REST can never
     # double-run; different fingerprint is a 409; in_progress returns 202-shape.
@@ -472,7 +474,7 @@ async def script_start(script_name: str, command_id: str | None = None):
         _ledger_complete(command_id, payload)
     return payload
 
-@script_app.get('/{script_name}/stop')
+@script_app.post('/{script_name}/stop')
 async def script_stop(script_name: str, command_id: str | None = None):
     # DeepSeek-14 B1/A1 v2: same atomic claim semantics as start.
     if command_id:
@@ -747,6 +749,8 @@ async def script_task_log(script_name: str):
 
 @script_app.websocket("/ws/{script_name}")
 async def websocket_endpoint(websocket: WebSocket, script_name: str):
+    if not await authorize_websocket(websocket):
+        return
     script_process = mm.get_script_process(script_name, create=True)
     await script_process.connect(websocket)
 

@@ -7,6 +7,7 @@
 • Linux/macOS/WSL 及 Win-Py 3.11+ → TZ='Asia/Shanghai' + time.tzset()
 • Win-Py ≤ 3.10            → TZ='CST-8'       + _tzset()（POSIX 语法）
 """
+import ipaddress
 import os, sys, time
 
 if hasattr(time, "tzset"):
@@ -29,6 +30,16 @@ import threading
 from module.logger import logger
 from module.server.setting import State
 from module.ocr.rpc import ensure_ocr_server_started, shutdown_ocr_server
+
+
+def _is_loopback_bind(host: str) -> bool:
+    normalized = str(host or '').strip().lower().strip('[]')
+    if normalized == 'localhost':
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
 
 
 def fun(ev: threading.Event):
@@ -72,8 +83,19 @@ def fun(ev: threading.Event):
     )
     args, _ = parser.parse_known_args()
 
-    host = args.host or State.deploy_config.WebuiHost or "0.0.0.0"
+    host = args.host or State.deploy_config.WebuiHost or "127.0.0.1"
     port = args.port or int(State.deploy_config.WebuiPort) or 22270
+    if not _is_loopback_bind(host):
+        remote_enabled = bool(State.deploy_config.EnableRemoteAccess)
+        configured_key = args.key or State.deploy_config.Password
+        if not remote_enabled:
+            raise RuntimeError(
+                f"Refusing non-loopback Core bind {host!r}: enable Webui.EnableRemoteAccess explicitly"
+            )
+        if not configured_key:
+            raise RuntimeError(
+                "Refusing remote Core bind without --key or Webui.Password"
+            )
 
     logger.hr("Launcher config")
     logger.attr("Host", host)

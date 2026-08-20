@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from module.logger import logger
+from module.server.security import authorize_websocket
 from module.server.tool import AnnotatorError, annotator_manager
 
 tool_app = APIRouter(
@@ -367,6 +368,8 @@ async def annotator_crop_save(data: CropSaveBody):
 
 @tool_app.websocket('/annotator/ws/{session_id}')
 async def annotator_frame_ws(websocket: WebSocket, session_id: str):
+    if not await authorize_websocket(websocket):
+        return
     await websocket.accept()
     try:
         annotator_manager.get_session_snapshot(session_id)
@@ -412,5 +415,4 @@ async def annotator_frame_ws(websocket: WebSocket, session_id: str):
             await websocket.close(code=1011)
         except Exception:
             pass
-
 

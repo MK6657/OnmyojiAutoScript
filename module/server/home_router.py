@@ -45,7 +45,7 @@ async def notify_test(setting: str, title: str, content: str):
         return str(e)
 
 
-@home_app.get('/kill_server')
+@home_app.post('/kill_server')
 async def kill_server():
     shutdown_ocr_server()
     MainManager.signal_kill_server = True
