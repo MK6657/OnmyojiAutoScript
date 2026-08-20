@@ -8,8 +8,8 @@
   行为:
     按 Core -> Bridge -> 界面 的顺序逐层处理。每一层:
       已经在跑  -> 直接复用，绝不重复启动（重复启动 Core 会抢配置和设备）；
-      端口被陌生程序占用 -> Bridge/界面 自动换下一个空闲端口；
-                            Core 端口是全局约定不自动换，停下来报告占用进程；
+      端口被陌生程序占用 -> Bridge/Core 停下来报告占用进程，界面可换下一个空闲端口；
+                            Bridge 不自动换端口，避免多个 Bridge 共享同一 SQLite 数据库；
       没在跑    -> 在新窗口拉起，并轮询等它就绪（Core 首次含 OCR 初始化，最多等 90 秒）。
     全部就绪后自动打开浏览器。
 
@@ -210,7 +210,7 @@ function Stop-CoreGraceful([int]$Port, [string]$CoreUrl) {
   # worker 并回收 IPC 管道），避免 Stop-Process -Force 把 worker 变成孤儿（BrokenPipeError）。
   $base = ([Uri]$CoreUrl).GetLeftPart([System.UriPartial]::Authority)
   try {
-    $resp = Invoke-WebRequest -Uri ("{0}/home/kill_server" -f $base) -Method GET -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
+    $resp = Invoke-WebRequest -Uri ("{0}/home/kill_server" -f $base) -Method POST -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
     if ($resp.StatusCode -ne 200) { return $false }
   } catch {
     return $false
@@ -315,7 +315,12 @@ if ($RestartCore -and -not $SkipCore) {
 if ($RestartAll) {
   # Bridge 与界面也一并结束，后面各层会当作“没在跑”重新拉起
   Write-Host '[*/3] 全部重启：一并结束 Bridge 与界面' -ForegroundColor DarkYellow
-  [void](Stop-PortOwner 22367 'Bridge')
+  $oldBridgeHealth = Test-Json 'http://127.0.0.1:22367/api/v1/health'
+  if ($oldBridgeHealth -and $oldBridgeHealth.bridge -eq 'ok') {
+    [void](Stop-PortOwner 22367 'Bridge')
+  } else {
+    Write-Host '      22367 不是可识别的 Bridge，跳过结束未知进程' -ForegroundColor DarkGray
+  }
   if (-not (Stop-RegisteredFrontend)) { exit 1 }
 }
 
@@ -359,11 +364,11 @@ if ($bridgeMatchesCore) {
 } else {
   $owner = Get-PortOwner $bridgePort
   if ($health -and $health.bridge -eq 'ok') {
-    $bridgePort = Find-FreePort 22368 22390
-    Write-Host ("[2/3] Bridge 22367 指向 {0}，与本次 Core {1} 不一致；保留旧 Bridge，改用端口 {2}" -f $health.core_url, $CoreUrl, $bridgePort) -ForegroundColor DarkYellow
+    Write-Host ("[2/3] Bridge 22367 已绑定到 {0}，与本次 Core {1} 不一致；为避免多实例共享 SQLite，拒绝自动换端口。请先停止旧 Bridge 或使用同一 Core。" -f $health.core_url, $CoreUrl) -ForegroundColor Red
+    exit 1
   } elseif ($owner) {
-    $bridgePort = Find-FreePort 22368 22390
-    Write-Host ("[2/3] Bridge 22367 被 {0} (PID {1}) 占用，自动改用空闲端口 {2}" -f $owner.Name, $owner.ProcessId, $bridgePort) -ForegroundColor DarkYellow
+    Write-Host ("[2/3] Bridge 端口 22367 被 {0} (PID {1}) 占用；拒绝自动换端口，避免多实例共享 SQLite。请结束占用进程后重试。" -f $owner.Name, $owner.ProcessId) -ForegroundColor Red
+    exit 1
   }
   $bridgeScript = Join-Path $cc 'launcher\start-bridge.ps1'
   Write-Host ("[2/3] Bridge 启动中(:{0})" -f $bridgePort)

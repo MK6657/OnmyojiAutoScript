@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import ctypes
 import json
 import os
@@ -73,6 +74,7 @@ TASK_LABELS = {
     "ActivityShikigami": "当期式神爬塔", "MetaDemon": "超鬼王", "FrogBoss": "青蛙瓷器",
     "FloatParade": "花车巡游", "Quiz": "智力问答", "KittyShop": "小猫の店", "DyeTrials": "染色试炼",
     "XiuxingHexun": "修行合训",
+    "XiuxingHexunClimb": "修行合训爬塔",
 }
 
 CATEGORY_LABELS = {
@@ -287,16 +289,71 @@ class TaskStateCache:
 
 class Bridge:
     def __init__(self) -> None:
+        self._instance_lock_handle = self._acquire_instance_lock()
         self.core = OasCoreClient(CORE_URL)
         self.events = EventHub()
-        self.repository = MetadataRepository(DATA_DIR / "control_center.db")
+        try:
+            self.repository = MetadataRepository(DATA_DIR / "control_center.db")
+        except Exception:
+            self._release_instance_lock()
+            raise
+        atexit.register(self._release_instance_lock)
         self.runtimes = RuntimeRegistry(self.core, self.events)
         self.task_cache = TaskStateCache()
         self._catalog: list[TaskSummary] | None = None
 
+    @staticmethod
+    def _acquire_instance_lock():
+        """Prevent two Bridge processes from sharing one SQLite data directory."""
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        lock_path = DATA_DIR / "bridge.instance.lock"
+        handle = lock_path.open("a+", encoding="utf-8")
+        handle.seek(0)
+        handle.write("0")
+        handle.flush()
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, ImportError) as exc:
+            handle.close()
+            raise RuntimeError(
+                f"Bridge data directory is already in use: {DATA_DIR.resolve()}"
+            ) from exc
+        return handle
+
+    def _release_instance_lock(self) -> None:
+        handle = getattr(self, "_instance_lock_handle", None)
+        if handle is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except (OSError, ImportError):
+            pass
+        finally:
+            handle.close()
+            self._instance_lock_handle = None
+
     async def close(self) -> None:
-        await self.runtimes.close()
-        await self.core.close()
+        try:
+            await self.runtimes.close()
+            await self.core.close()
+        finally:
+            self._release_instance_lock()
 
     async def require_core(self) -> None:
         if not await self.core.health():
@@ -326,7 +383,7 @@ class Bridge:
             enable = fields.get("enable")
             if enable is None or not enable.get("value"):
                 return None
-            if task.id == "XiuxingHexun":
+            if task.id in {"XiuxingHexun", "XiuxingHexunClimb"}:
                 activity_fields = {
                     field.get("name"): field
                     for field in args.get("activity_enabled", [])

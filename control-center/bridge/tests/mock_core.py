@@ -81,7 +81,7 @@ MENU: dict[str, list[str]] = {
               "GuildActivityMonitor"],
     "Weekly Task": ["TrueOrochi", "RichMan", "Secret", "WeeklyTrifles", "MysteryShop", "Duel"],
     "Activity Task": ["ActivityShikigami", "MetaDemon", "FrogBoss", "FloatParade", "Quiz",
-                      "KittyShop", "DyeTrials"],
+                      "KittyShop", "DyeTrials", "XiuxingHexun", "XiuxingHexunClimb"],
 }
 ALL_TASKS = [task for tasks in MENU.values() for task in tasks]
 
@@ -349,7 +349,7 @@ async def config_delete(name: str = ""):
     return True
 
 
-@app.get("/{script_name}/start")
+@app.post("/{script_name}/start")
 async def script_start(script_name: str):
     if script_name not in core.configs:
         raise HTTPException(status_code=400, detail=f"{script_name}.json not found")
@@ -360,7 +360,7 @@ async def script_start(script_name: str):
     return {"status": "completed", "success": True, "changed": True, "state": STATE_RUNNING}
 
 
-@app.get("/{script_name}/stop")
+@app.post("/{script_name}/stop")
 async def script_stop(script_name: str):
     core.states[script_name] = STATE_INACTIVE
     await core.broadcast(script_name, {"state": STATE_INACTIVE})

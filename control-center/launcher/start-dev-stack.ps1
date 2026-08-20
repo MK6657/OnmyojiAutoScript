@@ -53,7 +53,7 @@ function Find-BindableUiPort([int]$StartPort, [int]$EndPort) {
   throw "未在 $StartPort-$EndPort 找到可用前端端口"
 }
 
-# 与 start-bridge.ps1 相同的解释器选择顺序
+# mock Core 使用根环境；Bridge 子进程由 start-bridge.ps1 优先选择专用环境
 $rootPython = Join-Path $root '.venv\Scripts\python.exe'
 $bridgePython = Join-Path $bridgeDir '.venv\Scripts\python.exe'
 $python = if (Test-Path $rootPython) { (Resolve-Path $rootPython).Path }

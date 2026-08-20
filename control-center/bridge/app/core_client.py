@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any
 from urllib.parse import quote
 
@@ -29,6 +30,7 @@ class OasCoreClient:
     def __init__(self, base_url: str, timeout: float = 10.0, max_concurrency: int = 8):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.api_key = os.getenv("OAS_CORE_KEY", "").strip() or None
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=timeout,
@@ -40,6 +42,10 @@ class OasCoreClient:
         await self._client.aclose()
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+        if self.api_key:
+            headers = dict(kwargs.get("headers") or {})
+            headers.setdefault("X-OAS-Key", self.api_key)
+            kwargs["headers"] = headers
         try:
             async with self._gate:
                 response = await self._client.request(method, path, **kwargs)
@@ -204,13 +210,12 @@ class OasCoreClient:
         Core's command ledger can replay instead of executing twice."""
         params = {"command_id": command_id} if command_id else None
         return await self._request(
-            "GET", f"/{quote(account_id, safe='')}/start", params=params)
+            "POST", f"/{quote(account_id, safe='')}/start", params=params)
 
     async def stop_script(self, account_id: str, command_id: str | None = None) -> Any:
         params = {"command_id": command_id} if command_id else None
         return await self._request(
-            "GET", f"/{quote(account_id, safe='')}/stop", params=params)
-        return await self._request("GET", f"/{quote(account_id, safe='')}/stop")
+            "POST", f"/{quote(account_id, safe='')}/stop", params=params)
 
     async def copy_account(self, account_id: str, template: str = "template") -> Any:
         return await self._request("POST", "/config_copy", params={"file": account_id, "template": template})
