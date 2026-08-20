@@ -67,6 +67,7 @@ from tasks.Quiz.config import Quiz
 from tasks.KittyShop.config import KittyShop
 from tasks.DyeTrials.config import DyeTrials
 from tasks.XiuxingHexun.config import XiuxingHexun
+from tasks.XiuxingHexunClimb.config import XiuxingHexunClimb
 # ----------------------------------------------------------------------------------------------------------------------
 
 # 肝帝专属---------------------------------------------------------------------------------------------------------------
@@ -134,6 +135,7 @@ class ConfigModel(ConfigBase):
     kitty_shop: KittyShop = Field(default_factory=KittyShop)
     dye_trials: DyeTrials = Field(default_factory=DyeTrials)
     xiuxing_hexun: XiuxingHexun = Field(default_factory=XiuxingHexun)
+    xiuxing_hexun_climb: XiuxingHexunClimb = Field(default_factory=XiuxingHexunClimb)
 
     # 这些是肝帝专属
     bondling_fairyland: BondlingFairyland = Field(default_factory=BondlingFairyland)

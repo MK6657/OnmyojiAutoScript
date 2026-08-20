@@ -295,7 +295,7 @@ class Config(ConfigState, ConfigManual, ConfigWatcher, ConfigMenu):
         error = []
         self.scheduler_update_dt = datetime.now()
         for key, value in self.model.dict().items():
-            if key == 'xiuxing_hexun' and (
+            if key in {'xiuxing_hexun', 'xiuxing_hexun_climb'} and (
                 not xiuxing_hexun_globally_enabled()
                 or not value.get('activity_enabled', True)
             ):

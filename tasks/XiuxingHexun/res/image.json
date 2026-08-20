@@ -83,8 +83,8 @@
   {
     "itemName": "preset_team",
     "imageName": "preset_team_hexun.png",
-    "roiFront": "700,185,280,80",
-    "roiBack": "650,150,450,150",
+    "roiFront": "700,285,280,80",
+    "roiBack": "650,150,450,270",
     "method": "Template matching",
     "threshold": 0.8,
     "description": "修行合训顶配队伍卡"

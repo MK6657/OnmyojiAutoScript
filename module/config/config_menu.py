@@ -48,6 +48,7 @@ class ConfigMenu:
         ]
         if xiuxing_hexun_globally_enabled():
             self.menu["Activity Task"].append("XiuxingHexun")
+            self.menu["Activity Task"].append("XiuxingHexunClimb")
         # 开发工具
         self.menu["Tools"] = ['Image Rule', 'Ocr Rule', 'Click Rule', 'Long Click Rule', 'Swipe Rule', 'List Rule']
 

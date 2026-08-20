@@ -118,6 +118,18 @@ class GeneralBattle(GeneralBuff, GeneralBattleAssets):
     # Keep the grace bounded so a stale lock indicator cannot strand a battle.
     LOCKED_AUTO_START_GRACE = 2.5
 
+    # The battle-mode label is rendered on the first transition frame on some
+    # low-FPS MuMu profiles.  Never make a state-changing click from that frame:
+    # capture a fresh frame after a short settling window and require the same
+    # state on two fresh captures.  These are deliberately class attributes so
+    # lightweight harnesses can shorten the timings without changing runtime
+    # behaviour.
+    AUTO_MODE_SETTLE_DELAY = 0.4
+    AUTO_MODE_LOCKED_SETTLE_DELAY = 0.8
+    AUTO_MODE_VERIFY_SETTLE_DELAY = 0.25
+    AUTO_MODE_SAMPLE_INTERVAL = 0.2
+    AUTO_MODE_STABLE_SAMPLES = 2
+
     def run_general_battle(self, config: GeneralBattleConfig = None, buff: BuffClass or list[BuffClass] = None) -> bool:
         """
         运行脚本
@@ -224,6 +236,7 @@ class GeneralBattle(GeneralBuff, GeneralBattleAssets):
         """Read the current battle mode from the shared lower-left OCR rules."""
         raw_failed = False
         image = getattr(getattr(self, 'device', None), 'image', None)
+        matches = []
         if image is not None:
             for state, rule in (
                 ('auto', GameUiAssets.O_BATTLE_AUTO),
@@ -241,23 +254,36 @@ class GeneralBattle(GeneralBuff, GeneralBattleAssets):
                     continue
                 compact = re.sub(r'\s+', '', text)
                 if state == 'auto' and '自动' in compact:
-                    return state
+                    matches.append(state)
                 if state == 'manual' and '手动' in compact:
-                    return state
+                    matches.append(state)
+
+            # A transition frame can contain remnants of both labels.  Treat
+            # that as unknown rather than allowing the first OCR rule to win.
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                logger.debug('Battle mode OCR conflict; defer state-changing action')
+                return None
 
         # Keep lightweight harnesses and legacy device adapters compatible. In
         # the real runtime image OCR is preferred; this fallback is only used
         # when an image is unavailable or its direct OCR call failed.
         if image is None or raw_failed:
+            fallback_matches = []
             for state, rule in (
                 ('auto', GameUiAssets.O_BATTLE_AUTO),
                 ('manual', GameUiAssets.O_BATTLE_HAND),
             ):
                 try:
                     if self.ocr_appear(rule):
-                        return state
+                        fallback_matches.append(state)
                 except Exception as error:  # noqa: BLE001
                     logger.debug(f'Battle mode OCR fallback unavailable for {state}: {error}')
+            if len(fallback_matches) == 1:
+                return fallback_matches[0]
+            if len(fallback_matches) > 1:
+                logger.debug('Battle mode fallback OCR conflict; defer state-changing action')
         return None
 
     def _click_battle_mode_safe(self) -> tuple[int, int]:
@@ -296,6 +322,110 @@ class GeneralBattle(GeneralBuff, GeneralBattleAssets):
         )
         return True
 
+    def _auto_mode_capture_interval(self) -> float:
+        """Return a bounded delay between fresh mode observations."""
+        configured = getattr(
+            getattr(getattr(self, 'device', None), '_screenshot_interval', None),
+            'limit',
+            None,
+        )
+        try:
+            # Device.screenshot() already enforces its own minimum interval;
+            # this sleep is only a small yield for adapters/harnesses that do
+            # not have that timer.
+            return max(0.05, min(float(self.AUTO_MODE_SAMPLE_INTERVAL), float(configured)))
+        except (TypeError, ValueError):
+            return max(0.05, float(self.AUTO_MODE_SAMPLE_INTERVAL))
+
+    def _capture_auto_mode_frame(self):
+        """Capture a frame and return its freshness token.
+
+        A mode sample is only valid after a capture.  On the real device the
+        published ``frame_id`` is the authoritative token; test/legacy
+        adapters without it use a local capture sequence.  If a capture did
+        not publish a new real frame, return ``None`` so callers cannot count
+        duplicate OCR as stable evidence.
+        """
+        device = getattr(self, 'device', None)
+        before_frame_id = getattr(device, 'frame_id', None)
+        capture = getattr(self, 'screenshot', None)
+        if callable(capture):
+            capture()
+        else:
+            return ('image', id(getattr(device, 'image', None)))
+
+        after_frame_id = getattr(device, 'frame_id', None)
+        if (
+            before_frame_id is not None
+            and after_frame_id is not None
+            and after_frame_id == before_frame_id
+        ):
+            logger.debug(
+                f'AUTO_MODE_SAMPLE skipped duplicate frame_id={after_frame_id}'
+            )
+            return None
+
+        sequence = int(getattr(self, '_auto_mode_capture_sequence', 0)) + 1
+        self._auto_mode_capture_sequence = sequence
+        if after_frame_id is not None:
+            return ('frame', after_frame_id)
+        return ('capture', sequence)
+
+    def _observe_stable_battle_mode(
+        self,
+        deadline: float,
+        *,
+        settle_delay: float = 0.0,
+        stable_samples: int | None = None,
+    ) -> str | None:
+        """Return a mode only after consecutive fresh frames agree."""
+        required = max(
+            1,
+            int(
+                self.AUTO_MODE_STABLE_SAMPLES
+                if stable_samples is None
+                else stable_samples
+            ),
+        )
+        settle = max(0.0, float(settle_delay))
+        if settle:
+            time.sleep(min(settle, max(0.0, deadline - time.monotonic())))
+
+        last_state = None
+        stable_count = 0
+        last_token = object()
+        first_sample = True
+        while first_sample or time.monotonic() < deadline:
+            first_sample = False
+            token = self._capture_auto_mode_frame()
+            if token is None or token == last_token:
+                last_state = None
+                stable_count = 0
+            else:
+                last_token = token
+                state = self._read_battle_mode()
+                if state in ('auto', 'manual'):
+                    if state == last_state:
+                        stable_count += 1
+                    else:
+                        last_state = state
+                        stable_count = 1
+                    logger.debug(
+                        f'AUTO_MODE_SAMPLE state={state} stable={stable_count}/{required} '
+                        f'frame={token}'
+                    )
+                    if stable_count >= required:
+                        return state
+                else:
+                    last_state = None
+                    stable_count = 0
+                    logger.debug(f'AUTO_MODE_SAMPLE state=unknown frame={token}')
+
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(self._auto_mode_capture_interval())
+        return None
+
     def _ensure_auto_battle_mode(
         self,
         detect_timeout: float = 3.0,
@@ -309,14 +439,28 @@ class GeneralBattle(GeneralBuff, GeneralBattleAssets):
         fallback only after the first click is still confirmed as manual.
         """
         deadline = time.monotonic() + max(0.0, float(detect_timeout))
-        state = self._read_battle_mode()
-        while state is None and time.monotonic() < deadline:
-            time.sleep(0.15)
-            self.screenshot()
-            state = self._read_battle_mode()
+        settle_delay = self.AUTO_MODE_SETTLE_DELAY
+        if getattr(self, '_battle_lock_expected_active', False):
+            # A locked team can enter combat without a prepare click.  Give
+            # its lower-left label one extra render window before treating a
+            # transitional "手动" frame as an actionable manual state.
+            settle_delay = max(
+                settle_delay,
+                float(
+                    getattr(
+                        self,
+                        'AUTO_MODE_LOCKED_SETTLE_DELAY',
+                        settle_delay,
+                    )
+                ),
+            )
+        state = self._observe_stable_battle_mode(
+            deadline,
+            settle_delay=settle_delay,
+        )
 
         if state == 'auto':
-            logger.info('AUTO_MODE_STATE state=auto source=ocr')
+            logger.info('AUTO_MODE_STATE state=auto source=ocr_stable')
             logger.info('AUTO_MODE_RESULT result=enabled action=none')
             return True
         if state != 'manual':
@@ -326,29 +470,35 @@ class GeneralBattle(GeneralBuff, GeneralBattleAssets):
             )
             return False
 
-        logger.info('AUTO_MODE_STATE state=manual source=ocr')
+        logger.info('AUTO_MODE_STATE state=manual source=ocr_stable')
         x, y = self._click_battle_mode_safe()
 
         deadline = time.monotonic() + max(0.0, float(verify_timeout))
-        while time.monotonic() < deadline:
-            time.sleep(0.15)
-            self.screenshot()
-            state = self._read_battle_mode()
-            if state == 'auto':
-                logger.info('AUTO_MODE_RESULT result=enabled action=toggle')
-                return True
+        state = self._observe_stable_battle_mode(
+            deadline,
+            settle_delay=self.AUTO_MODE_VERIFY_SETTLE_DELAY,
+        )
+        if state == 'auto':
+            logger.info('AUTO_MODE_RESULT result=enabled action=toggle')
+            return True
+        if state != 'manual':
+            logger.warning(
+                'AUTO_MODE_RESULT result=unrecognized '
+                f'phase=after_toggle timeout={float(verify_timeout):.1f}s'
+            )
+            return False
 
         if self._click_battle_mode_adb_fallback(x, y):
             deadline = time.monotonic() + max(0.0, float(verify_timeout))
-            while time.monotonic() < deadline:
-                time.sleep(0.15)
-                self.screenshot()
-                state = self._read_battle_mode()
-                if state == 'auto':
-                    logger.info(
-                        'AUTO_MODE_RESULT result=enabled action=adb_fallback'
-                    )
-                    return True
+            state = self._observe_stable_battle_mode(
+                deadline,
+                settle_delay=self.AUTO_MODE_VERIFY_SETTLE_DELAY,
+            )
+            if state == 'auto':
+                logger.info(
+                    'AUTO_MODE_RESULT result=enabled action=adb_fallback'
+                )
+                return True
 
         logger.warning(
             'AUTO_MODE_RESULT result=failed '

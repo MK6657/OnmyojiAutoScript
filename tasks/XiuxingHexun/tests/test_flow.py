@@ -37,10 +37,10 @@ class XiuxingHexunFlowTest(unittest.TestCase):
     def test_preset_deploy_click_stays_inside_button(self):
         marker = ScriptTask.C_PRESET_DEPLOY
         x, y, width, height = marker.roi_front
-        self.assertGreaterEqual(x, 810)
-        self.assertGreaterEqual(y, 515)
-        self.assertLessEqual(x + width, 925)
-        self.assertLessEqual(y + height, 560)
+        self.assertGreaterEqual(x, 795)
+        self.assertGreaterEqual(y, 475)
+        self.assertLessEqual(x + width, 920)
+        self.assertLessEqual(y + height, 520)
 
     def test_search_click_stays_inside_center_label(self):
         marker = ScriptTask.C_SEARCH
@@ -64,12 +64,19 @@ class XiuxingHexunFlowTest(unittest.TestCase):
         self.assertLessEqual(x + width, 955)
         self.assertLessEqual(y + height, 642)
 
+    def test_monthly_group_click_stays_inside_current_panel_tab(self):
+        x, y, width, height = ScriptTask.C_PRESET_GROUP_MONTHLY.roi_front
+        self.assertGreaterEqual(x, 540)
+        self.assertGreaterEqual(y, 320)
+        self.assertLessEqual(x + width, 655)
+        self.assertLessEqual(y + height, 375)
+
     def test_monthly_preset_group_click_stays_inside_activity_panel(self):
         x, y, width, height = ScriptTask.C_PRESET_GROUP_MONTHLY.roi_front
-        self.assertGreaterEqual(x, 550)
-        self.assertGreaterEqual(y, 360)
-        self.assertLessEqual(x + width, 675)
-        self.assertLessEqual(y + height, 420)
+        self.assertGreaterEqual(x, 540)
+        self.assertGreaterEqual(y, 320)
+        self.assertLessEqual(x + width, 655)
+        self.assertLessEqual(y + height, 375)
 
     def test_search_first_when_search_is_available(self):
         self.assertEqual(

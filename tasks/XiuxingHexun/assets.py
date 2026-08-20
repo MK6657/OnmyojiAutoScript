@@ -80,15 +80,23 @@ class XiuxingHexunAssets:
 
     # The monthly group label is stable even when the selected enemy changes.
     I_PRESET_PAGE = RuleImage(
-        roi_front=(548, 360, 125, 75),
-        roi_back=(520, 325, 200, 150),
+        # The 2301 client opens the preset panel at the right-center of the
+        # daily-training page.  Keep the search ROI around the actual
+        # 每月活动 tab; the previous y=360 crop started below the tab and
+        # could never confirm that the panel was open on this layout.
+        roi_front=(535, 319, 125, 75),
+        roi_back=(500, 280, 220, 170),
         threshold=0.8,
         method="Template matching",
         file="./tasks/XiuxingHexun/res/preset_group_monthly.png",
     )
     I_PRESET_TEAM = RuleImage(
-        roi_front=(700, 185, 280, 80),
-        roi_back=(650, 150, 450, 150),
+        # The monthly group can show another preset card in the first row;
+        # the configured 修行合训 card is currently rendered in the second
+        # row on MuMu 2301.  Keep the fast crop on that row and let the
+        # fallback search cover the whole two-row panel for layout variants.
+        roi_front=(700, 285, 280, 80),
+        roi_back=(650, 150, 450, 270),
         threshold=0.8,
         method="Template matching",
         file="./tasks/XiuxingHexun/res/preset_team_hexun.png",
@@ -124,16 +132,19 @@ class XiuxingHexunAssets:
     )
     O_NO_TICKET = O_TICKET_COUNT
     O_PRESET_GROUP = RuleOcr(
-        roi=(548, 360, 125, 75),
-        area=(548, 360, 125, 75),
+        roi=(535, 319, 125, 75),
+        area=(535, 319, 125, 75),
         mode="Single",
         method="Default",
         keyword="每月活动",
         name="xiuxing_preset_group",
     )
     O_PRESET_TEAM = RuleOcr(
-        roi=(680, 185, 420, 80),
-        area=(680, 185, 420, 80),
+        # Both visible team rows belong to the selected group.  Keep one
+        # bounded ROI so a caller can verify either row (爬塔222 is on the
+        # first row; 【修行合训】顶配 is on the second row in 2301).
+        roi=(660, 145, 420, 205),
+        area=(660, 145, 420, 205),
         mode="Single",
         method="Default",
         keyword="修行合训",
@@ -184,24 +195,40 @@ class XiuxingHexunAssets:
     )
     C_TEAM_PRESET = RuleClick(
         # Keep the sampled point on the 队伍预设 icon, away from 协战 and
-        # the label row below it.
-        roi_front=(905, 588, 48, 52),
-        roi_back=(905, 588, 48, 52),
+        # the label row below it.  The previous 48x52 ROI reached the label
+        # baseline; random sampling could land at y=633 and miss the icon.
+        roi_front=(910, 590, 30, 30),
+        roi_back=(910, 590, 30, 30),
         name="XIUXING_TEAM_PRESET",
     )
     C_PRESET_GROUP_MONTHLY = RuleClick(
         # Activity preset panels remember the last selected group.
-        roi_front=(555, 365, 115, 50),
-        roi_back=(555, 365, 115, 50),
+        roi_front=(545, 322, 105, 48),
+        roi_back=(545, 322, 105, 48),
         name="XIUXING_PRESET_GROUP_MONTHLY",
     )
     C_PRESET_DEPLOY = RuleClick(
         # Keep every sampled point inside the orange 出战 button.  The
         # surrounding panel accepts no click, so a broad ROI can look like
         # a successful action while leaving the preset page open.
-        roi_front=(815, 520, 105, 38),
-        roi_back=(815, 520, 105, 38),
+        roi_front=(800, 477, 115, 40),
+        roi_back=(800, 477, 115, 40),
         name="XIUXING_PRESET_DEPLOY",
+    )
+    C_PRESET_TEAM_TOP = RuleClick(
+        # First team card in 每月活动 (currently 爬塔222).  Do not sample
+        # the card's upper/right controls: those open the preset detail
+        # dialog instead of selecting the card for deployment.
+        roi_front=(680, 195, 220, 35),
+        roi_back=(680, 195, 220, 35),
+        name="XIUXING_PRESET_TEAM_TOP",
+    )
+    C_PRESET_TEAM_BOTTOM = RuleClick(
+        # Second team card in 每月活动 (currently 【修行合训】顶配), with
+        # the same safe body-only click area.
+        roi_front=(680, 295, 220, 35),
+        roi_back=(680, 295, 220, 35),
+        name="XIUXING_PRESET_TEAM_BOTTOM",
     )
     C_START_CHALLENGE = RuleClick(
         roi_front=(1070, 520, 145, 150),
